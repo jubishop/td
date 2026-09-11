@@ -1,0 +1,188 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-labelledby="sequence-title sequence-description" data-theme="graphite" data-theme-appearance="light">
+  <title id="sequence-title">A local change reaches the server and other devices</title><desc id="sequence-description">After any mutating command, the post-run hook runs one push-and-pull round. The server logs events idempotently, materializes them into the live project database, and notifies browser clients.</desc><metadata>{&quot;journeyId&quot;:&quot;autosync-round&quot;,&quot;provenance&quot;:&quot;Authored 2026-09-11 from cmd/autosync.go, cmd/feature_gate.go, pkg/tdsync/tdsync.go, internal/sync/client.go, internal/api/sync.go and internal/api/sync_apply.go. Gate open, credentials valid, no conflicts. Not a captured trace.&quot;,&quot;hiddenLanes&quot;:[],&quot;rows&quot;:[{&quot;id&quot;:&quot;gate&quot;,&quot;type&quot;:&quot;phase&quot;,&quot;messageIds&quot;:[&quot;mutating_cmd&quot;,&quot;debounce&quot;,&quot;gate_check&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;agent&quot;,&quot;hooks&quot;,&quot;syncer&quot;,&quot;local_db&quot;]},{&quot;id&quot;:&quot;mutating_cmd&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;mutating_cmd&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;agent&quot;,&quot;hooks&quot;]},{&quot;id&quot;:&quot;debounce&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;debounce&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;hooks&quot;,&quot;syncer&quot;]},{&quot;id&quot;:&quot;gate_check&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;gate_check&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;syncer&quot;,&quot;local_db&quot;]},{&quot;id&quot;:&quot;push&quot;,&quot;type&quot;:&quot;phase&quot;,&quot;messageIds&quot;:[&quot;pending&quot;,&quot;read_action_log&quot;,&quot;push_req&quot;,&quot;push_http&quot;,&quot;push_authz&quot;,&quot;insert_events&quot;,&quot;apply_live&quot;,&quot;broadcast&quot;,&quot;push_ack&quot;,&quot;mark_synced&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;syncer&quot;,&quot;engine&quot;,&quot;local_db&quot;,&quot;http&quot;,&quot;middleware&quot;,&quot;sync_api&quot;,&quot;events_db&quot;,&quot;project_db&quot;,&quot;sse&quot;]},{&quot;id&quot;:&quot;pending&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;pending&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;syncer&quot;,&quot;engine&quot;]},{&quot;id&quot;:&quot;read_action_log&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;read_action_log&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;engine&quot;,&quot;local_db&quot;]},{&quot;id&quot;:&quot;push_req&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;push_req&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;syncer&quot;,&quot;http&quot;]},{&quot;id&quot;:&quot;push_http&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;push_http&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;http&quot;,&quot;middleware&quot;]},{&quot;id&quot;:&quot;push_authz&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;push_authz&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;middleware&quot;,&quot;sync_api&quot;]},{&quot;id&quot;:&quot;insert_events&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;insert_events&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;sync_api&quot;,&quot;events_db&quot;]},{&quot;id&quot;:&quot;apply_live&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;apply_live&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;sync_api&quot;,&quot;project_db&quot;]},{&quot;id&quot;:&quot;broadcast&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;broadcast&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;sync_api&quot;,&quot;sse&quot;]},{&quot;id&quot;:&quot;push_ack&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;push_ack&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;sync_api&quot;,&quot;http&quot;]},{&quot;id&quot;:&quot;mark_synced&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;mark_synced&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;engine&quot;,&quot;local_db&quot;]},{&quot;id&quot;:&quot;pull&quot;,&quot;type&quot;:&quot;phase&quot;,&quot;messageIds&quot;:[&quot;pull_req&quot;,&quot;pull_http&quot;,&quot;pull_authz&quot;,&quot;pull_read&quot;,&quot;pull_resp&quot;,&quot;apply_remote&quot;,&quot;write_remote&quot;,&quot;round_done&quot;,&quot;warn_pending&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;syncer&quot;,&quot;http&quot;,&quot;middleware&quot;,&quot;sync_api&quot;,&quot;events_db&quot;,&quot;engine&quot;,&quot;local_db&quot;,&quot;hooks&quot;,&quot;agent&quot;]},{&quot;id&quot;:&quot;pull_req&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;pull_req&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;syncer&quot;,&quot;http&quot;]},{&quot;id&quot;:&quot;pull_http&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;pull_http&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;http&quot;,&quot;middleware&quot;]},{&quot;id&quot;:&quot;pull_authz&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;pull_authz&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;middleware&quot;,&quot;sync_api&quot;]},{&quot;id&quot;:&quot;pull_read&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;pull_read&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;sync_api&quot;,&quot;events_db&quot;]},{&quot;id&quot;:&quot;pull_resp&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;pull_resp&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;sync_api&quot;,&quot;http&quot;]},{&quot;id&quot;:&quot;apply_remote&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;apply_remote&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;syncer&quot;,&quot;engine&quot;]},{&quot;id&quot;:&quot;write_remote&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;write_remote&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;engine&quot;,&quot;local_db&quot;]},{&quot;id&quot;:&quot;round_done&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;round_done&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;syncer&quot;,&quot;hooks&quot;]},{&quot;id&quot;:&quot;warn_pending&quot;,&quot;type&quot;:&quot;message&quot;,&quot;messageIds&quot;:[&quot;warn_pending&quot;],&quot;hiddenMessageIds&quot;:[],&quot;participantIds&quot;:[&quot;hooks&quot;,&quot;agent&quot;]}]}</metadata>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#85857f"/></marker>
+    <marker id="arrow-open" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10" fill="none" stroke="#85857f" stroke-width="1.5"/></marker>
+  </defs>
+  <rect width="1920" height="1080" fill="#f8f8f6"/>
+  <g font-family="Arial, Helvetica, sans-serif" data-export-layer="title">
+    <text x="70" y="43" font-size="11" letter-spacing="2.5" fill="#626b6f">FRACTAL / SEQUENCE JOURNEY</text>
+    <text x="70" y="88" text-anchor="start" font-size="34" fill="#292927"><tspan x="70" dy="0">A local change reaches the server and other devices</tspan></text>
+    <text x="70" y="126" text-anchor="start" font-size="15" fill="#74746f"><tspan x="70" dy="0">After any mutating command, the post-run hook runs one push-and-pull round. The server logs events idempotently, materializes them into the live project database, and notifies browser clients.</tspan></text>
+  </g>
+  <g font-family="Arial, Helvetica, sans-serif" transform="translate(483.4637454355764 190) scale(0.396452790818988)"><g data-column="agent" data-members="agent" data-elements="">
+    <rect x="102" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#759EB5" stroke-width="2"/>
+    <text x="182" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="182" dy="0">Agent running td</tspan></text>
+    <path d="M182 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="hooks" data-members="hooks" data-elements="cli.autosync_hooks">
+    <rect x="306" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#759EB5" stroke-width="2"/>
+    <text x="386" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="386" dy="0">Autosync hooks</tspan></text>
+    <path d="M386 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="syncer" data-members="syncer" data-elements="syncclient.syncer">
+    <rect x="510" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#C48282" stroke-width="2"/>
+    <text x="590" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="590" dy="0">Syncer &amp; gate</tspan></text>
+    <path d="M590 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="engine" data-members="engine" data-elements="syncclient.engine">
+    <rect x="714" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#C48282" stroke-width="2"/>
+    <text x="794" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="794" dy="0">Event engine</tspan></text>
+    <path d="M794 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="local_db" data-members="local_db" data-elements="store.issues_db">
+    <rect x="918" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#89A579" stroke-width="2"/>
+    <text x="998" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="998" dy="0">issues.db</tspan></text>
+    <path d="M998 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="http" data-members="http" data-elements="syncclient.http">
+    <rect x="1122" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#C48282" stroke-width="2"/>
+    <text x="1202" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="1202" dy="0">HTTP adapter</tspan></text>
+    <path d="M1202 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="middleware" data-members="middleware" data-elements="server.middleware">
+    <rect x="1326" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#B58A9E" stroke-width="2"/>
+    <text x="1406" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="1406" dy="0">Auth &amp; membership</tspan></text>
+    <path d="M1406 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="sync_api" data-members="sync_api" data-elements="server.sync_api">
+    <rect x="1530" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#B58A9E" stroke-width="2"/>
+    <text x="1610" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="1610" dy="0">Sync endpoints</tspan></text>
+    <path d="M1610 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="events_db" data-members="events_db" data-elements="server.events_db">
+    <rect x="1734" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#B58A9E" stroke-width="2"/>
+    <text x="1814" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="1814" dy="0">events.db</tspan></text>
+    <path d="M1814 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="project_db" data-members="project_db" data-elements="server.project_db">
+    <rect x="1938" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#B58A9E" stroke-width="2"/>
+    <text x="2018" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="2018" dy="0">project.db</tspan></text>
+    <path d="M2018 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-column="sse" data-members="sse" data-elements="server.events_sse">
+    <rect x="2142" y="32" width="160" height="44" rx="12" fill="#ffffff" stroke="#B58A9E" stroke-width="2"/>
+    <text x="2222" y="59" text-anchor="middle" font-size="15" fill="#292927"><tspan x="2222" dy="0">Project SSE</tspan></text>
+    <path d="M2222 76V1847" stroke="#ddddda" stroke-width="1.2" stroke-dasharray="5 7"/>
+  </g><g data-row-id="gate" data-message-ids="mutating_cmd,debounce,gate_check" data-participant-ids="agent,hooks,syncer,local_db" data-row-type="phase" data-phase-depth="0" data-collapsed="false">
+        <rect x="58" y="118" width="2288" height="35" rx="10" fill="#eeeeeb" stroke="#d5d5d0"/>
+        <text x="78" y="141" text-anchor="start" font-size="15" fill="#292927"><tspan x="78" dy="0">Decide whether to sync</tspan></text>
+        
+        <text x="2304" y="139.5" text-anchor="end" font-size="11" fill="#7d7d77">3 interactions</text>
+      </g><g data-row-id="mutating_cmd" data-message-ids="mutating_cmd" data-participant-ids="agent,hooks" data-row-type="message" data-kind="call">
+      <rect x="104" y="167" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="284" y="190" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="284" dy="0">Mutating command completes (PersistentPostRun)</tspan></text>
+      
+      <path d="M182 206H378" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="debounce" data-message-ids="debounce" data-participant-ids="hooks,syncer" data-row-type="message" data-kind="call">
+      <rect x="308" y="231" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="488" y="254" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="488" dy="0">Once() after debounce</tspan></text>
+      
+      <path d="M386 270H582" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="gate_check" data-message-ids="gate_check" data-participant-ids="syncer,local_db" data-row-type="message" data-kind="call">
+      <rect x="614" y="295" width="360" height="85" rx="7" fill="#f8f8f6"/>
+      <text x="794" y="318" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="794" dy="0">Read sync_state; check kill switch, feature flag,</tspan><tspan x="794" dy="17">credentials</tspan></text>
+      <text x="794" y="359" text-anchor="middle" font-size="11" fill="#7d7d77"><tspan x="794" dy="0">Closed gate returns immediately with pending count 0;</tspan><tspan x="794" dy="15">nothing is warned.</tspan></text>
+      <path d="M590 385H990" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="push" data-message-ids="pending,read_action_log,push_req,push_http,push_authz,insert_events,apply_live,broadcast,push_ack,mark_synced" data-participant-ids="syncer,engine,local_db,http,middleware,sync_api,events_db,project_db,sse" data-row-type="phase" data-phase-depth="0" data-collapsed="false">
+        <rect x="58" y="410" width="2288" height="35" rx="10" fill="#eeeeeb" stroke="#d5d5d0"/>
+        <text x="78" y="433" text-anchor="start" font-size="15" fill="#292927"><tspan x="78" dy="0">Push pending events</tspan></text>
+        
+        <text x="2304" y="431.5" text-anchor="end" font-size="11" fill="#7d7d77">10 interactions</text>
+      </g><g data-row-id="pending" data-message-ids="pending" data-participant-ids="syncer,engine" data-row-type="message" data-kind="call">
+      <rect x="512" y="459" width="360" height="49" rx="7" fill="#f8f8f6"/>
+      <text x="692" y="482" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="692" dy="0">GetPendingEvents (backfill creates, map action</tspan><tspan x="692" dy="17">types)</tspan></text>
+      
+      <path d="M590 513H786" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="read_action_log" data-message-ids="read_action_log" data-participant-ids="engine,local_db" data-row-type="message" data-kind="call">
+      <rect x="716" y="538" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="896" y="561" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="896" dy="0">Unsynced, non-undone action_log rows</tspan></text>
+      
+      <path d="M794 577H990" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="push_req" data-message-ids="push_req" data-participant-ids="syncer,http" data-row-type="message" data-kind="call">
+      <rect x="716" y="602" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="896" y="625" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="896" dy="0">Push batch (≤500) with retry until the 6s budget</tspan></text>
+      
+      <path d="M590 641H1194" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="push_http" data-message-ids="push_http" data-participant-ids="http,middleware" data-row-type="message" data-kind="call">
+      <rect x="1124" y="666" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="1304" y="689" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1304" dy="0">POST /v1/projects/{id}/sync/push (Bearer key)</tspan></text>
+      
+      <path d="M1202 705H1398" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="push_authz" data-message-ids="push_authz" data-participant-ids="middleware,sync_api" data-row-type="message" data-kind="call">
+      <rect x="1328" y="730" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="1508" y="753" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1508" dy="0">Writer role confirmed, rate limit applied</tspan></text>
+      
+      <path d="M1406 769H1602" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="insert_events" data-message-ids="insert_events" data-participant-ids="sync_api,events_db" data-row-type="message" data-kind="call">
+      <rect x="1532" y="794" width="360" height="85" rx="7" fill="#f8f8f6"/>
+      <text x="1712" y="817" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1712" dy="0">INSERT OR IGNORE by (device, session,</tspan><tspan x="1712" dy="17">client_action_id)</tspan></text>
+      <text x="1712" y="858" text-anchor="middle" font-size="11" fill="#7d7d77"><tspan x="1712" dy="0">Duplicates are acked with their existing server_seq so</tspan><tspan x="1712" dy="15">retries converge.</tspan></text>
+      <path d="M1610 884H1806" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="apply_live" data-message-ids="apply_live" data-participant-ids="sync_api,project_db" data-row-type="message" data-kind="call">
+      <rect x="1634" y="909" width="360" height="49" rx="7" fill="#f8f8f6"/>
+      <text x="1814" y="932" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1814" dy="0">Apply accepted events past the applied_events</tspan><tspan x="1814" dy="17">cursor</tspan></text>
+      
+      <path d="M1610 963H2010" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="broadcast" data-message-ids="broadcast" data-participant-ids="sync_api,sse" data-row-type="message" data-kind="async">
+      <rect x="1736" y="988" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="1916" y="1011" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1916" dy="0">Broadcast refresh to connected browsers</tspan></text>
+      
+      <path d="M1610 1027H2214" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow-open)"/>
+    </g><g data-row-id="push_ack" data-message-ids="push_ack" data-participant-ids="sync_api,http" data-row-type="message" data-kind="return">
+      <rect x="1226" y="1052" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="1406" y="1075" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1406" dy="0">Acks with server_seq; sync cursor updated</tspan></text>
+      
+      <path d="M1610 1091H1210" fill="none" stroke="#85857f" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow)"/>
+    </g><g data-row-id="mark_synced" data-message-ids="mark_synced" data-participant-ids="engine,local_db" data-row-type="message" data-kind="call">
+      <rect x="716" y="1116" width="360" height="49" rx="7" fill="#f8f8f6"/>
+      <text x="896" y="1139" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="896" dy="0">MarkEventsSynced: stamp synced_at and</tspan><tspan x="896" dy="17">server_seq</tspan></text>
+      
+      <path d="M794 1170H990" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="pull" data-message-ids="pull_req,pull_http,pull_authz,pull_read,pull_resp,apply_remote,write_remote,round_done,warn_pending" data-participant-ids="syncer,http,middleware,sync_api,events_db,engine,local_db,hooks,agent" data-row-type="phase" data-phase-depth="0" data-collapsed="false">
+        <rect x="58" y="1195" width="2288" height="35" rx="10" fill="#eeeeeb" stroke="#d5d5d0"/>
+        <text x="78" y="1218" text-anchor="start" font-size="15" fill="#292927"><tspan x="78" dy="0">Pull and apply remote events</tspan></text>
+        
+        <text x="2304" y="1216.5" text-anchor="end" font-size="11" fill="#7d7d77">9 interactions</text>
+      </g><g data-row-id="pull_req" data-message-ids="pull_req" data-participant-ids="syncer,http" data-row-type="message" data-kind="call">
+      <rect x="716" y="1244" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="896" y="1267" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="896" dy="0">Pull after last_server_seq, excluding this device</tspan></text>
+      
+      <path d="M590 1283H1194" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="pull_http" data-message-ids="pull_http" data-participant-ids="http,middleware" data-row-type="message" data-kind="call">
+      <rect x="1124" y="1308" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="1304" y="1331" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1304" dy="0">GET /v1/projects/{id}/sync/pull</tspan></text>
+      
+      <path d="M1202 1347H1398" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="pull_authz" data-message-ids="pull_authz" data-participant-ids="middleware,sync_api" data-row-type="message" data-kind="call">
+      <rect x="1328" y="1372" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="1508" y="1395" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1508" dy="0">Reader role confirmed</tspan></text>
+      
+      <path d="M1406 1411H1602" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="pull_read" data-message-ids="pull_read" data-participant-ids="sync_api,events_db" data-row-type="message" data-kind="call">
+      <rect x="1532" y="1436" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="1712" y="1459" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1712" dy="0">Events after cursor</tspan></text>
+      
+      <path d="M1610 1475H1806" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="pull_resp" data-message-ids="pull_resp" data-participant-ids="sync_api,http" data-row-type="message" data-kind="return">
+      <rect x="1226" y="1500" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="1406" y="1523" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="1406" dy="0">Batch of remote events</tspan></text>
+      
+      <path d="M1610 1539H1210" fill="none" stroke="#85857f" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow)"/>
+    </g><g data-row-id="apply_remote" data-message-ids="apply_remote" data-participant-ids="syncer,engine" data-row-type="message" data-kind="call">
+      <rect x="512" y="1564" width="360" height="81" rx="7" fill="#f8f8f6"/>
+      <text x="692" y="1587" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="692" dy="0">ApplyRemoteEvents in one SQLite transaction</tspan></text>
+      <text x="692" y="1609" text-anchor="middle" font-size="11" fill="#7d7d77"><tspan x="692" dy="0">Runs outside the CLI write lock. Local rows modified since</tspan><tspan x="692" dy="15">the last sync are recorded in sync_conflicts instead of</tspan><tspan x="692" dy="15">being overwritten.</tspan></text>
+      <path d="M590 1650H786" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="write_remote" data-message-ids="write_remote" data-participant-ids="engine,local_db" data-row-type="message" data-kind="call">
+      <rect x="716" y="1675" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="896" y="1698" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="896" dy="0">Upsert entities, advance sync_state cursor</tspan></text>
+      
+      <path d="M794 1714H990" fill="none" stroke="#85857f" stroke-width="2" marker-end="url(#arrow)"/>
+    </g><g data-row-id="round_done" data-message-ids="round_done" data-participant-ids="syncer,hooks" data-row-type="message" data-kind="return">
+      <rect x="308" y="1739" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="488" y="1762" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="488" dy="0">Result: pushed, pulled, pending, conflicts</tspan></text>
+      
+      <path d="M590 1778H394" fill="none" stroke="#85857f" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow)"/>
+    </g><g data-row-id="warn_pending" data-message-ids="warn_pending" data-participant-ids="hooks,agent" data-row-type="message" data-kind="return">
+      <rect x="104" y="1803" width="360" height="34" rx="7" fill="#f8f8f6"/>
+      <text x="284" y="1826" text-anchor="middle" font-size="13" fill="#62625e"><tspan x="284" dy="0">Warn only if changes are still pending</tspan></text>
+      
+      <path d="M386 1842H190" fill="none" stroke="#85857f" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow)"/>
+    </g></g>
+  <g font-family="Arial, Helvetica, sans-serif" data-export-layer="footer">
+    <path d="M70 992H1850" stroke="#ddddda"/>
+    <text x="70" y="1027" font-size="12" font-weight="600" letter-spacing="1" fill="#626b6f">CURRENT · 22 INTERACTIONS</text>
+    <text x="620" y="1027" font-size="11" fill="#7d7d77">SOURCE · Authored 2026-09-11 from cmd/autosync.go, cmd/feature_gate.go, pkg/tdsync/tdsync.go, internal/sync/client.go, internal/api/sync.go and internal/api/sync_apply.go. Gate open, credentials valid, no conflicts. Not a ca…</text>
+  </g>
+  </svg>

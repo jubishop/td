@@ -1,0 +1,912 @@
+{
+  "version": 1,
+  "journeys": [
+    {
+      "id": "review-and-close",
+      "title": "From handoff to a reviewed close",
+      "description": "An implementing session submits work for review; an independent session approves and closes it. Shows where the state machine, review policy and logged write path each get a say.",
+      "provenance": "Authored 2026-09-11 from cmd/review.go (reviewCmd, approveCmd), internal/reviewpolicy/policy.go, internal/workflow/guards.go and internal/db/issues_logged.go. Trusted mode, independent reviewer, no --record-only. Not a captured trace.",
+      "status": "current",
+      "participants": [
+        {
+          "id": "implementer",
+          "title": "Implementing session",
+          "description": "The agent or person who did the work.",
+          "color": "#759EB5"
+        },
+        {
+          "id": "reviewer",
+          "title": "Reviewing session",
+          "description": "A session with no implementation history on the issue.",
+          "color": "#759EB5"
+        },
+        {
+          "id": "workflow_cmds",
+          "element": "cli.workflow_cmds",
+          "title": "Workflow commands"
+        },
+        {
+          "id": "session",
+          "element": "core.session",
+          "title": "Session identity"
+        },
+        {
+          "id": "machine",
+          "element": "core.workflow",
+          "title": "State machine"
+        },
+        {
+          "id": "policy",
+          "element": "core.reviewpolicy",
+          "title": "Review policy"
+        },
+        {
+          "id": "repositories",
+          "element": "store.repositories",
+          "title": "Repositories"
+        },
+        {
+          "id": "logged",
+          "element": "store.logged",
+          "title": "Logged writes"
+        },
+        {
+          "id": "hooks",
+          "element": "cli.autosync_hooks",
+          "title": "Autosync hooks"
+        }
+      ],
+      "groups": [
+        {
+          "id": "core_group",
+          "title": "Shared core",
+          "participants": [
+            "session",
+            "machine",
+            "policy",
+            "repositories",
+            "logged"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "type": "phase",
+          "id": "submit",
+          "title": "Submit for review",
+          "description": "td review moves the issue to in_review and makes sure a handoff exists.",
+          "steps": [
+            {
+              "type": "message",
+              "id": "review_cmd",
+              "from": "implementer",
+              "to": "workflow_cmds",
+              "title": "td review <id>",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "resolve_impl_session",
+              "from": "workflow_cmds",
+              "to": "session",
+              "title": "Resolve current session (branch + agent + TD_CONTEXT_ID)",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "check_in_review",
+              "from": "workflow_cmds",
+              "to": "machine",
+              "title": "Validate in_progress → in_review against the transition table",
+              "kind": "call",
+              "description": "DefaultMachine is liberal: the transition table is checked, guards are not run."
+            },
+            {
+              "type": "message",
+              "id": "auto_handoff",
+              "from": "workflow_cmds",
+              "to": "logged",
+              "title": "Write status change; synthesize a handoff from logs if none exists",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "submit_done",
+              "from": "workflow_cmds",
+              "to": "implementer",
+              "title": "in_review, review_requested_by recorded",
+              "kind": "return"
+            },
+            {
+              "type": "message",
+              "id": "push_after_review",
+              "from": "workflow_cmds",
+              "to": "hooks",
+              "title": "PostRun: push if the project gate is open",
+              "kind": "async"
+            }
+          ]
+        },
+        {
+          "type": "phase",
+          "id": "approve",
+          "title": "Approve and close",
+          "description": "td approve checks the transition table, decides eligibility from session history, then records the review and the close in one logged transaction.",
+          "steps": [
+            {
+              "type": "message",
+              "id": "approve_cmd",
+              "from": "reviewer",
+              "to": "workflow_cmds",
+              "title": "td approve <id> --reason \"...\"",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "resolve_reviewer_session",
+              "from": "workflow_cmds",
+              "to": "session",
+              "title": "Resolve reviewing session",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "close_transition",
+              "from": "workflow_cmds",
+              "to": "machine",
+              "title": "Validate in_review → closed against the transition table",
+              "kind": "call",
+              "description": "Table check only; DifferentReviewerGuard is defined but not run in liberal mode."
+            },
+            {
+              "type": "message",
+              "id": "involvement",
+              "from": "workflow_cmds",
+              "to": "repositories",
+              "title": "Was this session involved / an implementer?",
+              "kind": "call",
+              "description": "issue_session_history answers both questions; a read, not a logged write."
+            },
+            {
+              "type": "message",
+              "id": "eligibility",
+              "from": "workflow_cmds",
+              "to": "policy",
+              "title": "Evaluate reviewer eligibility for the project's review_policy_mode",
+              "kind": "call",
+              "description": "Independent session: approved. Involved session in trusted mode: needs --reviewed-by or --self-review; delegated/strict: rejected."
+            },
+            {
+              "type": "message",
+              "id": "eligibility_result",
+              "from": "policy",
+              "to": "workflow_cmds",
+              "title": "Eligible (independent reviewer)",
+              "kind": "return"
+            },
+            {
+              "type": "message",
+              "id": "record_and_close",
+              "from": "workflow_cmds",
+              "to": "logged",
+              "title": "Create review row and update issue in one transaction",
+              "kind": "call",
+              "description": "CreateIssueReviewAndUpdateIssueLogged writes the review, the status, reviewer_session and closed_by_session, plus action_log entries."
+            },
+            {
+              "type": "message",
+              "id": "session_action",
+              "from": "workflow_cmds",
+              "to": "logged",
+              "title": "Record session action for future eligibility checks",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "approve_done",
+              "from": "workflow_cmds",
+              "to": "reviewer",
+              "title": "closed",
+              "kind": "return"
+            },
+            {
+              "type": "message",
+              "id": "push_after_approve",
+              "from": "workflow_cmds",
+              "to": "hooks",
+              "title": "PostRun: push if the project gate is open",
+              "kind": "async"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "autosync-round",
+      "title": "A local change reaches the server and other devices",
+      "description": "After any mutating command, the post-run hook runs one push-and-pull round. The server logs events idempotently, materializes them into the live project database, and notifies browser clients.",
+      "provenance": "Authored 2026-09-11 from cmd/autosync.go, cmd/feature_gate.go, pkg/tdsync/tdsync.go, internal/sync/client.go, internal/api/sync.go and internal/api/sync_apply.go. Gate open, credentials valid, no conflicts. Not a captured trace.",
+      "status": "current",
+      "participants": [
+        {
+          "id": "agent",
+          "title": "Agent running td",
+          "color": "#759EB5"
+        },
+        {
+          "id": "hooks",
+          "element": "cli.autosync_hooks",
+          "title": "Autosync hooks"
+        },
+        {
+          "id": "syncer",
+          "element": "syncclient.syncer",
+          "title": "Syncer & gate"
+        },
+        {
+          "id": "engine",
+          "element": "syncclient.engine",
+          "title": "Event engine"
+        },
+        {
+          "id": "local_db",
+          "element": "store.issues_db",
+          "title": "issues.db"
+        },
+        {
+          "id": "http",
+          "element": "syncclient.http",
+          "title": "HTTP adapter"
+        },
+        {
+          "id": "middleware",
+          "element": "server.middleware",
+          "title": "Auth & membership"
+        },
+        {
+          "id": "sync_api",
+          "element": "server.sync_api",
+          "title": "Sync endpoints"
+        },
+        {
+          "id": "events_db",
+          "element": "server.events_db",
+          "title": "events.db"
+        },
+        {
+          "id": "project_db",
+          "element": "server.project_db",
+          "title": "project.db"
+        },
+        {
+          "id": "sse",
+          "element": "server.events_sse",
+          "title": "Project SSE"
+        }
+      ],
+      "groups": [
+        {
+          "id": "client_group",
+          "title": "td process",
+          "participants": [
+            "hooks",
+            "syncer",
+            "engine",
+            "local_db",
+            "http"
+          ]
+        },
+        {
+          "id": "server_group",
+          "title": "td-sync server",
+          "participants": [
+            "middleware",
+            "sync_api",
+            "events_db",
+            "project_db",
+            "sse"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "type": "phase",
+          "id": "gate",
+          "title": "Decide whether to sync",
+          "steps": [
+            {
+              "type": "message",
+              "id": "mutating_cmd",
+              "from": "agent",
+              "to": "hooks",
+              "title": "Mutating command completes (PersistentPostRun)",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "debounce",
+              "from": "hooks",
+              "to": "syncer",
+              "title": "Once() after debounce",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "gate_check",
+              "from": "syncer",
+              "to": "local_db",
+              "title": "Read sync_state; check kill switch, feature flag, credentials",
+              "kind": "call",
+              "description": "Closed gate returns immediately with pending count 0; nothing is warned."
+            }
+          ]
+        },
+        {
+          "type": "phase",
+          "id": "push",
+          "title": "Push pending events",
+          "steps": [
+            {
+              "type": "message",
+              "id": "pending",
+              "from": "syncer",
+              "to": "engine",
+              "title": "GetPendingEvents (backfill creates, map action types)",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "read_action_log",
+              "from": "engine",
+              "to": "local_db",
+              "title": "Unsynced, non-undone action_log rows",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "push_req",
+              "from": "syncer",
+              "to": "http",
+              "title": "Push batch (≤500) with retry until the 6s budget",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "push_http",
+              "from": "http",
+              "to": "middleware",
+              "title": "POST /v1/projects/{id}/sync/push (Bearer key)",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "push_authz",
+              "from": "middleware",
+              "to": "sync_api",
+              "title": "Writer role confirmed, rate limit applied",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "insert_events",
+              "from": "sync_api",
+              "to": "events_db",
+              "title": "INSERT OR IGNORE by (device, session, client_action_id)",
+              "kind": "call",
+              "description": "Duplicates are acked with their existing server_seq so retries converge."
+            },
+            {
+              "type": "message",
+              "id": "apply_live",
+              "from": "sync_api",
+              "to": "project_db",
+              "title": "Apply accepted events past the applied_events cursor",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "broadcast",
+              "from": "sync_api",
+              "to": "sse",
+              "title": "Broadcast refresh to connected browsers",
+              "kind": "async"
+            },
+            {
+              "type": "message",
+              "id": "push_ack",
+              "from": "sync_api",
+              "to": "http",
+              "title": "Acks with server_seq; sync cursor updated",
+              "kind": "return"
+            },
+            {
+              "type": "message",
+              "id": "mark_synced",
+              "from": "engine",
+              "to": "local_db",
+              "title": "MarkEventsSynced: stamp synced_at and server_seq",
+              "kind": "call"
+            }
+          ]
+        },
+        {
+          "type": "phase",
+          "id": "pull",
+          "title": "Pull and apply remote events",
+          "steps": [
+            {
+              "type": "message",
+              "id": "pull_req",
+              "from": "syncer",
+              "to": "http",
+              "title": "Pull after last_server_seq, excluding this device",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "pull_http",
+              "from": "http",
+              "to": "middleware",
+              "title": "GET /v1/projects/{id}/sync/pull",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "pull_authz",
+              "from": "middleware",
+              "to": "sync_api",
+              "title": "Reader role confirmed",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "pull_read",
+              "from": "sync_api",
+              "to": "events_db",
+              "title": "Events after cursor",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "pull_resp",
+              "from": "sync_api",
+              "to": "http",
+              "title": "Batch of remote events",
+              "kind": "return"
+            },
+            {
+              "type": "message",
+              "id": "apply_remote",
+              "from": "syncer",
+              "to": "engine",
+              "title": "ApplyRemoteEvents in one SQLite transaction",
+              "kind": "call",
+              "description": "Runs outside the CLI write lock. Local rows modified since the last sync are recorded in sync_conflicts instead of being overwritten."
+            },
+            {
+              "type": "message",
+              "id": "write_remote",
+              "from": "engine",
+              "to": "local_db",
+              "title": "Upsert entities, advance sync_state cursor",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "round_done",
+              "from": "syncer",
+              "to": "hooks",
+              "title": "Result: pushed, pulled, pending, conflicts",
+              "kind": "return"
+            },
+            {
+              "type": "message",
+              "id": "warn_pending",
+              "from": "hooks",
+              "to": "agent",
+              "title": "Warn only if changes are still pending",
+              "kind": "return"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hosted-project-write",
+      "title": "A browser edit on a hosted project reaches the CLI",
+      "description": "td-watch writes through the server's project API. The write lands in project.db using the same td serve handlers as a local project, is promoted into the event log, and is pulled by CLI clients like any other event.",
+      "provenance": "Authored 2026-09-11 from internal/api/project_routes.go (wrapServeHandler, projectMutateChain), internal/api/action_log_promotion.go, internal/api/broadcast.go and internal/serve/handlers_write.go. Not a captured trace.",
+      "status": "current",
+      "participants": [
+        {
+          "id": "browser",
+          "element": "external.tdwatch",
+          "title": "td-watch"
+        },
+        {
+          "id": "middleware",
+          "element": "server.middleware",
+          "title": "Auth & membership"
+        },
+        {
+          "id": "project_api",
+          "element": "server.project_api",
+          "title": "Project REST API"
+        },
+        {
+          "id": "handlers",
+          "element": "serve.handlers",
+          "title": "td serve handlers"
+        },
+        {
+          "id": "project_db",
+          "element": "server.project_db",
+          "title": "project.db"
+        },
+        {
+          "id": "promotion",
+          "element": "server.promotion",
+          "title": "action_log promotion"
+        },
+        {
+          "id": "events_db",
+          "element": "server.events_db",
+          "title": "events.db"
+        },
+        {
+          "id": "sse",
+          "element": "server.events_sse",
+          "title": "Project SSE"
+        },
+        {
+          "id": "cli_client",
+          "element": "syncclient.syncer",
+          "title": "Another device's sync client"
+        }
+      ],
+      "groups": [
+        {
+          "id": "server_group",
+          "title": "td-sync server",
+          "participants": [
+            "middleware",
+            "project_api",
+            "handlers",
+            "project_db",
+            "promotion",
+            "events_db",
+            "sse"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "type": "phase",
+          "id": "write",
+          "title": "Write through the shared handlers",
+          "steps": [
+            {
+              "type": "message",
+              "id": "patch",
+              "from": "browser",
+              "to": "middleware",
+              "title": "PATCH /v1/projects/{id}/issues/{iid}",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "authz",
+              "from": "middleware",
+              "to": "project_api",
+              "title": "Writer membership confirmed; td-watch session id stamped (twu_<user>)",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "acquire",
+              "from": "project_api",
+              "to": "project_db",
+              "title": "Acquire live DB (bootstrap from events.db on first use)",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "handler",
+              "from": "project_api",
+              "to": "handlers",
+              "title": "Invoke the same handler td serve uses locally",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "logged_write",
+              "from": "handlers",
+              "to": "project_db",
+              "title": "Logged mutation: entity row plus action_log",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "handler_done",
+              "from": "handlers",
+              "to": "project_api",
+              "title": "Updated issue",
+              "kind": "return"
+            },
+            {
+              "type": "message",
+              "id": "resp",
+              "from": "project_api",
+              "to": "browser",
+              "title": "200 with the updated issue (handler writes the response)",
+              "kind": "return"
+            }
+          ]
+        },
+        {
+          "type": "phase",
+          "id": "promote",
+          "title": "Promote and notify after the response",
+          "steps": [
+            {
+              "type": "message",
+              "id": "promote_call",
+              "from": "project_api",
+              "to": "promotion",
+              "title": "Promote unsynced action_log rows",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "attach",
+              "from": "promotion",
+              "to": "events_db",
+              "title": "ATTACH events.db; insert events and flip synced_at in one transaction",
+              "kind": "call",
+              "description": "Per-row session ids are preserved; device id is the constant td_watch_server. On failure the rows stay unsynced and the next request retries."
+            },
+            {
+              "type": "message",
+              "id": "notify",
+              "from": "project_api",
+              "to": "sse",
+              "title": "issue.upserted",
+              "kind": "async"
+            },
+            {
+              "type": "message",
+              "id": "sse_out",
+              "from": "sse",
+              "to": "browser",
+              "title": "Live update",
+              "kind": "async"
+            }
+          ]
+        },
+        {
+          "type": "phase",
+          "id": "converge",
+          "title": "Other devices converge",
+          "steps": [
+            {
+              "type": "message",
+              "id": "cli_pull",
+              "from": "cli_client",
+              "to": "middleware",
+              "title": "GET /v1/projects/{id}/sync/pull on its next round",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "cli_events",
+              "from": "events_db",
+              "to": "cli_client",
+              "title": "Promoted events after its cursor",
+              "kind": "return"
+            }
+          ],
+          "description": "The sync endpoints between membership and events.db are elided here; see the autosync journey for the full pull path."
+        }
+      ]
+    },
+    {
+      "id": "monitor-live-sync",
+      "title": "How the monitor stays live",
+      "description": "An open monitor owns a long-lived syncer: it prefers the server's event stream, probes the status endpoint with backoff when the stream drops, and falls back to timed rounds only when the server lacks live endpoints. Panels refresh whenever pulled data changes.",
+      "provenance": "Authored 2026-09-11 from pkg/monitor/sync_runtime.go, pkg/tdsync/live.go and internal/syncclient/client.go (Events). Not a captured trace; the exact ladder rungs and timeouts are in live.go.",
+      "status": "current",
+      "participants": [
+        {
+          "id": "model",
+          "element": "monitor.model",
+          "title": "Monitor model"
+        },
+        {
+          "id": "runtime",
+          "element": "monitor.sync_runtime",
+          "title": "Sync runtime"
+        },
+        {
+          "id": "live",
+          "element": "syncclient.live",
+          "title": "Live ladder"
+        },
+        {
+          "id": "syncer",
+          "element": "syncclient.syncer",
+          "title": "Syncer"
+        },
+        {
+          "id": "http",
+          "element": "syncclient.http",
+          "title": "HTTP adapter"
+        },
+        {
+          "id": "sse",
+          "element": "server.events_sse",
+          "title": "Project SSE"
+        },
+        {
+          "id": "data",
+          "element": "monitor.data",
+          "title": "Refresh & actions"
+        }
+      ],
+      "groups": [
+        {
+          "id": "sync_group",
+          "title": "Sync client",
+          "participants": [
+            "live",
+            "syncer",
+            "http"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "type": "phase",
+          "id": "start",
+          "title": "Start the ladder",
+          "steps": [
+            {
+              "type": "message",
+              "id": "init",
+              "from": "model",
+              "to": "runtime",
+              "title": "Init: start the sync runtime (Live waits for the gate to open)",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "live_start",
+              "from": "runtime",
+              "to": "live",
+              "title": "Live(ctx, onChange)",
+              "kind": "async"
+            },
+            {
+              "type": "message",
+              "id": "initial_round",
+              "from": "live",
+              "to": "syncer",
+              "title": "Initial Once()",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "subscribe",
+              "from": "live",
+              "to": "http",
+              "title": "Open events stream with Last-Event-ID",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "stream_open",
+              "from": "http",
+              "to": "sse",
+              "title": "GET /v1/projects/{id}/events",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "rung",
+              "from": "live",
+              "to": "runtime",
+              "title": "Status: rung = live",
+              "kind": "async"
+            }
+          ]
+        },
+        {
+          "type": "phase",
+          "id": "change",
+          "title": "React to a remote change",
+          "steps": [
+            {
+              "type": "message",
+              "id": "event",
+              "from": "sse",
+              "to": "http",
+              "title": "issue.upserted",
+              "kind": "async"
+            },
+            {
+              "type": "message",
+              "id": "request_sync",
+              "from": "live",
+              "to": "syncer",
+              "title": "Event arms a coalesce window, then syncPass (push and pull)",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "on_change",
+              "from": "live",
+              "to": "runtime",
+              "title": "onChange (pulled data changed)",
+              "kind": "async"
+            },
+            {
+              "type": "message",
+              "id": "refresh",
+              "from": "runtime",
+              "to": "model",
+              "title": "monitorSyncResultMsg",
+              "kind": "async"
+            },
+            {
+              "type": "message",
+              "id": "fetch",
+              "from": "model",
+              "to": "data",
+              "title": "fetchData",
+              "kind": "call"
+            }
+          ]
+        },
+        {
+          "type": "phase",
+          "id": "fallback",
+          "title": "Probe when the stream drops",
+          "steps": [
+            {
+              "type": "message",
+              "id": "stall",
+              "from": "http",
+              "to": "live",
+              "title": "Stream stalled or disconnected",
+              "kind": "return"
+            },
+            {
+              "type": "message",
+              "id": "timed",
+              "from": "live",
+              "to": "syncer",
+              "title": "Rung = probing: sync rounds driven by status-endpoint probes with backoff",
+              "kind": "call"
+            },
+            {
+              "type": "message",
+              "id": "rung_fallback",
+              "from": "live",
+              "to": "runtime",
+              "title": "Status: rung = probing (timed only if live endpoints return 404/405/501)",
+              "kind": "async"
+            },
+            {
+              "type": "message",
+              "id": "retry_stream",
+              "from": "live",
+              "to": "http",
+              "title": "Reopen the stream after the backoff delay (first retry immediate)",
+              "kind": "call",
+              "description": "Probes during the wait only trigger sync passes; they do not shorten the reconnect wait."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,591 @@
+// Authored architecture for td. Evidence paths are relative to the repository root.
+// Structure follows responsibilities and seams, not the package tree one-to-one.
+specification {
+  element actor
+  element subsystem
+  element component
+  element adapter
+  element store
+  element external
+  relationship calls
+  relationship reads
+  relationship writes
+  relationship uses
+  relationship embeds
+  relationship streams
+  relationship sends
+  relationship notifies
+  relationship replicates
+  tag current
+  tag proposed
+}
+
+model {
+  user = actor 'Developer or Agent' {
+    description 'Runs td from a shell, an agent harness, or inside Sidecar. Agents are first-class users: every capability has a non-interactive path with JSON output.'
+    metadata { uid 'user' fractalColor '#759EB5' evidence ['README.md', 'docs/primer.md'] }
+  }
+
+  // ───────────────────────────── CLI ─────────────────────────────
+  cli = subsystem 'td CLI' {
+    description 'Cobra command tree. The primary surface for agents: complete, scriptable, with a JSON envelope for every result and error.'
+    technology 'Go, cobra'
+    metadata { uid 'cli' fractalColor '#759EB5' evidence ['main.go', 'cmd/root.go', 'docs/guides/cli-commands-guide.md'] }
+
+    root = component 'Root & Dispatch' {
+      description 'Resolves the project root (--work-dir, TD_WORK_DIR, .td-root, associations), runs the gated sync hooks around every command, and turns errors into a JSON envelope or a human hint.'
+      metadata { uid 'cli.root' fractalColor '#759EB5' evidence ['cmd/root.go', 'cmd/errcode.go', 'cmd/errors.go'] }
+    }
+
+    issue_cmds = component 'Issue Commands' {
+      description 'create, list, show, update, log, handoff, note, comment, due, defer, link. Read and write issues through the store facade and render via the output layer.'
+      metadata { uid 'cli.issue_cmds' fractalColor '#759EB5' evidence ['cmd/create.go', 'cmd/list.go', 'cmd/show.go', 'cmd/update.go', 'cmd/log.go', 'cmd/handoff.go', 'cmd/note.go'] }
+    }
+
+    workflow_cmds = component 'Workflow Commands' {
+      description 'start, review, approve, reject, close, block, unblock, reopen. Each transition is checked against the shared transition table; approve and close eligibility comes from the review policy before anything is written.'
+      metadata { uid 'cli.workflow_cmds' fractalColor '#759EB5' evidence ['cmd/start.go', 'cmd/review.go', 'cmd/block.go', 'cmd/review_policy.go', 'cmd/workflow.go'] }
+    }
+
+    session_cmds = component 'Session & Context Commands' {
+      description 'usage, resume, session, ws (work sessions), focus. Give a new context window the durable state it needs to continue.'
+      metadata { uid 'cli.session_cmds' fractalColor '#759EB5' evidence ['cmd/context.go', 'cmd/system.go', 'cmd/ws.go', 'cmd/focus.go', 'cmd/current_state.go'] }
+    }
+
+    query_cmds = component 'Query & Reporting Commands' {
+      description 'query (TDQ), search, stats, board, dependencies, epic. Read-only projections over the same store.'
+      metadata { uid 'cli.query_cmds' fractalColor '#759EB5' evidence ['cmd/query.go', 'cmd/search.go', 'cmd/stats.go', 'cmd/board.go', 'cmd/dependencies.go', 'cmd/epic.go'] }
+    }
+
+    sync_cmds = component 'Auth & Sync Commands' {
+      description 'auth login/logout, sync init/link/status/push/pull/tail/enable/disable. Registered behind the sync_cli feature gate; sync status stays available for diagnostics.'
+      metadata { uid 'cli.sync_cmds' fractalColor '#759EB5' evidence ['cmd/sync.go', 'cmd/auth.go', 'cmd/sync_init.go', 'cmd/sync_status.go', 'cmd/sync_tail.go', 'cmd/feature_gate.go'] }
+    }
+
+    autosync_hooks = component 'Autosync Hooks' {
+      description 'PersistentPreRun/PostRun hooks. Run one push-and-pull round on startup (for commands not on the skip list) and, debounced, after any mutating command, when the per-project gate is open.'
+      metadata { uid 'cli.autosync_hooks' fractalColor '#759EB5' evidence ['cmd/autosync.go', 'cmd/feature_gate.go'] }
+    }
+
+    system_cmds = component 'System Commands' {
+      description 'init, doctor, undo, config, export/import, upgrade, version, serve, monitor. Project bootstrap, repair, and launching the other surfaces.'
+      metadata { uid 'cli.system_cmds' fractalColor '#759EB5' evidence ['cmd/init.go', 'cmd/doctor.go', 'cmd/undo.go', 'cmd/config.go', 'cmd/system.go', 'cmd/serve.go', 'cmd/monitor.go'] }
+    }
+
+    output = component 'Output Rendering' {
+      description 'Human tables, markdown, trees, and the --json contract shared by every command. JSON stdout stays pure; hints go to stderr.'
+      metadata { uid 'cli.output' fractalColor '#759EB5' evidence ['internal/output/output.go', 'internal/output/markdown.go', 'internal/output/tree.go', 'cmd/output_helpers.go'] }
+    }
+
+    suggest = component 'Hints & Suggestions' {
+      description 'Did-you-mean and alias hints for unknown flags, and workflow hints for unknown commands such as done or finish. Reduces agent retry loops.'
+      metadata { uid 'cli.suggest' fractalColor '#759EB5' evidence ['internal/suggest/suggest.go', 'cmd/root.go'] }
+    }
+
+    analytics = component 'Usage & Error Telemetry' {
+      description 'Appends command usage and failed invocations to local JSONL files under .todos for agent-DX analysis. Local only; never synced.'
+      metadata { uid 'cli.analytics' fractalColor '#759EB5' evidence ['internal/db/analytics.go', 'internal/db/agent_errors.go', 'cmd/stats_errors.go'] }
+    }
+
+    redact_cmds = component 'td redact (proposed)' {
+      #proposed
+      description 'Supported redaction of logs and their action_log copies, with WAL checkpoint and vacuum. Emits a redact sync event through the normal push path so peers converge.'
+      metadata { uid 'cli.redact_cmds' fractalColor '#D9A441' evidence ['docs/plans/active/redaction.md'] }
+    }
+  }
+
+  // ───────────────────────────── Monitor TUI ─────────────────────────────
+  monitor = subsystem 'Monitor TUI' {
+    description 'Bubble Tea task monitor for humans. Runs standalone as td monitor or embedded inside Sidecar. Its data assembly (task list, activity, sort modes) is also reused by td serve.'
+    technology 'Go, Bubble Tea v2, Lip Gloss'
+    metadata { uid 'monitor' fractalColor '#9A91C4' evidence ['pkg/monitor/doc.go', 'pkg/monitor/model.go', 'docs/guides/declarative-modal-guide.md'] }
+
+    model = component 'Model, Panels & Views' {
+      description 'The Bubble Tea model: current-work, task-list, and activity panels, focus, scrolling, search, and the footer.'
+      metadata { uid 'monitor.model' fractalColor '#9A91C4' evidence ['pkg/monitor/model.go', 'pkg/monitor/view.go', 'pkg/monitor/rows.go', 'pkg/monitor/focus.go'] }
+    }
+
+    kanban = component 'Boards & Kanban' {
+      description 'Board view with swimlanes, drag positions, and the board editor. Board layout state lives in the database, not config.json.'
+      metadata { uid 'monitor.kanban' fractalColor '#9A91C4' evidence ['pkg/monitor/kanban.go', 'pkg/monitor/board_editor.go', 'internal/db/boards.go'] }
+    }
+
+    modals = component 'Declarative Modals & Forms' {
+      description 'Stacking modal system, issue forms with autofill, notes editor, help, and confirmations. Renders through the injected theme.'
+      metadata { uid 'monitor.modals' fractalColor '#9A91C4' evidence ['pkg/monitor/modal/modal.go', 'pkg/monitor/form.go', 'pkg/monitor/form_modal.go', 'pkg/monitor/notes_modal.go', 'docs/guides/declarative-modal-guide.md'] }
+    }
+
+    data = component 'Refresh & Actions' {
+      description 'Polls the store on an interval, assembles task list and activity data (also reused by td serve), and dispatches actions (start, review, approve, delete) through the same policy as the CLI.'
+      metadata { uid 'monitor.data' fractalColor '#9A91C4' evidence ['pkg/monitor/data.go', 'pkg/monitor/actions.go', 'pkg/monitor/commands.go'] }
+    }
+
+    theme = adapter 'Theme & Embedding Seam' {
+      description 'Host-neutral palette and optional panel/modal renderers so an embedder (Sidecar) can restyle a running monitor without restarting it.'
+      metadata { uid 'monitor.theme' fractalColor '#9A91C4' evidence ['pkg/monitor/theme.go', 'pkg/monitor/modal_theme.go', 'pkg/monitor/styles.go', 'docs/plans/active/sidecar-theme-parity.md'] }
+    }
+
+    sync_runtime = component 'Background Sync Runtime' {
+      description 'Owns a tdsync Syncer for the open project: starts the live ladder, refreshes panels when pulled data changes, and forwards rung status to an embedder callback.'
+      metadata { uid 'monitor.sync_runtime' fractalColor '#9A91C4' evidence ['pkg/monitor/sync_runtime.go', 'pkg/monitor/sync_prompt.go'] }
+    }
+
+    dbpool = component 'Shared DB Handle' {
+      description 'Singleton connection per database path so value-copied Bubble Tea models do not leak SQLite connections when embedded.'
+      metadata { uid 'monitor.dbpool' fractalColor '#9A91C4' evidence ['pkg/monitor/dbpool.go'] }
+    }
+  }
+
+  // ───────────────────────────── td serve ─────────────────────────────
+  serve = subsystem 'td serve Local API' {
+    description 'Loopback HTTP API over one project. The canonical boundary for browser and desktop clients; the same handlers are reused by the sync server for hosted projects.'
+    technology 'Go net/http, SSE'
+    metadata { uid 'serve' fractalColor '#B59669' evidence ['internal/serve/server.go', 'docs/td-serve-spec.md', 'cmd/serve.go'] }
+
+    router = component 'Router & Middleware' {
+      description 'Route table, optional bearer token, CORS, panic recovery, graceful shutdown. One process per td base directory.'
+      metadata { uid 'serve.router' fractalColor '#B59669' evidence ['internal/serve/server.go', 'internal/serve/response.go'] }
+    }
+
+    handlers = component 'Issue, Board & Transition Handlers' {
+      description 'Read, write, transition, review, comment, dependency, board, focus, stats and label handlers. Functions over a request context so another host can wrap them; list and activity reads reuse the monitor data assembly.'
+      metadata { uid 'serve.handlers' fractalColor '#B59669' evidence ['internal/serve/handlers_read.go', 'internal/serve/handlers_write.go', 'internal/serve/handlers_transitions.go', 'internal/serve/handlers_reviews.go', 'internal/serve/context.go'] }
+    }
+
+    sse = component 'Change Stream' {
+      description 'GET /v1/events: broadcasts a refresh to connected clients after each write (and on a polled change token), then runs a debounced autosync push and pull of its own.'
+      metadata { uid 'serve.sse' fractalColor '#B59669' evidence ['internal/serve/sse.go'] }
+    }
+
+    portfile = component 'Port File & Web Session' {
+      description 'Writes .todos/serve-port with port, pid and instance id for discovery; bootstraps a dedicated web session so writes are attributed.'
+      metadata { uid 'serve.portfile' fractalColor '#B59669' evidence ['internal/serve/portfile.go', 'internal/serve/session.go'] }
+    }
+  }
+
+  // ───────────────────────────── Domain core ─────────────────────────────
+  core = subsystem 'Domain Core' {
+    description 'Framework-free rules shared by every surface: models, the status state machine, review policy, session identity, TDQ, and configuration.'
+    technology 'Go'
+    metadata { uid 'core' fractalColor '#739886' evidence ['internal/models/models.go', 'internal/workflow/workflow.go', 'internal/reviewpolicy/policy.go'] }
+
+    models = component 'Models' {
+      description 'Issue, Log, Handoff, Comment, Note, Board, WorkSession, Config, ActionLog. The vocabulary every layer speaks.'
+      metadata { uid 'core.models' fractalColor '#739886' evidence ['internal/models/models.go'] }
+    }
+
+    workflow = component 'Status State Machine' {
+      description 'open → in_progress → in_review → closed (or blocked). The transition table every surface validates against. Guard types exist (blocked, different-reviewer) but every current caller uses the liberal DefaultMachine, which skips guards; independence is enforced by the review policy, not here.'
+      metadata { uid 'core.workflow' fractalColor '#739886' evidence ['internal/workflow/workflow.go', 'internal/workflow/transitions.go', 'internal/workflow/guards.go', 'docs/implemented/spec-td-state-machine.md'] }
+    }
+
+    reviewpolicy = component 'Review Policy' {
+      description 'Who may approve or close. Modes strict, balanced, delegated, trusted; reviewer independence, record-only attestations, and review freshness after edits. Pure data in, decision out; callers resolve the mode from config and pass it in.'
+      metadata { uid 'core.reviewpolicy' fractalColor '#739886' evidence ['internal/reviewpolicy/policy.go', 'docs/status-and-review.md', 'docs/multi-agent-sessions.md'] }
+    }
+
+    session = component 'Session Identity' {
+      description 'Sessions keyed by branch + agent fingerprint + TD_CONTEXT_ID, with worktree awareness and liveness. Independence between implementer and reviewer is derived from these identities.'
+      metadata { uid 'core.session' fractalColor '#739886' evidence ['internal/session/session.go', 'internal/session/agent_fingerprint.go', 'internal/workdir/workdir.go'] }
+    }
+
+    query = component 'TDQ Query Engine' {
+      description 'Lexer, parser and evaluator for the td query language. Runs against any QuerySource, so the same query works on a local database or a server snapshot.'
+      metadata { uid 'core.query' fractalColor '#739886' evidence ['internal/query/parser.go', 'internal/query/evaluator.go', 'internal/query/execute.go', 'internal/query/source.go', 'docs/guides/query-guide.md'] }
+    }
+
+    dependency = component 'Dependency Rules' {
+      description 'Blocking relationships, cycle detection, and ready-to-start evaluation.'
+      metadata { uid 'core.dependency' fractalColor '#739886' evidence ['internal/dependency/dependency.go', 'internal/db/issue_relations.go'] }
+    }
+
+    config = component 'Project Config & Feature Flags' {
+      description '.todos/config.json (review_policy_mode, title rules, monitor state) and named feature flags with env overrides.'
+      metadata { uid 'core.config' fractalColor '#739886' evidence ['internal/config/config.go', 'internal/features/features.go', 'internal/features/sync_gate_map.go'] }
+    }
+
+    notes_api = component 'Notes Go API' {
+      description 'pkg/notes: the public in-process API for freeform notes. Sidecar calls this instead of speaking SQL to issues.db.'
+      metadata { uid 'core.notes_api' fractalColor '#739886' evidence ['pkg/notes/notes.go', 'internal/db/notes.go'] }
+    }
+
+    agent_instructions = component 'Agent Instruction Installer' {
+      description 'Detects CLAUDE.md / AGENTS.md style files and installs or upgrades a versioned td guidance block.'
+      metadata { uid 'core.agent_instructions' fractalColor '#739886' evidence ['internal/agent/instructions.go', 'cmd/init.go'] }
+    }
+
+    git = adapter 'Git Adapter' {
+      description 'Branch, top-level, and diff-stat lookups used for session scoping, worktree resolution and handoff snapshots.'
+      metadata { uid 'core.git' fractalColor '#739886' evidence ['internal/git/git.go', 'internal/workdir/workdir.go'] }
+    }
+
+    version = component 'Update Checker' {
+      description 'Cached background check against GitHub releases; surfaces an upgrade hint in the monitor and td upgrade.'
+      metadata { uid 'core.version' fractalColor '#739886' evidence ['internal/version/checker.go', 'internal/version/cache.go', 'internal/version/version.go'] }
+    }
+
+    delegate = component 'td delegate (proposed)' {
+      #proposed
+      description 'Explicit implementer/reviewer role declaration layered above session inference. Declared role wins; session identity remains the fallback.'
+      metadata { uid 'core.delegate' fractalColor '#D9A441' evidence ['docs/plans/active/td-delegate-design.md'] }
+    }
+  }
+
+  // ───────────────────────────── Local store ─────────────────────────────
+  store = subsystem 'Local Store' {
+    description 'SQLite persistence for one project under .todos/. Writes from the CLI, monitor, serve and notes API go through a cross-process lock and land in action_log, which powers undo, activity, and sync.'
+    technology 'SQLite (modernc), JSONL'
+    metadata { uid 'store' fractalColor '#89A579' evidence ['internal/db/db.go', 'internal/db/schema.go', 'docs/db-layer-mutation.md'] }
+
+    facade = component 'DB Facade & Migrations' {
+      description 'Open, initialize, migrate, integrity and FK audit. The single door into the database for every surface.'
+      metadata { uid 'store.facade' fractalColor '#89A579' evidence ['internal/db/db.go', 'internal/db/schema.go', 'internal/db/migrations.go', 'internal/db/integrity.go'] }
+    }
+
+    repositories = component 'Entity Repositories' {
+      description 'Issues, logs, handoffs, comments, notes, boards, labels, work sessions, sessions, claims, relations, reviews, and search (FTS).'
+      metadata { uid 'store.repositories' fractalColor '#89A579' evidence ['internal/db/issues.go', 'internal/db/activity.go', 'internal/db/boards.go', 'internal/db/notes.go', 'internal/db/work_sessions.go', 'internal/db/sessions.go', 'internal/db/reviews.go', 'internal/db/search.go'] }
+    }
+
+    logged = component 'Logged Mutations & action_log' {
+      description 'Write path that records old and new state per mutation. Also supersedes stale approvals when a review-relevant field changes.'
+      metadata { uid 'store.logged' fractalColor '#89A579' evidence ['internal/db/issues_logged.go', 'internal/db/boards_logged.go', 'internal/db/relations_logged.go', 'internal/db/activity.go'] }
+    }
+
+    lock = component 'Cross-Process Write Lock' {
+      description 'OS file lock around CLI, monitor, serve and notes writes so concurrent processes do not interleave transactions. The sync engine applies remote events in its own SQLite transaction outside this lock.'
+      metadata { uid 'store.lock' fractalColor '#89A579' evidence ['internal/db/lock.go', 'internal/db/lock_unix.go', 'internal/db/lock_windows.go'] }
+    }
+
+    sync_state = component 'Sync State & History' {
+      description 'sync_state (project id, cursor, last sync), sync_history, sync_conflicts and skipped events.'
+      metadata { uid 'store.sync_state' fractalColor '#89A579' evidence ['internal/db/sync_state.go', 'internal/db/sync_history.go', 'internal/db/sync_skipped.go'] }
+    }
+
+    workdir = component 'Project Root Resolver' {
+      description 'Finds the .todos directory: .td-root redirection for git worktrees, plus ~/.config/td/associations.json for directories outside a repo (user-level, written by td associate).'
+      metadata { uid 'store.workdir' fractalColor '#89A579' evidence ['internal/workdir/workdir.go', 'internal/workdir/associations.go'] }
+    }
+
+    issues_db = store 'issues.db' {
+      description '.todos/issues.db — issues, logs, handoffs, comments, notes, boards, sessions, work sessions, action_log, sync tables.'
+      technology 'SQLite'
+      metadata { uid 'store.issues_db' fractalColor '#89A579' evidence ['internal/db/schema.go', 'internal/db/paths.go'] }
+    }
+
+    config_json = store 'config.json & telemetry files' {
+      description '.todos/config.json plus command_usage.jsonl and agent_errors.jsonl. Text an agent can read, diff and repair.'
+      technology 'JSON, JSONL'
+      metadata { uid 'store.config_json' fractalColor '#89A579' evidence ['internal/config/config.go', 'internal/db/analytics.go', 'internal/db/agent_errors.go'] }
+    }
+  }
+
+  // ───────────────────────────── Sync client ─────────────────────────────
+  syncclient = subsystem 'Sync Client' {
+    description 'Turns action_log into events, pushes them to a td-sync server, pulls and applies remote events, and keeps a live SSE connection when a monitor is open.'
+    technology 'Go, HTTPS, SSE'
+    metadata { uid 'syncclient' fractalColor '#C48282' evidence ['pkg/tdsync/tdsync.go', 'docs/sync-client-guide.md', 'docs/sync-agent-guide.md'] }
+
+    syncer = component 'Syncer & Gate' {
+      description 'Steady-state policy: decides whether sync is open (kill switch, feature flag, per-project configured), runs one push-and-pull round, expires credentials on auth failure.'
+      metadata { uid 'syncclient.syncer' fractalColor '#C48282' evidence ['pkg/tdsync/tdsync.go', 'cmd/feature_gate.go'] }
+    }
+
+    live = component 'Live Sync Ladder' {
+      description 'Long-lived loop: SSE stream when the server allows it, timed polling fallback otherwise, RequestSync for immediate rounds.'
+      metadata { uid 'syncclient.live' fractalColor '#C48282' evidence ['pkg/tdsync/live.go'] }
+    }
+
+    engine = component 'Event Engine' {
+      description 'Reads pending action_log rows as events (backfilling creates), applies remote events with conflict detection, marks rows synced, resolves pull outcomes.'
+      metadata { uid 'syncclient.engine' fractalColor '#C48282' evidence ['internal/sync/client.go', 'internal/sync/events.go', 'internal/sync/backfill.go', 'internal/sync/pullpolicy.go', 'internal/sync/local_only.go'] }
+    }
+
+    taxonomy = component 'Event Taxonomy' {
+      description 'Canonical entity and action types shared by client and server; normalizes legacy singular names and maps td action types onto create/update/delete/restore.'
+      metadata { uid 'syncclient.taxonomy' fractalColor '#C48282' evidence ['internal/events/taxonomy.go'] }
+    }
+
+    http = adapter 'Server HTTP Adapter' {
+      description 'Typed client for auth (device flow with PKCE), projects, members, push, pull, snapshot, status and the events stream. Transport only; no policy.'
+      metadata { uid 'syncclient.http' fractalColor '#C48282' evidence ['internal/syncclient/client.go', 'internal/syncclient/pkce.go'] }
+    }
+
+    credentials = store 'User Sync Config' {
+      description '~/.config/td/auth.json (API key, device id, server URL) and config.json (autosync kill switch, interval).'
+      technology 'JSON'
+      metadata { uid 'syncclient.credentials' fractalColor '#C48282' evidence ['internal/syncconfig/syncconfig.go'] }
+    }
+  }
+
+  // ───────────────────────────── td-sync server ─────────────────────────────
+  server = subsystem 'td-sync Server' {
+    description 'Separate single-binary service. Authenticates users, stores an append-only event log per project, materializes a live project database, and exposes the same project API a browser client uses.'
+    technology 'Go net/http, SQLite, Docker'
+    metadata { uid 'server' fractalColor '#B58A9E' evidence ['cmd/td-sync/main.go', 'internal/api/server.go', 'docs/sync-server-ops-guide.md'] }
+
+    main = component 'Binary, Config & Admin CLI' {
+      description 'Loads env config, opens server.db, starts the HTTP server; td-sync admin subcommands for operators.'
+      metadata { uid 'server.main' fractalColor '#B58A9E' evidence ['cmd/td-sync/main.go', 'cmd/td-sync/admin.go', 'internal/api/config.go'] }
+    }
+
+    auth = component 'Authentication' {
+      description 'Email magic-link login, device flow with PKCE, web token exchange, API keys and auth event audit.'
+      metadata { uid 'server.auth' fractalColor '#B58A9E' evidence ['internal/api/auth.go', 'internal/serverdb/device_auth.go', 'internal/serverdb/email_auth.go', 'internal/serverdb/apikeys.go'] }
+    }
+
+    middleware = component 'Auth, Membership & Rate Limits' {
+      description 'Bearer auth, project role checks (reader/writer/owner), per-key rate limits, CORS, metrics, and session stamping for td-watch writers.'
+      metadata { uid 'server.middleware' fractalColor '#B58A9E' evidence ['internal/api/middleware.go', 'internal/api/project_middleware.go', 'internal/api/ratelimit.go', 'internal/api/cors.go', 'internal/api/metrics.go'] }
+    }
+
+    sync_api = component 'Sync Endpoints' {
+      description 'push, pull, status, snapshot. Inserts events idempotently by (device, session, client action id) and applies accepted events to the live project database.'
+      metadata { uid 'server.sync_api' fractalColor '#B58A9E' evidence ['internal/api/sync.go', 'internal/api/sync_apply.go', 'internal/sync/engine.go'] }
+    }
+
+    project_api = component 'Project REST API' {
+      description '/v1/projects/{id}/issues, boards, focus, stats, sessions, labels. Wraps td serve handlers over project.db so hosted projects behave like local ones.'
+      metadata { uid 'server.project_api' fractalColor '#B58A9E' evidence ['internal/api/project_routes.go'] }
+    }
+
+    promotion = component 'action_log Promotion' {
+      description 'After a project API write, atomically copies new action_log rows from project.db into events.db (ATTACH) so CLI clients pull them like any other event.'
+      metadata { uid 'server.promotion' fractalColor '#B58A9E' evidence ['internal/api/action_log_promotion.go'] }
+    }
+
+    events_sse = component 'Project Event Stream' {
+      description 'Per-project SSE hub: issue.upserted, issue.deleted, refresh. Fed by sync pushes and project API writes.'
+      metadata { uid 'server.events_sse' fractalColor '#B58A9E' evidence ['internal/api/sse_hub.go', 'internal/api/events_handler.go', 'internal/api/broadcast.go'] }
+    }
+
+    projects_members = component 'Projects, Members & Invitations' {
+      description 'Project CRUD, membership roles, invitation lifecycle.'
+      metadata { uid 'server.projects_members' fractalColor '#B58A9E' evidence ['internal/api/projects.go', 'internal/api/members.go', 'internal/api/invitations.go'] }
+    }
+
+    admin_api = component 'Admin API' {
+      description 'Scoped admin endpoints for server overview, users, keys, impersonation tokens, projects, cursors and event inspection.'
+      metadata { uid 'server.admin_api' fractalColor '#B58A9E' evidence ['internal/api/admin_server.go', 'internal/api/admin_users.go', 'internal/api/admin_projects.go', 'internal/api/admin_events.go', 'internal/api/admin_snapshots.go', 'internal/api/snapshot_query_source.go'] }
+    }
+
+    email = adapter 'Email Adapter' {
+      description 'Provider-neutral sender with Cloudflare, log and in-memory implementations.'
+      metadata { uid 'server.email' fractalColor '#B58A9E' evidence ['internal/email/email.go', 'internal/email/cloudflare.go', 'internal/email/log.go', 'internal/email/memory.go'] }
+    }
+
+    server_db = store 'server.db' {
+      description 'Users, API keys, projects, memberships, invitations, sync cursors, auth and rate-limit events.'
+      technology 'SQLite'
+      metadata { uid 'server.server_db' fractalColor '#B58A9E' evidence ['internal/serverdb/schema.go', 'internal/serverdb/serverdb.go'] }
+    }
+
+    events_db = store 'Per-project events.db' {
+      description 'Append-only event log keyed by server_seq. The source of truth for a hosted project.'
+      technology 'SQLite'
+      metadata { uid 'server.events_db' fractalColor '#B58A9E' evidence ['internal/api/dbpool.go', 'internal/sync/engine.go'] }
+    }
+
+    project_db = store 'Per-project project.db' {
+      description 'Materialized td schema, bootstrapped by replaying events.db. Read and write target for the project REST API; tracks applied_events cursor.'
+      technology 'SQLite'
+      metadata { uid 'server.project_db' fractalColor '#B58A9E' evidence ['internal/api/project_live_pool.go', 'internal/api/sync_apply.go'] }
+    }
+
+    redaction = component 'Event Redaction (proposed)' {
+      #proposed
+      description 'td-sync admin redact: host-only erasure of event payloads in place, checkpoint and vacuum, and a report of which peers already pulled the event (cursor blast radius). No HTTP endpoint.'
+      metadata { uid 'server.redaction' fractalColor '#D9A441' evidence ['docs/plans/active/redaction.md'] }
+    }
+  }
+
+  // ───────────────────────────── External ─────────────────────────────
+  external = subsystem 'Neighbours' {
+    description 'Systems td embeds into, serves, or depends on.'
+    metadata { uid 'external' fractalColor '#8C8C8C' evidence ['README.md'] }
+
+    sidecar = external 'Sidecar' {
+      description 'Terminal workspace that embeds the monitor as a tab and reads notes through pkg/notes.'
+      metadata { uid 'external.sidecar' fractalColor '#8C8C8C' evidence ['pkg/monitor/doc.go', 'pkg/notes/notes.go', 'docs/notes-sidecar-gated-merge-plan.md'] }
+    }
+
+    tdwatch = external 'td-watch / browser clients' {
+      description 'Web UI that talks to td serve locally or to the sync server project API for hosted projects.'
+      metadata { uid 'external.tdwatch' fractalColor '#8C8C8C' evidence ['docs/td-serve-spec.md', 'internal/api/project_routes.go'] }
+    }
+
+    litestream = external 'Litestream' {
+      description 'Deploy-time WAL replication of server.db. The shipped configs replicate to a local file; the S3 replica is present but commented out and not mounted in prod.'
+      metadata { uid 'external.litestream' fractalColor '#8C8C8C' evidence ['deploy/litestream.yml', 'deploy/docker-compose.yml'] }
+    }
+
+    github = external 'GitHub Releases' {
+      description 'Source for the update check and Homebrew tap.'
+      metadata { uid 'external.github' fractalColor '#8C8C8C' evidence ['internal/version/checker.go', '.github/workflows/release.yml'] }
+    }
+
+    email_provider = external 'Email provider' {
+      description 'Cloudflare email delivery for magic links and device approvals.'
+      metadata { uid 'external.email_provider' fractalColor '#8C8C8C' evidence ['internal/email/cloudflare.go'] }
+    }
+  }
+
+  // ───────────────────────────── Relationships ─────────────────────────────
+  user .calls cli 'Runs commands, often with --json' { metadata { uid 'user-cli' } }
+  user .calls monitor 'Watches and acts on work' { metadata { uid 'user-monitor' } }
+  user .calls external.tdwatch 'Uses a browser client' { metadata { uid 'user-tdwatch' } }
+
+  // CLI internals
+  cli.root .calls cli.autosync_hooks 'Pre/post-run hooks' { metadata { uid 'root-hooks' } }
+  cli.root .uses store.workdir 'Resolve project root' { metadata { uid 'root-workdir' } }
+  cli.root .uses cli.suggest 'Unknown flag or command hints' { metadata { uid 'root-suggest' } }
+  cli.root .writes cli.analytics 'Command usage and failures' { metadata { uid 'root-analytics' } }
+  cli.system_cmds .calls monitor 'td monitor launches the TUI' { metadata { uid 'system-monitor' } }
+  cli.system_cmds .calls serve 'td serve starts the local API' { metadata { uid 'system-serve' } }
+  cli.system_cmds .uses core.agent_instructions 'Bootstrap and upgrade' { metadata { uid 'system-instructions' } }
+  cli.system_cmds .uses core.version 'Bootstrap and upgrade' { metadata { uid 'system-version' } }
+  cli.system_cmds .calls store.logged 'Write through logged mutations' { metadata { uid 'system-undo' } }
+  cli.issue_cmds .uses cli.output 'Render results' { metadata { uid 'issue-output' } }
+  cli.workflow_cmds .uses cli.output 'Render results' { metadata { uid 'workflow-output' } }
+  cli.query_cmds .uses cli.output 'Render results' { metadata { uid 'query-output' } }
+  cli.session_cmds .uses cli.output 'Render results' { metadata { uid 'session-output' } }
+  cli.analytics .writes store.config_json 'Append JSONL telemetry' { metadata { uid 'analytics-files' } }
+  cli.issue_cmds .uses core.models 'Shared vocabulary' { metadata { uid 'issue-models' } }
+  store.repositories .uses core.models 'Shared vocabulary' { metadata { uid 'repos-models' } }
+  serve.handlers .uses core.models 'Shared vocabulary' { metadata { uid 'handlers-models' } }
+  monitor.data .uses core.models 'Shared vocabulary' { metadata { uid 'data-models' } }
+
+  // CLI → core and store
+  cli.issue_cmds .calls store.logged 'Write through logged mutations' { metadata { uid 'issue-logged' } }
+  cli.issue_cmds .reads store.repositories 'Read project state' { metadata { uid 'issue-repos' } }
+  cli.workflow_cmds .uses core.workflow 'Apply shared rules' { metadata { uid 'workflow-machine' } }
+  cli.workflow_cmds .uses core.reviewpolicy 'Apply shared rules' { metadata { uid 'workflow-policy' } }
+  cli.workflow_cmds .calls store.logged 'Write through logged mutations' { metadata { uid 'workflow-logged' } }
+  cli.session_cmds .uses core.session 'Apply shared rules' { metadata { uid 'session-identity' } }
+  cli.session_cmds .reads store.repositories 'Read project state' { metadata { uid 'session-repos' } }
+  cli.query_cmds .uses core.query 'Apply shared rules' { metadata { uid 'query-tdq' } }
+  cli.query_cmds .reads store.repositories 'Read project state' { metadata { uid 'query-repos' } }
+  cli.sync_cmds .calls syncclient.syncer 'Run a sync round' { metadata { uid 'synccmd-syncer' } }
+  cli.sync_cmds .calls syncclient.http 'Login and project link' { metadata { uid 'synccmd-http' } }
+  cli.sync_cmds .writes syncclient.credentials 'Store credentials and kill switch' { metadata { uid 'synccmd-credentials' } }
+  cli.autosync_hooks .calls syncclient.syncer 'Run a sync round' { metadata { uid 'hooks-syncer' } }
+  cli.autosync_hooks .uses core.config 'Apply shared rules' { metadata { uid 'hooks-config' } }
+
+  // Monitor
+  monitor.model .uses monitor.modals 'Open forms, notes, help' { metadata { uid 'model-modals' } }
+  monitor.model .uses monitor.kanban 'Board view' { metadata { uid 'model-kanban' } }
+  monitor.model .calls monitor.data 'Refresh and dispatch actions' { metadata { uid 'model-data' } }
+  monitor.model .uses monitor.theme 'Resolve colors and renderers' { metadata { uid 'model-theme' } }
+  monitor.model .uses monitor.sync_runtime 'Show sync status, refresh on change' { metadata { uid 'model-syncruntime' } }
+  monitor.data .uses monitor.dbpool 'Shared connection' { metadata { uid 'data-dbpool' } }
+  monitor.data .reads store.repositories 'Read project state' { metadata { uid 'data-repos' } }
+  monitor.data .calls store.logged 'Write through logged mutations' { metadata { uid 'data-logged' } }
+  monitor.data .uses core.reviewpolicy 'Apply shared rules' { metadata { uid 'data-policy' } }
+  monitor.data .uses core.workflow 'Apply shared rules' { metadata { uid 'data-workflow' } }
+  monitor.model .uses core.version 'Background update check' { metadata { uid 'model-version' } }
+  monitor.sync_runtime .calls syncclient.live 'Own a live Syncer' { metadata { uid 'syncruntime-live' } }
+  monitor.model .writes store.config_json 'Persist pane heights and filters' { metadata { uid 'model-config' } }
+
+  // td serve
+  serve.router .calls serve.handlers 'Route requests' { metadata { uid 'router-handlers' } }
+  serve.router .calls serve.sse 'GET /v1/events' { metadata { uid 'router-sse' } }
+  serve.router .uses serve.portfile 'Announce port and web session' { metadata { uid 'router-portfile' } }
+  serve.handlers .uses core.workflow 'Apply shared rules' { metadata { uid 'handlers-workflow' } }
+  serve.handlers .uses core.reviewpolicy 'Apply shared rules' { metadata { uid 'handlers-policy' } }
+  serve.handlers .uses core.query 'Apply shared rules' { metadata { uid 'handlers-query' } }
+  serve.handlers .calls store.logged 'Write through logged mutations' { metadata { uid 'handlers-logged' } }
+  serve.handlers .reads store.repositories 'Read project state' { metadata { uid 'handlers-repos' } }
+  serve.sse .reads store.facade 'Poll change token' { metadata { uid 'sse-facade' } }
+  external.tdwatch .calls serve.router 'Local HTTP + SSE' { metadata { uid 'tdwatch-serve' } }
+  serve.sse .calls syncclient.engine 'Push and pull after a write' { metadata { uid 'sse-engine' } }
+  serve.sse .calls syncclient.http 'Push and pull after a write' { metadata { uid 'sse-http' } }
+  serve.sse .reads syncclient.credentials 'Server URL, key, device id' { metadata { uid 'sse-credentials' } }
+  serve.handlers .uses monitor.data 'Reuse list and activity assembly' { metadata { uid 'handlers-monitor-data' } }
+  serve.handlers .uses core.dependency 'Apply shared rules' { metadata { uid 'handlers-dependency' } }
+  cli.issue_cmds .uses core.dependency 'Apply shared rules' { metadata { uid 'issue-dependency' } }
+
+  // Core internals
+  core.session .uses core.git 'Branch and worktree' { metadata { uid 'session-git' } }
+  core.session .reads store.repositories 'Read project state' { metadata { uid 'session-store' } }
+  core.config .uses core.reviewpolicy 'Parse review_policy_mode into a policy mode' { metadata { uid 'config-policy' } }
+  cli.workflow_cmds .uses core.config 'Apply shared rules' { metadata { uid 'workflow-config' } }
+  core.query .reads store.repositories 'Read project state' { metadata { uid 'query-source' } }
+  core.notes_api .calls store.logged 'Write through logged mutations' { metadata { uid 'notes-logged' } }
+  core.config .writes store.config_json 'Load and save' { metadata { uid 'config-file' } }
+  core.version .calls external.github 'Latest release lookup' { metadata { uid 'version-github' } }
+  core.dependency .reads store.repositories 'Read project state' { metadata { uid 'dependency-store' } }
+
+  // Store internals
+  store.logged .uses store.lock 'Exclusive write' { metadata { uid 'logged-lock' } }
+  store.logged .uses core.reviewpolicy 'Supersede stale approvals' { metadata { uid 'logged-policy' } }
+  store.logged .writes store.issues_db 'Entities plus action_log' { metadata { uid 'logged-db' } }
+  store.repositories .reads store.issues_db 'Queries' { metadata { uid 'repos-db' } }
+  store.facade .writes store.issues_db 'Open, migrate, audit' { metadata { uid 'facade-db' } }
+  store.sync_state .writes store.issues_db 'Cursor and history' { metadata { uid 'syncstate-db' } }
+  store.repositories .uses store.facade 'Connection' { metadata { uid 'repos-facade' } }
+
+  // Sync client internals
+  syncclient.syncer .uses syncclient.engine 'Extract, apply, mark synced' { metadata { uid 'syncer-engine' } }
+  syncclient.syncer .calls syncclient.http 'Push and pull' { metadata { uid 'syncer-http' } }
+  syncclient.syncer .reads syncclient.credentials 'Server URL, key, device id' { metadata { uid 'syncer-credentials' } }
+  syncclient.syncer .uses core.config 'Feature gate and kill switch' { metadata { uid 'syncer-config' } }
+  syncclient.syncer .reads store.sync_state 'Project id and cursor' { metadata { uid 'syncer-syncstate' } }
+  syncclient.live .calls syncclient.syncer 'Round on event or timer' { metadata { uid 'live-syncer' } }
+  syncclient.live .streams syncclient.http 'Events stream' { metadata { uid 'live-http' } }
+  syncclient.engine .uses syncclient.taxonomy 'Normalize entity and action types' { metadata { uid 'engine-taxonomy' } }
+  syncclient.engine .reads store.issues_db 'Pending action_log rows' { metadata { uid 'engine-pending' } }
+  syncclient.engine .writes store.issues_db 'Apply remote events, record conflicts' { metadata { uid 'engine-apply' } }
+  syncclient.http .sends server.middleware 'HTTPS with bearer key' { metadata { uid 'http-server' } }
+
+  // Server internals
+  server.main .calls server.middleware 'Serve routes' { metadata { uid 'main-middleware' } }
+  server.middleware .calls server.auth 'Unauthenticated auth routes' { metadata { uid 'middleware-auth' } }
+  server.middleware .calls server.sync_api 'Writer/reader role' { metadata { uid 'middleware-sync' } }
+  server.middleware .calls server.project_api 'Member role plus td-watch session' { metadata { uid 'middleware-project' } }
+  server.middleware .calls server.projects_members 'Owner role' { metadata { uid 'middleware-members' } }
+  server.middleware .calls server.admin_api 'Admin scopes' { metadata { uid 'middleware-admin' } }
+  server.middleware .calls server.events_sse 'Subscribe' { metadata { uid 'middleware-sse' } }
+  server.middleware .reads server.server_db 'Keys, memberships, rate limits' { metadata { uid 'middleware-serverdb' } }
+  server.auth .writes server.server_db 'Users, keys, challenges' { metadata { uid 'auth-serverdb' } }
+  server.auth .calls server.email 'Magic links and approvals' { metadata { uid 'auth-email' } }
+  server.email .sends external.email_provider 'Deliver' { metadata { uid 'email-provider' } }
+  server.projects_members .writes server.server_db 'Projects and memberships' { metadata { uid 'members-serverdb' } }
+  server.admin_api .reads server.server_db 'Inspect' { metadata { uid 'admin-serverdb' } }
+  server.admin_api .reads server.events_db 'Inspect events' { metadata { uid 'admin-eventsdb' } }
+  server.sync_api .writes server.events_db 'Insert events idempotently' { metadata { uid 'syncapi-eventsdb' } }
+  server.sync_api .uses syncclient.taxonomy 'Validate entity and action types' { metadata { uid 'syncapi-taxonomy' } }
+  server.sync_api .reads server.events_db 'Pull after cursor, snapshot' { metadata { uid 'syncapi-pull' } }
+  server.sync_api .writes server.project_db 'Apply accepted events' { metadata { uid 'syncapi-projectdb' } }
+  server.sync_api .writes server.server_db 'Sync cursors' { metadata { uid 'syncapi-cursors' } }
+  server.sync_api .notifies server.events_sse 'Broadcast change' { metadata { uid 'syncapi-sse' } }
+  server.project_api .calls serve.handlers 'Reuse td serve handlers' { metadata { uid 'projectapi-handlers' } }
+  server.project_api .writes server.project_db 'Attributed writes' { metadata { uid 'projectapi-projectdb' } }
+  server.project_api .calls server.promotion 'Post-commit promotion' { metadata { uid 'projectapi-promotion' } }
+  server.project_api .notifies server.events_sse 'Broadcast change' { metadata { uid 'projectapi-sse' } }
+  server.admin_api .uses core.query 'TDQ over a read-only snapshot source' { metadata { uid 'admin-query' } }
+  server.promotion .reads server.project_db 'Unsynced action_log rows' { metadata { uid 'promotion-projectdb' } }
+  server.promotion .writes server.events_db 'Promote atomically via ATTACH' { metadata { uid 'promotion-eventsdb' } }
+  server.project_db .replicates server.events_db 'Bootstrapped by replaying the log' { metadata { uid 'projectdb-bootstrap' } }
+  external.tdwatch .calls server.middleware 'Hosted project API' { metadata { uid 'tdwatch-server' } }
+  external.litestream .replicates server.server_db 'Tail WAL to a file replica' { metadata { uid 'litestream-serverdb' } }
+
+  // Neighbours
+  external.sidecar .embeds monitor 'Hosts the monitor as a tab with its own theme' { metadata { uid 'sidecar-monitor' } }
+  external.sidecar .calls core.notes_api 'Read and write notes in-process' { metadata { uid 'sidecar-notes' } }
+
+  // Proposed
+  cli.workflow_cmds .calls core.delegate 'td delegate declares roles' { metadata { uid 'workflow-delegate' } }
+  core.delegate .writes store.logged 'Record declared roles' { metadata { uid 'delegate-logged' } }
+  core.reviewpolicy .uses core.delegate 'Declared role wins over session inference' { metadata { uid 'policy-delegate' } }
+  cli.redact_cmds .writes store.issues_db 'Redact rows, checkpoint, vacuum' { metadata { uid 'redact-local' } }
+  cli.redact_cmds .calls syncclient.syncer 'Push a redact event' { metadata { uid 'redact-sync' } }
+  server.main .calls server.redaction 'td-sync admin redact' { metadata { uid 'main-redaction' } }
+  server.redaction .writes server.events_db 'Erase payloads' { metadata { uid 'redaction-eventsdb' } }
+  server.redaction .reads server.server_db 'Cursor blast radius' { metadata { uid 'redaction-cursors' } }
+}
+
+views {
+  view index {
+    include *
+  }
+}

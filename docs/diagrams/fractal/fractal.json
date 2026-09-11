@@ -1,0 +1,220 @@
+{
+  "version": 1,
+  "id": "td",
+  "title": "td",
+  "description": "Local task and session management for AI-assisted development: one shared core, several surfaces, optional sync.",
+  "provenance": "Authored 2026-09-11 from the td repository at commit ef78e0a: cmd/, internal/, pkg/, cmd/td-sync, deploy/, and docs (td-serve-spec, sync-client-guide, multi-agent-sessions, status-and-review, active plans). Evidence paths were checked to exist. Model follows responsibilities and seams rather than every package; the monitor's keymap/mouse helpers, dateparse, crypto, input, and themecheck packages are intentionally folded into their owning components. Proposed elements come from docs/plans/active and are not implemented.",
+  "boundaries": [
+    {
+      "id": "td-process",
+      "title": "td binary (one process per invocation)",
+      "description": "Everything that ships in the td executable. The CLI, monitor and serve are thin shells over the same core and store; the sync client is compiled in but gated per project.",
+      "kind": "process",
+      "members": [
+        "cli",
+        "monitor",
+        "serve",
+        "core",
+        "store",
+        "syncclient"
+      ],
+      "color": "#759EB5"
+    },
+    {
+      "id": "shared-core",
+      "title": "Shared core: rules every surface must agree on",
+      "description": "Transitions, review eligibility, session identity and logged writes live here once. The CLI, monitor, td serve and the hosted project API all call the same functions, so a capability reachable from one surface is reachable from all.",
+      "kind": "ownership",
+      "members": [
+        "core.models",
+        "core.workflow",
+        "core.reviewpolicy",
+        "core.session",
+        "core.query",
+        "core.dependency",
+        "core.config",
+        "store.logged",
+        "store.lock"
+      ],
+      "color": "#739886"
+    },
+    {
+      "id": "project-state",
+      "title": "Project-owned state (.todos/)",
+      "description": "Lives in the repository the issues describe. Shared across git worktrees via .td-root; safe for many concurrent processes because of the write lock.",
+      "kind": "storage",
+      "members": [
+        "store.issues_db",
+        "store.config_json",
+        "store.workdir",
+        "serve.portfile"
+      ],
+      "color": "#89A579"
+    },
+    {
+      "id": "review-independence",
+      "title": "Review independence",
+      "description": "The parts that decide whether a close is honest: session identity, the review policy, and the logged history it reads. Trusted mode records attestations; delegated and strict modes enforce them mechanically. The workflow state machine is not part of this: its guards are not active on the current runtime path.",
+      "kind": "permission",
+      "members": [
+        "core.reviewpolicy",
+        "core.session",
+        "store.logged",
+        "core.delegate"
+      ],
+      "color": "#D9A441"
+    },
+    {
+      "id": "user-home",
+      "title": "User-level configuration (~/.config/td)",
+      "description": "Credentials, the global autosync kill switch and directory associations belong to the user, not the project, so they are never committed or synced. The root resolver reads both project markers and the user-level associations file.",
+      "kind": "storage",
+      "members": [
+        "syncclient.credentials",
+        "store.workdir"
+      ],
+      "color": "#C48282"
+    },
+    {
+      "id": "server-host",
+      "title": "td-sync server host",
+      "description": "A separate deployment (Docker, Litestream). Authenticates with bearer keys, isolates each project in its own databases, and never sees the user's local telemetry.",
+      "kind": "network",
+      "members": [
+        "server",
+        "external.litestream"
+      ],
+      "color": "#B58A9E"
+    },
+    {
+      "id": "embedding",
+      "title": "In-process embedding surface",
+      "description": "What Sidecar links against directly: the monitor as a Bubble Tea model and pkg/notes as a Go API. Both are public packages; everything else in td is internal. td serve also reuses the monitor's data assembly in-process.",
+      "kind": "interface",
+      "members": [
+        "monitor",
+        "core.notes_api",
+        "external.sidecar"
+      ],
+      "color": "#9A91C4"
+    }
+  ],
+  "scenes": [
+    {
+      "id": "overview",
+      "title": "One core, several surfaces",
+      "description": "td at a glance: the CLI for agents, the monitor for humans, td serve for browser clients, all over one domain core and one local SQLite store, with an optional sync client talking to a separately deployed td-sync server.",
+      "expanded": [],
+      "proposed": false,
+      "lens": "structure"
+    },
+    {
+      "id": "cli-surface",
+      "title": "The agent's surface: the CLI",
+      "description": "How a command flows from root dispatch through the command groups into the core and the store, and where hints, telemetry and the autosync hooks sit around it.",
+      "expanded": [
+        "cli"
+      ],
+      "proposed": false,
+      "lens": "structure",
+      "scope": "cli"
+    },
+    {
+      "id": "core-and-store",
+      "title": "Rules and persistence shared by every surface",
+      "description": "The domain core and the local store: state machine, review policy, session identity, TDQ, logged mutations, the write lock, and the databases on disk.",
+      "expanded": [
+        "core",
+        "store"
+      ],
+      "proposed": false,
+      "lens": "structure"
+    },
+    {
+      "id": "monitor",
+      "title": "The human surface: monitor TUI",
+      "description": "Panels, boards, modals and the theme seam that lets Sidecar restyle a running monitor. Actions go through the same policy and write path as the CLI.",
+      "expanded": [
+        "monitor"
+      ],
+      "proposed": false,
+      "lens": "structure",
+      "scope": "monitor"
+    },
+    {
+      "id": "serve-api",
+      "title": "td serve: the local HTTP boundary",
+      "description": "Router, pure handlers, change stream and port-file discovery. The handlers are the same ones the sync server wraps for hosted projects.",
+      "expanded": [
+        "serve"
+      ],
+      "proposed": false,
+      "lens": "structure",
+      "scope": "serve"
+    },
+    {
+      "id": "sync-client",
+      "title": "Sync client: action_log becomes events",
+      "description": "Gate, syncer, event engine, live ladder and the HTTP adapter, with the store rows and user credentials they depend on.",
+      "expanded": [
+        "syncclient"
+      ],
+      "proposed": false,
+      "lens": "structure",
+      "scope": "syncclient"
+    },
+    {
+      "id": "sync-server",
+      "title": "td-sync server: event log plus live project database",
+      "description": "Auth, membership and rate limits in front of the sync endpoints, the project REST API that reuses td serve handlers, and the three database roles: server.db, events.db, project.db.",
+      "expanded": [
+        "server"
+      ],
+      "proposed": false,
+      "lens": "structure",
+      "scope": "server"
+    },
+    {
+      "id": "full-detail",
+      "title": "Everything expanded",
+      "description": "The complete current model with every subsystem open. Use search or focus for a readable slice; this scene is for orientation and export.",
+      "expanded": [
+        "cli",
+        "monitor",
+        "serve",
+        "core",
+        "store",
+        "syncclient",
+        "server",
+        "external"
+      ],
+      "proposed": false,
+      "lens": "structure"
+    },
+    {
+      "id": "trust-boundaries",
+      "title": "Ownership, process and trust boundaries",
+      "description": "Where state lives and who may change it: the td process, the shared core, project-owned state, user-level credentials, review independence, and the separately hosted server. Surfaces stay collapsed so the boundaries around the core, store and sync client are legible; open the full-detail scene for everything.",
+      "expanded": [
+        "core",
+        "store",
+        "syncclient"
+      ],
+      "proposed": false,
+      "lens": "trust"
+    },
+    {
+      "id": "proposed",
+      "title": "Planned: explicit delegation and supported redaction",
+      "description": "Two active plans shown alongside the current model: td delegate layers declared roles over session inference, and td redact gives secrets in logs a reproducible, auditable removal path on the client and the server.",
+      "expanded": [
+        "cli",
+        "core",
+        "store",
+        "server"
+      ],
+      "proposed": true,
+      "lens": "structure"
+    }
+  ]
+}
