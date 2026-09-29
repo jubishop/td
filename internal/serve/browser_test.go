@@ -86,6 +86,36 @@ func TestBrowserMarkdownSanitization(t *testing.T) {
 	}
 }
 
+func TestBrowserMarkdownRejectsEncodedDangerousURLs(t *testing.T) {
+	srv := newBrowserTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	for _, source := range []string{
+		`[click](&#106;avascript:alert(1))`,
+		`<javascript:alert(document.domain)>`,
+		`![alt](&#106;avascript:alert(1))`,
+	} {
+		t.Run(source, func(t *testing.T) {
+			var rendered bytes.Buffer
+			if err := browserMarkdown.Convert([]byte(source), &rendered); err != nil {
+				t.Fatal(err)
+			}
+			for _, attribute := range []string{`href="javascript:`, `src="javascript:`} {
+				if strings.Contains(rendered.String(), attribute) {
+					t.Errorf("renderer emitted an unsafe URL before sanitization: %s", rendered.String())
+				}
+			}
+			_, env := doJSON(t, ts, "POST", "/v1/markdown", map[string]string{"text": source})
+			html := env.Data.(map[string]interface{})["html"].(string)
+			for _, attribute := range []string{`href="javascript:`, `src="javascript:`} {
+				if strings.Contains(html, attribute) {
+					t.Errorf("endpoint emitted an unsafe URL: %s", html)
+				}
+			}
+		})
+	}
+}
+
 func requestRevision(t *testing.T, ts *httptest.Server, method, path, revision string, body interface{}) int {
 	t.Helper()
 	data, _ := json.Marshal(body)

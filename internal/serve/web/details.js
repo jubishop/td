@@ -31,7 +31,9 @@ export function createPanels(state, refresh) {
         form &&
         Object.keys(changedFields(state.editor.original, formValues(form)))
           .length,
-      ) || Boolean(drawer.querySelector('[name="comment"]')?.value.trim())
+      ) ||
+      Boolean(drawer.querySelector('[name="comment"]')?.value.trim()) ||
+      Boolean(drawer.querySelector('[name="depends_on"]')?.value.trim())
     );
   }
   function mayLeave() {
@@ -62,10 +64,12 @@ export function createPanels(state, refresh) {
   }
 
   async function open(id, { quiet = false } = {}) {
+    if (quiet && state.detail?.issue.id !== id) return false;
     if (!quiet && !mayLeave()) return false;
     const serial = ++request;
     if (!quiet) {
       state.editor = null;
+      state.detail = null;
       showDrawer(
         header(id) +
           '<div class="detail-body"><p class="muted">Loading task…</p></div>',
@@ -84,6 +88,7 @@ export function createPanels(state, refresh) {
       markdown(data.issue.acceptance),
     ]);
     if (serial !== request) return false;
+    if (quiet && (state.editor || dirty())) return true;
     const oldScroll = drawer.querySelector(".detail-body")?.scrollTop || 0;
     state.detail = data;
     renderDetail(data, description, acceptance);
@@ -161,6 +166,7 @@ export function createPanels(state, refresh) {
   }
 
   function editor(original, values = original, note = "") {
+    request++;
     state.editor = { original };
     showDrawer(
       header(original.id || "NEW TASK") +
@@ -197,8 +203,10 @@ export function createPanels(state, refresh) {
     return true;
   }
 
-  async function conflict(original, draft) {
+  async function conflict(editing, draft) {
+    const original = editing.original;
     const current = (await api(`/issues/${original.id}`)).issue;
+    if (state.editor !== editing) return;
     const fields = editableFields.filter(
       (key) =>
         JSON.stringify(normalized(original[key])) !==
@@ -241,7 +249,8 @@ export function createPanels(state, refresh) {
 
   async function saveIssue(form) {
     const draft = formValues(form);
-    const original = state.editor.original;
+    const editing = state.editor;
+    const original = editing.original;
     const changes = changedFields(original, draft);
     if (original.id && !Object.keys(changes).length) {
       state.editor = null;
@@ -259,14 +268,16 @@ export function createPanels(state, refresh) {
           revision: original.revision,
         },
       );
-      state.editor = null;
-      drawer.innerHTML = "";
-      location.hash = `${state.view}?issue=${data.issue.id}`;
-      await open(data.issue.id);
+      if (state.editor === editing) {
+        state.editor = null;
+        drawer.innerHTML = "";
+        history.replaceState(null, "", `#${state.view}?issue=${data.issue.id}`);
+        await open(data.issue.id);
+      }
       await refresh();
       toast(original.id ? "Task updated" : "Task created");
     } catch (error) {
-      if (error.status === 409 && original.id) await conflict(original, draft);
+      if (error.status === 409 && original.id) await conflict(editing, draft);
       else throw error;
     }
   }
@@ -332,8 +343,9 @@ export function createPanels(state, refresh) {
   }
 
   async function handleAction(action, target) {
-    if (action === "edit-task") editor(state.detail.issue);
-    else if (action === "preview") {
+    if (action === "edit-task") {
+      if (mayLeave()) editor(state.detail.issue);
+    } else if (action === "preview") {
       const field = target.dataset.field;
       const preview = drawer.querySelector(`#preview-${field}`);
       const textarea = drawer.querySelector(`[name="${field}"]`);
@@ -423,6 +435,7 @@ export function createPanels(state, refresh) {
         method: "POST",
         body: { depends_on: form.elements.depends_on.value.trim() },
       });
+      form.reset();
       await open(id, { quiet: true });
       await refresh();
       toast("Dependency added");

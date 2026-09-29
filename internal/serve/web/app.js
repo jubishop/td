@@ -110,17 +110,16 @@ async function refresh() {
       );
       boardIssues = data.issues;
       issues = boardIssues.map((row) => row.issue);
-      if (state.filters.search && state.filters.search_mode === "tdq") {
+      if (state.filters.search) {
         const matches = new Set(
           (await allIssues(params, signal)).map((i) => i.id),
         );
-        issues = issues.filter((i) => matches.has(i.id));
-      } else if (state.filters.search) {
         const search = state.filters.search.toLowerCase();
-        issues = issues.filter((i) =>
-          `${i.id} ${i.title} ${i.description} ${i.labels.join(" ")}`
-            .toLowerCase()
-            .includes(search),
+        issues = issues.filter(
+          (i) =>
+            matches.has(i.id) ||
+            (state.filters.search_mode === "text" &&
+              i.labels.join(" ").toLowerCase().includes(search)),
         );
       }
       if (state.filters.type)
@@ -160,11 +159,19 @@ async function route() {
   if (["board", "list", "reviews", "activity"].includes(view))
     state.view = view;
   const id = new URLSearchParams(query).get("issue");
+  let routeError;
   if (id && state.detail?.issue.id !== id) {
-    const opened = await panels.open(id);
-    if (!opened) return;
+    try {
+      const opened = await panels.open(id);
+      if (!opened) return;
+    } catch (error) {
+      panels.close();
+      history.replaceState(null, "", `#${state.view}`);
+      routeError = error;
+    }
   } else if (!id && state.detail && !state.editor) panels.close();
   await refresh();
+  if (routeError) toast(routeError.message);
 }
 
 async function action(name, target) {
@@ -222,6 +229,7 @@ document.addEventListener("submit", async (event) => {
     form.querySelector('[type="submit"]') || form.querySelector("button");
   if (button?.disabled) return;
   if (button) button.disabled = true;
+  form.inert = true;
   form.querySelectorAll(".form-error").forEach((node) => {
     node.hidden = true;
   });
@@ -230,6 +238,7 @@ document.addEventListener("submit", async (event) => {
   } catch (error) {
     showError(error, form);
   } finally {
+    form.inert = false;
     if (button) button.disabled = false;
   }
 });
