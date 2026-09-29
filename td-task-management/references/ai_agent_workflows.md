@@ -26,13 +26,14 @@ td handoff td-a1b2 \
 # 5. Submit for review
 td review td-a1b2
 
-# 6. Different session reviews and approves
-# (Next session/human runs: td approve td-a1b2)
+# 6. Prefer independent review when practical
+# (Or, in trusted mode: --reviewed-by "<who>" to credit the reviewer,
+#  or --self-review --reason to acknowledge reviewing your own work)
 ```
 
-## Multi-Issue Workflow (Recommended for Agents)
+## Multi-Issue Workflow
 
-Use when tackling related issues together (recommended for AI agents):
+Use when tackling related issues together:
 
 ```bash
 # 1. Start a work session
@@ -48,7 +49,7 @@ td ws log --decision "Storing refresh tokens in secure storage"
 # 4. Before context ends, capture state for all
 td ws handoff
 
-# 5. Different session reviews completed issues
+# 5. Review completed issues
 # Each issue goes to review independently
 ```
 
@@ -108,10 +109,10 @@ td reject td-a1b2 --reason "Missing error handling for expired tokens"
 
 ## Tips for AI Agents
 
-1. **Always start with `td usage --new-session`** - Tells you current focus, pending reviews, and what to work on
-2. **Log decisions and uncertainty** - Use `--decision` and `--uncertain` flags so next session knows your reasoning
-3. **Handoff before context ends** - Don't let context window expire without handoff
+1. **Start a new context with `td usage --new-session -q`** - See current focus, pending reviews, and available work without repeating the full guide
+2. **Log decisions and uncertainty when they aid continuity** - Use `--decision` and `--uncertain`
+3. **Handoff work that will continue elsewhere** - Capture what is done and what remains
 4. **Use work sessions for related issues** - Groups handoffs and makes tracking easier
 5. **Track files with `td link`** - Helps future sessions know what changed
 6. **Check blockers vs openwork** - If blocked, don't waste tokens retrying - work on something else
-7. **Never approve your own work** - Session isolation prevents this automatically
+7. **Prefer independent review when practical** - Give a reviewing sub-agent its own `TD_CONTEXT_ID` so its independence is verifiable. In trusted mode, an involved session can instead record who reviewed the work with `td approve <id> --reviewed-by "<who>"`, or acknowledge a genuine self-review with `td approve <id> --self-review --reason "..."`. Never name a reviewer who did not review.

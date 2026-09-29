@@ -1,12 +1,16 @@
 package features
 
 import (
+	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/marcus/td/internal/config"
+	"github.com/marcus/td/internal/reviewpolicy"
 )
 
 // Feature describes a named feature flag.
@@ -19,10 +23,16 @@ type Feature struct {
 var (
 	// BalancedReviewPolicy allows creator-only approval for issues implemented by
 	// a different session, while still blocking implementer/self approval.
+	//
+	// DEPRECATED (Step 5): prefer review_policy_mode=balanced. The flag remains
+	// registered so existing configs do not error at load time. When explicitly
+	// set, it still maps to balanced mode (Default=false means an untouched
+	// config does NOT trip the deprecation warning). The flag will be removed
+	// in a future release.
 	BalancedReviewPolicy = Feature{
 		Name:        "balanced_review_policy",
-		Default:     true,
-		Description: "Allow creator-only approvals for externally implemented issues with audit logging",
+		Default:     false,
+		Description: "DEPRECATED: use review_policy_mode=balanced. Allows creator-only approvals for externally implemented issues.",
 	}
 
 	// SyncCLI gates user-facing sync/auth commands.
@@ -32,11 +42,17 @@ var (
 		Description: "Enable sync/auth CLI commands for end users",
 	}
 
-	// SyncAutosync gates startup/post-mutation/monitor autosync behavior.
+	// SyncAutosync is an explicit override for the autosync hooks. As of
+	// td-a4c721 it is no longer the primary gate: autosync fires automatically
+	// when the project is actually configured for sync (sync_state + auth). This
+	// flag only matters when set EXPLICITLY (env or project config) — an explicit
+	// true forces the hooks on, an explicit false forces them off. When unset
+	// (source=default) the per-project sync config decides. The Default stays
+	// false so an untouched config does not count as an explicit override.
 	SyncAutosync = Feature{
 		Name:        "sync_autosync",
 		Default:     false,
-		Description: "Enable background autosync hooks",
+		Description: "Explicit override for autosync hooks (default: follow per-project sync config)",
 	}
 
 	// SyncMonitorPrompt gates the monitor sync prompt UX.
@@ -53,6 +69,44 @@ var (
 		Description: "Enable sync transport for notes entities",
 	}
 )
+
+// ReviewPolicyMode is the string-valued feature name that selects between
+// strict | balanced | delegated | trusted review policies.
+//
+// Default: trusted (Step 5 / trusted-review-mode final stage). Prior to this
+// the resolver default was delegated, and before that the effective default
+// was balanced via the legacy BalancedReviewPolicy=true feature flag. The
+// final stage flipped the resolver default to trusted — a fresh install with
+// no explicit configuration now runs the trusted flow. Trusted keeps the
+// delegated review-attestation model (prefer an independent reviewer; any
+// session may close once an independent approval is recorded) and adds a
+// flag-gated, audited self-review escape hatch: an implementer/orchestrator
+// who has reviewed their own diff may approve+close with
+// `td approve <id> --self-review --reason "..."`. Projects that want the hard
+// wall can pin review_policy_mode=delegated|balanced|strict.
+//
+// Implementation note (Option B): the existing Feature struct is boolean-
+// typed, and retrofitting it with a union type would ripple through
+// ListAll / IsKnownFeature / defaultValues / env-override logic. The
+// less invasive path is to keep Feature unchanged and add a parallel
+// string-feature resolver. This keeps the bool-feature surface simple
+// and opts string features in one-by-one. If a second string feature ever
+// shows up, this should be generalized.
+const (
+	ReviewPolicyMode        = "review_policy_mode"
+	ReviewPolicyModeDefault = string(reviewpolicy.ModeTrusted)
+)
+
+// balancedReviewPolicyDeprecatedLogged fires the legacy-mapping deprecation
+// warning exactly once per process. Tests can reset it via
+// ResetDeprecationWarningsForTests to exercise the warning path repeatedly.
+var balancedReviewPolicyDeprecatedLogged sync.Once
+
+// ResetDeprecationWarningsForTests clears the once-only deprecation
+// warning latches. Intended for use from tests in this package only.
+func ResetDeprecationWarningsForTests() {
+	balancedReviewPolicyDeprecatedLogged = sync.Once{}
+}
 
 var allFeatures = []Feature{
 	BalancedReviewPolicy,
@@ -102,6 +156,18 @@ func IsEnabledForProcess(name string) bool {
 		return enabled
 	}
 	return getDefault(canonical)
+}
+
+// ResolveExplicit resolves a feature and reports whether the value was set
+// explicitly (env or project config) versus falling back to the registered
+// default. explicit is true when the resolution source is "env" or "config".
+//
+// This lets callers distinguish "explicitly set false" from "unset/default" —
+// the autosync gate (td-a4c721) uses this to treat sync_autosync as an explicit
+// override rather than a primary on/off switch.
+func ResolveExplicit(baseDir, name string) (value bool, explicit bool) {
+	v, source := Resolve(baseDir, name)
+	return v, source != "default"
 }
 
 // Resolve returns the resolved feature state and the source ("env", "config", "default").
@@ -181,6 +247,123 @@ func parseBoolEnv(key string) (bool, bool) {
 	default:
 		return false, false
 	}
+}
+
+// ResolveReviewPolicyMode returns the effective review-policy mode for the
+// given project baseDir. Resolution order (Step 5):
+//  1. TD_FEATURE_REVIEW_POLICY_MODE env var (explicit) -> use it
+//  2. config.FeatureStringFlags["review_policy_mode"] (explicit) -> use it
+//  3. legacy balanced_review_policy EXPLICITLY set (env or config, NOT
+//     default) -> map true->balanced / false->strict AND emit a one-time
+//     deprecation warning.
+//  4. default: trusted.
+//
+// Key difference from the pre-flip behavior: the legacy flag's *default* value
+// no longer feeds into mode resolution. Only an explicit set triggers the
+// compat mapping. Users who never touched either flag now get trusted mode
+// (delegated review-attestation plus a flag-gated self-review escape hatch).
+// Explicit review_policy_mode and env overrides are honored unchanged.
+//
+// Conflict detection: if BOTH review_policy_mode AND balanced_review_policy
+// are set EXPLICITLY (env or config, not default) to values that disagree,
+// refuse to resolve rather than pick a silent winner.
+func ResolveReviewPolicyMode(baseDir string) (reviewpolicy.Mode, error) {
+	envKey := "TD_FEATURE_" + normalizeForEnvKey(ReviewPolicyMode)
+	envRaw := strings.TrimSpace(os.Getenv(envKey))
+
+	var (
+		configMode    string
+		configModeSet bool
+	)
+	if baseDir != "" {
+		v, ok, err := config.GetFeatureStringFlag(baseDir, ReviewPolicyMode)
+		if err == nil && ok {
+			configMode = v
+			configModeSet = true
+		}
+	}
+
+	// Conflict detection requires knowing whether the LEGACY flag was set
+	// explicitly — a default legacy value should not fight with an
+	// explicit review_policy_mode.
+	legacyExplicit, legacyExplicitSet := explicitBalancedReviewPolicyValue(baseDir)
+
+	explicitMode := ""
+	if envRaw != "" {
+		explicitMode = envRaw
+	} else if configModeSet {
+		explicitMode = configMode
+	}
+	if legacyExplicitSet && explicitMode != "" {
+		legacyMapped := legacyBalancedToMode(legacyExplicit)
+		if legacyMapped != reviewpolicy.Mode(explicitMode) {
+			return "", fmt.Errorf(
+				"conflicting review policy settings: review_policy_mode=%q vs balanced_review_policy=%t "+
+					"(balanced_review_policy is deprecated; unset one of the two)",
+				explicitMode, legacyExplicit)
+		}
+	}
+
+	// 1. env wins.
+	if envRaw != "" {
+		mode, err := reviewpolicy.ParseMode(envRaw)
+		if err != nil {
+			return "", fmt.Errorf("%s=%s invalid: %w", envKey, envRaw, err)
+		}
+		return mode, nil
+	}
+
+	// 2. config explicit.
+	if configModeSet {
+		mode, err := reviewpolicy.ParseMode(configMode)
+		if err != nil {
+			return "", fmt.Errorf("config review_policy_mode=%q invalid: %w", configMode, err)
+		}
+		return mode, nil
+	}
+
+	// 3. Legacy compat: only honor the legacy flag when it was set
+	// explicitly. Default-valued legacy does NOT feed mode resolution anymore,
+	// so an untouched config falls through to step 4 (trusted).
+	if legacyExplicitSet {
+		balancedReviewPolicyDeprecatedLogged.Do(func() {
+			slog.Warn("balanced_review_policy is deprecated; use review_policy_mode="+
+				string(legacyBalancedToMode(legacyExplicit))+" instead. This flag will be removed in a future release.",
+				"mapped_to", string(legacyBalancedToMode(legacyExplicit)))
+		})
+		return legacyBalancedToMode(legacyExplicit), nil
+	}
+
+	// 4. Default: trusted.
+	return reviewpolicy.ModeTrusted, nil
+}
+
+// legacyBalancedToMode maps the deprecated balanced_review_policy boolean.
+func legacyBalancedToMode(enabled bool) reviewpolicy.Mode {
+	if enabled {
+		return reviewpolicy.ModeBalanced
+	}
+	return reviewpolicy.ModeStrict
+}
+
+// explicitBalancedReviewPolicyValue reports the balanced_review_policy flag
+// if (and only if) it was explicitly set by env or project config. The
+// feature's default value does not count as "explicit" — see plan under
+// "Feature Flag and Compatibility Plan".
+func explicitBalancedReviewPolicyValue(baseDir string) (bool, bool) {
+	canonical := normalizeName(BalancedReviewPolicy.Name)
+	if v, ok := resolveEnvOverride(canonical); ok {
+		return v, true
+	}
+	if baseDir == "" {
+		return false, false
+	}
+	cfg, err := config.Load(baseDir)
+	if err != nil || cfg.FeatureFlags == nil {
+		return false, false
+	}
+	v, ok := cfg.FeatureFlags[canonical]
+	return v, ok
 }
 
 func containsFeatureName(raw, target string) bool {

@@ -9,21 +9,31 @@ import (
 
 // AuthEvent represents a row in the auth_events table.
 type AuthEvent struct {
-	ID              int64  `json:"id"`
-	AuthRequestID   string `json:"auth_request_id"`
-	Email           string `json:"email"`
-	EventType       string `json:"event_type"`
-	Metadata        string `json:"metadata"`
-	CreatedAt       string `json:"created_at"`
+	ID            int64  `json:"id"`
+	AuthRequestID string `json:"auth_request_id"`
+	Email         string `json:"email"`
+	EventType     string `json:"event_type"`
+	Metadata      string `json:"metadata"`
+	CreatedAt     string `json:"created_at"`
 }
 
 // Auth event type constants.
 const (
-	AuthEventStarted      = "started"
-	AuthEventCodeVerified = "code_verified"
-	AuthEventKeyIssued    = "key_issued"
-	AuthEventExpired      = "expired"
-	AuthEventFailed       = "failed"
+	AuthEventStarted             = "started"
+	AuthEventCodeVerified        = "code_verified"
+	AuthEventKeyIssued           = "key_issued"
+	AuthEventExpired             = "expired"
+	AuthEventFailed              = "failed"
+	AuthEventImpersonationIssued = "impersonation_issued"
+	AuthEventKeyRevoked          = "key_revoked"
+
+	// Email-login lifecycle events (used by D1-D5).
+	AuthEventChallengeStarted = "challenge_started" // web/start or device/start called, challenge created
+	AuthEventEmailSent        = "email_sent"        // email dispatched to provider without error
+	AuthEventEmailSuppressed  = "email_suppressed"  // challenge created for unknown/disabled user, generic response sent
+	AuthEventWebExchanged     = "web_exchanged"     // web/exchange succeeded, key issued
+	AuthEventDeviceVerified   = "device_verified"   // emailed link consumed, device request marked verified
+	AuthEventLoginFailed      = "login_failed"      // any terminal failure: wrong token, wrong state, wrong verifier, expired
 )
 
 // InsertAuthEvent inserts an auth event row.
@@ -109,7 +119,7 @@ func (db *ServerDB) GetPendingExpiredAuthRequests() ([]AuthRequest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get pending expired auth requests: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []AuthRequest
 	for rows.Next() {

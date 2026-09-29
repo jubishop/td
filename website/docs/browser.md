@@ -26,6 +26,9 @@ port file; stop the existing process before starting the other command.
 - **Reviews:** Open tasks submitted for review. Read their acceptance criteria,
   handoffs, comments, dependencies, and logs before using **Approve** or
   **Reject**. Approval and rejection are explicit actions, never drag gestures.
+  Available actions follow the project's review policy. Approval records who
+  reviewed the work; self-review requires an explicit choice and a reason.
+  A task with a recorded approval can be closed using that review.
 - **Activity:** Follow recent task changes, logs, and handoffs. Session timestamps
   show the last recorded activity; they do not indicate whether an agent process
   is currently running.
@@ -56,7 +59,7 @@ save explicitly. A further concurrent change triggers another comparison.
 
 Writes use the existing HTTP API's shared web session and appear in td's action
 history. **Close without review** is for administrative closures such as
-duplicates or cancellations. See the [HTTP API](http-api/overview) for its
+duplicates or cancellations, when the project's policy permits it. See the [HTTP API](http-api/overview) for its
 workflow and session model. Code review stays in your existing tools; links in
 task descriptions can point to code or pull requests.
 

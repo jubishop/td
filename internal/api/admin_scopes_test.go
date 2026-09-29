@@ -20,6 +20,7 @@ func TestValidateScopes(t *testing.T) {
 		{"mixed valid and invalid", "sync,admin:read:server,bogus", true},
 		{"completely unknown", "foo", true},
 		{"trailing comma (empty part)", "sync,", false},
+		{"impersonation read scope", "impersonation:read", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -56,6 +57,30 @@ func TestHasScope(t *testing.T) {
 	}
 }
 
+func TestHasAnyScope(t *testing.T) {
+	tests := []struct {
+		name     string
+		scopes   string
+		required []string
+		want     bool
+	}{
+		{"single match", "admin:read:server", []string{"admin:read:server"}, true},
+		{"multi required one hit", "sync,admin:export", []string{"admin:read:server", "admin:export"}, true},
+		{"multi required no hit", "sync,admin:read:events", []string{"admin:read:server", "admin:export"}, false},
+		{"empty scopes", "", []string{"admin:read:server"}, false},
+		{"whitespace trimming", " admin:read:server , sync ", []string{"admin:read:server"}, true},
+		{"no required args", "sync,admin:read:server", []string{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := HasAnyScope(tt.scopes, tt.required...)
+			if got != tt.want {
+				t.Errorf("HasAnyScope(%q, %v) = %v, want %v", tt.scopes, tt.required, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAllScopeConstantsInValidMap(t *testing.T) {
 	scopes := []string{
 		AdminScopeReadServer,
@@ -63,6 +88,7 @@ func TestAllScopeConstantsInValidMap(t *testing.T) {
 		AdminScopeReadEvents,
 		AdminScopeReadSnapshots,
 		AdminScopeExport,
+		AdminScopeWriteUsers,
 	}
 	for _, s := range scopes {
 		if !ValidAdminScopes[s] {

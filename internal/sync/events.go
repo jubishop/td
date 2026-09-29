@@ -50,7 +50,7 @@ func getDependenciesTx(tx *sql.Tx, issueID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var deps []string
 	for rows.Next() {
@@ -121,7 +121,7 @@ func getTableColumns(tx *sql.Tx, table string) (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	cols := map[string]bool{}
 	for rows.Next() {
 		var cid int
@@ -133,6 +133,43 @@ func getTableColumns(tx *sql.Tx, table string) (map[string]bool, error) {
 			return nil, err
 		}
 		cols[name] = true
+	}
+	return cols, rows.Err()
+}
+
+// getTextEmptyDefaultColumns returns the set of TEXT columns declared with
+// an empty-string default on the given table. Sync payloads may carry these fields as
+// JSON null (either because a previous write set them to NULL, or because
+// the sender serialized an empty pointer/string as null). Binding NULL for
+// such columns breaks readers that scan into plain `string` — notably
+// scanIssueRow in internal/db/issues_logged.go, which crashed `td monitor`
+// with: Scan error on column index 7, name "labels": converting NULL to
+// string is unsupported. We default nil → "" for these columns at apply
+// time to match the schema's intent.
+func getTextEmptyDefaultColumns(tx *sql.Tx, table string) (map[string]bool, error) {
+	if !validColumnName.MatchString(table) {
+		return nil, fmt.Errorf("invalid table name: %q", table)
+	}
+	rows, err := tx.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dfltValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			return nil, err
+		}
+		// PRAGMA returns the raw default-value SQL literal. For TEXT
+		// DEFAULT '' it comes back as the two-character string "''".
+		if strings.EqualFold(ctype, "TEXT") && dfltValue.Valid && dfltValue.String == "''" {
+			cols[name] = true
+		}
 	}
 	return cols, rows.Err()
 }
@@ -200,9 +237,13 @@ func applyPartialUpdate(tx *sql.Tx, entityType string, entityID string, changedF
 	if err != nil {
 		return 0, fmt.Errorf("partial update %s/%s: get columns: %w", entityType, entityID, err)
 	}
+	textEmptyDefaults, err := getTextEmptyDefaultColumns(tx, entityType)
+	if err != nil {
+		return 0, fmt.Errorf("partial update %s/%s: get text defaults: %w", entityType, entityID, err)
+	}
 
 	// Normalize values for DB storage
-	normalizeFieldsForDB(entityType, changedFields)
+	normalizeFieldsForDB(entityType, changedFields, textEmptyDefaults)
 
 	// Build SET clause with only valid, changed columns
 	keys := make([]string, 0, len(changedFields))
@@ -252,6 +293,8 @@ func applyEventWithPrevious(tx *sql.Tx, event Event, validator EntityValidator, 
 	if event.EntityID == "" {
 		return applyResult{}, fmt.Errorf("empty entity ID for %q event", event.ActionType)
 	}
+	event.Payload = scrubLocalOnlySyncPayload(event.EntityType, event.Payload)
+	previousData = scrubLocalOnlySyncPayload(event.EntityType, previousData)
 
 	switch event.ActionType {
 	case "create", "update":
@@ -282,6 +325,16 @@ func applyEventWithPrevious(tx *sql.Tx, event Event, validator EntityValidator, 
 	}
 }
 
+// unwrapIssuePayload extracts the nested issue object from a ReviewUndoPayload wrapper if present.
+func unwrapIssuePayload(fields map[string]any) map[string]any {
+	if issueVal, ok := fields["issue"]; ok {
+		if issueMap, ok := issueVal.(map[string]any); ok {
+			return issueMap
+		}
+	}
+	return fields
+}
+
 // applyPartialUpdateEvent diffs previous_data vs new_data and applies only changed fields.
 // Falls back to full upsert if the partial update fails or the row doesn't exist.
 func applyPartialUpdateEvent(tx *sql.Tx, event Event, previousData json.RawMessage) (applyResult, error) {
@@ -295,6 +348,11 @@ func applyPartialUpdateEvent(tx *sql.Tx, event Event, previousData json.RawMessa
 	if err := json.Unmarshal(event.Payload, &newFields); err != nil {
 		slog.Debug("partial update: bad new_data, falling back", "err", err)
 		return upsertEntityIfExists(tx, event.EntityType, event.EntityID, event.Payload)
+	}
+
+	if event.EntityType == "issues" {
+		prevFields = unwrapIssuePayload(prevFields)
+		newFields = unwrapIssuePayload(newFields)
 	}
 
 	changed := diffJSON(prevFields, newFields)
@@ -343,6 +401,10 @@ func upsertEntityWithMode(tx *sql.Tx, entityType, entityID string, newData json.
 		return applyResult{}, fmt.Errorf("upsert %s/%s: unmarshal payload: %w", entityType, entityID, err)
 	}
 
+	if entityType == "issues" {
+		fields = unwrapIssuePayload(fields)
+	}
+
 	if len(fields) == 0 {
 		return applyResult{}, fmt.Errorf("upsert %s/%s: payload has no fields", entityType, entityID)
 	}
@@ -378,7 +440,7 @@ func upsertEntityWithMode(tx *sql.Tx, entityType, entityID string, newData json.
 		}
 	}
 	// Close before INSERT to release shared lock
-	rows.Close()
+	_ = rows.Close()
 
 	if requireExisting && !overwritten {
 		slog.Debug("upsert skipped (missing row)", "table", entityType, "id", entityID)
@@ -387,13 +449,25 @@ func upsertEntityWithMode(tx *sql.Tx, entityType, entityID string, newData json.
 
 	fields["id"] = entityID
 
-	normalizeFieldsForDB(entityType, fields)
+	// Only a fresh insert can orphan a row. An overwrite means the row is
+	// already present, so its parents are too — the FK held when it landed.
+	if !overwritten {
+		if err := checkParentsPresent(tx, entityType, fields); err != nil {
+			return applyResult{}, err
+		}
+	}
 
 	// Filter unknown columns for forward compatibility (spec: ignore unknown fields)
 	validCols, err := getTableColumns(tx, entityType)
 	if err != nil {
 		return applyResult{}, fmt.Errorf("upsert %s/%s: get columns: %w", entityType, entityID, err)
 	}
+	textEmptyDefaults, err := getTextEmptyDefaultColumns(tx, entityType)
+	if err != nil {
+		return applyResult{}, fmt.Errorf("upsert %s/%s: get text defaults: %w", entityType, entityID, err)
+	}
+
+	normalizeFieldsForDB(entityType, fields, textEmptyDefaults)
 	for k := range fields {
 		if !validCols[k] {
 			slog.Debug("upsert: dropping unknown column", "table", entityType, "column", k)
@@ -419,15 +493,23 @@ func upsertEntityWithMode(tx *sql.Tx, entityType, entityID string, newData json.
 }
 
 // deleteEntity hard-deletes a row. No-op if the row does not exist.
-// For boards, also cascade soft-delete all board_issue_positions since
-// PRAGMA foreign_keys is not enabled and ON DELETE CASCADE is inert.
+//
+// Migration 30 (td-4846e6) added schema-level ON DELETE CASCADE to every
+// child relation that used to be emulated here (handoffs, git_snapshots,
+// issue_files, issue_dependencies, work_session_issues, comments,
+// issue_session_history, board_issue_positions). On the CLI issues.db
+// (PRAGMA foreign_keys=ON) those cascades fire automatically, so no
+// application-level cascade is needed for FK-backed relations.
+//
+// The one exception is issues.parent_id: per migration 30's rationale,
+// td uses the empty string as the "no parent" sentinel, which is
+// incompatible with a schema-level FK (SQLite treats the empty string as a real value).
+// That relation has no FK at all, so parent_id cleanup must still happen
+// here. This was the regression fix from commit baa9b23 (td-4846e6).
 func deleteEntity(tx *sql.Tx, entityType, entityID string) error {
-	if entityType == "boards" {
-		if _, err := tx.Exec(
-			`UPDATE board_issue_positions SET deleted_at = CURRENT_TIMESTAMP WHERE board_id = ? AND deleted_at IS NULL`,
-			entityID,
-		); err != nil {
-			return fmt.Errorf("cascade soft-delete positions for board %s: %w", entityID, err)
+	if entityType == "issues" {
+		if _, err := tx.Exec(`UPDATE issues SET parent_id = '' WHERE parent_id = ?`, entityID); err != nil {
+			return fmt.Errorf("clear child parent links for issue %s: %w", entityID, err)
 		}
 	}
 	query := fmt.Sprintf("DELETE FROM %s WHERE id = ?", entityType)
@@ -482,10 +564,16 @@ func buildInsert(fields map[string]any) (cols string, placeholders string, vals 
 // normalizeFieldsForDB converts non-scalar values (slices, maps) to DB-compatible strings.
 // Special case: issues.labels is stored as comma-separated text.
 // All other array/object fields are stored as JSON strings.
-func normalizeFieldsForDB(entityType string, fields map[string]any) {
+//
+// textEmptyDefaultCols, when non-nil, lists TEXT columns declared with
+// an empty-string default on this table. Any field present in fields with a nil value
+// whose column is in this set is defaulted to "" — otherwise INSERT binds
+// NULL, which breaks readers that scan into plain `string` (see
+// getTextEmptyDefaultColumns for the symptom that motivated this).
+func normalizeFieldsForDB(entityType string, fields map[string]any, textEmptyDefaultCols map[string]bool) {
 	for k, v := range fields {
 		if v == nil {
-			if entityType == "issues" && (k == "implementer_session" || k == "reviewer_session" || k == "creator_session") {
+			if textEmptyDefaultCols[k] {
 				fields[k] = ""
 			}
 			continue

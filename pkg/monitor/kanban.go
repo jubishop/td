@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/marcus/td/internal/models"
 )
@@ -15,10 +15,12 @@ import (
 // status additions are automatically included.
 var kanbanColumnOrder = []TaskListCategory{
 	CategoryReviewable,
+	CategoryReadyToClose,
 	CategoryNeedsRework,
 	CategoryInProgress,
 	CategoryReady,
 	CategoryPendingReview,
+	CategoryPendingOther,
 	CategoryBlocked,
 	CategoryClosed,
 }
@@ -28,6 +30,8 @@ func kanbanColumnLabel(cat TaskListCategory) string {
 	switch cat {
 	case CategoryReviewable:
 		return "REVIEW"
+	case CategoryReadyToClose:
+		return "TO CLOSE"
 	case CategoryNeedsRework:
 		return "REWORK"
 	case CategoryInProgress:
@@ -36,6 +40,8 @@ func kanbanColumnLabel(cat TaskListCategory) string {
 		return "READY"
 	case CategoryPendingReview:
 		return "P.REVIEW"
+	case CategoryPendingOther:
+		return "P.OTHER"
 	case CategoryBlocked:
 		return "BLOCKED"
 	case CategoryClosed:
@@ -45,27 +51,52 @@ func kanbanColumnLabel(cat TaskListCategory) string {
 	}
 }
 
-// kanbanColumnColor returns the header color for each column category.
-// Colors are derived from the style variables defined in styles.go.
-func kanbanColumnColor(cat TaskListCategory) lipgloss.Color {
-	switch cat {
-	case CategoryReviewable:
-		return secondaryColor // purple (in_review)
-	case CategoryNeedsRework:
-		return warningColor // orange (needs action)
-	case CategoryInProgress:
-		return cyanColor // cyan (in_progress)
-	case CategoryReady:
-		return successColor // green (open/ready)
-	case CategoryPendingReview:
-		return lipgloss.Color("183") // light purple (pending review)
-	case CategoryBlocked:
-		return errorColor // red (blocked)
-	case CategoryClosed:
-		return mutedColor // gray (closed)
-	default:
-		return lipgloss.Color("255")
+// kanbanPinnedColumns are always shown so a new or sparse board still
+// has a Review / WIP / Ready shape instead of collapsing to one fat lane.
+var kanbanPinnedColumns = []TaskListCategory{
+	CategoryReviewable,
+	CategoryInProgress,
+	CategoryReady,
+}
+
+// visibleKanbanColumns returns pinned columns plus any other occupied
+// lane, in canonical order. Empty extras (rework, ready-to-close, …)
+// stay hidden so they do not steal width.
+func visibleKanbanColumns(data TaskListData) []TaskListCategory {
+	want := make(map[TaskListCategory]bool, len(kanbanColumnOrder))
+	for _, cat := range kanbanPinnedColumns {
+		want[cat] = true
 	}
+	for _, cat := range kanbanColumnOrder {
+		if len(kanbanColumnIssues(data, cat)) > 0 {
+			want[cat] = true
+		}
+	}
+	visible := make([]TaskListCategory, 0, len(want))
+	for _, cat := range kanbanColumnOrder {
+		if want[cat] {
+			visible = append(visible, cat)
+		}
+	}
+	return visible
+}
+
+func kanbanColumnIndex(cat TaskListCategory) int {
+	for i, c := range kanbanColumnOrder {
+		if c == cat {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m Model) visibleKanbanColIndexes() []int {
+	visible := visibleKanbanColumns(m.BoardMode.SwimlaneData)
+	indexes := make([]int, len(visible))
+	for i, cat := range visible {
+		indexes[i] = kanbanColumnIndex(cat)
+	}
+	return indexes
 }
 
 // kanbanColumnIssues returns the issues for a given category from the swimlane data.
@@ -73,6 +104,8 @@ func kanbanColumnIssues(data TaskListData, cat TaskListCategory) []models.Issue 
 	switch cat {
 	case CategoryReviewable:
 		return data.Reviewable
+	case CategoryReadyToClose:
+		return data.ReadyToClose
 	case CategoryNeedsRework:
 		return data.NeedsRework
 	case CategoryInProgress:
@@ -81,6 +114,8 @@ func kanbanColumnIssues(data TaskListData, cat TaskListCategory) []models.Issue 
 		return data.Ready
 	case CategoryPendingReview:
 		return data.PendingReview
+	case CategoryPendingOther:
+		return data.PendingOther
 	case CategoryBlocked:
 		return data.Blocked
 	case CategoryClosed:
@@ -122,21 +157,29 @@ func (m *Model) closeKanbanView() {
 	m.KanbanColScrolls = nil
 }
 
-// kanbanMoveLeft moves the cursor to the previous column, clamping row to valid range.
+// kanbanMoveLeft moves the cursor to the previous visible column.
 func (m *Model) kanbanMoveLeft() {
-	if m.KanbanCol > 0 {
-		m.KanbanCol--
-		m.clampKanbanRow()
-		m.ensureKanbanCursorVisible()
+	visible := m.visibleKanbanColIndexes()
+	for i, col := range visible {
+		if col == m.KanbanCol && i > 0 {
+			m.KanbanCol = visible[i-1]
+			m.clampKanbanRow()
+			m.ensureKanbanCursorVisible()
+			return
+		}
 	}
 }
 
-// kanbanMoveRight moves the cursor to the next column, clamping row to valid range.
+// kanbanMoveRight moves the cursor to the next visible column.
 func (m *Model) kanbanMoveRight() {
-	if m.KanbanCol < len(kanbanColumnOrder)-1 {
-		m.KanbanCol++
-		m.clampKanbanRow()
-		m.ensureKanbanCursorVisible()
+	visible := m.visibleKanbanColIndexes()
+	for i, col := range visible {
+		if col == m.KanbanCol && i < len(visible)-1 {
+			m.KanbanCol = visible[i+1]
+			m.clampKanbanRow()
+			m.ensureKanbanCursorVisible()
+			return
+		}
 	}
 }
 
@@ -158,8 +201,36 @@ func (m *Model) kanbanMoveUp() {
 	}
 }
 
+// clampKanbanCol snaps the column cursor onto a visible column. Prefer the
+// nearest column to the right so a disappearing lane does not jump backward
+// past work that is still on the board.
+func (m *Model) clampKanbanCol() {
+	visible := m.visibleKanbanColIndexes()
+	if len(visible) == 0 {
+		m.KanbanCol = 0
+		return
+	}
+	for _, col := range visible {
+		if col == m.KanbanCol {
+			return
+		}
+	}
+	for _, col := range visible {
+		if col > m.KanbanCol {
+			m.KanbanCol = col
+			m.KanbanRow = 0
+			return
+		}
+	}
+	m.KanbanCol = visible[len(visible)-1]
+	m.KanbanRow = 0
+}
+
 // clampKanbanRow clamps the row cursor to valid range in the current column.
 func (m *Model) clampKanbanRow() {
+	if m.KanbanCol < 0 || m.KanbanCol >= len(kanbanColumnOrder) {
+		m.KanbanCol = 0
+	}
 	cat := kanbanColumnOrder[m.KanbanCol]
 	issues := kanbanColumnIssues(m.BoardMode.SwimlaneData, cat)
 	if len(issues) == 0 {
@@ -169,11 +240,27 @@ func (m *Model) clampKanbanRow() {
 	}
 }
 
+// kanbanBoxFrameLines is the vertical chrome the box itself adds around
+// the inner grid: 2 for the border, plus 2 padding newlines when a
+// custom ModalRenderer is in use (sidecar). The card budget must leave
+// this room or OverlayModal / the embedder clips the bottom rule.
+func (m Model) kanbanBoxFrameLines() int {
+	if m.ModalRenderer != nil {
+		return 4
+	}
+	return 2
+}
+
 // kanbanDimensions computes layout dimensions for the kanban view.
 func (m Model) kanbanDimensions() (modalWidth, modalHeight, colWidth, maxVisibleCards int) {
+	maxInnerH := m.Height - m.kanbanBoxFrameLines()
+	if maxInnerH < kanbanChromeLines+kanbanCardHeight {
+		maxInnerH = kanbanChromeLines + kanbanCardHeight
+	}
+
 	if m.KanbanFullscreen {
 		modalWidth = m.Width - 2
-		modalHeight = m.Height
+		modalHeight = maxInnerH
 	} else {
 		modalWidth = m.Width * 90 / 100
 		if modalWidth < 60 {
@@ -182,26 +269,47 @@ func (m Model) kanbanDimensions() (modalWidth, modalHeight, colWidth, maxVisible
 		if modalWidth > 160 {
 			modalWidth = 160
 		}
+		if modalWidth > m.Width-2 && m.Width > 2 {
+			modalWidth = m.Width - 2
+		}
 		modalHeight = m.Height * 85 / 100
-		if modalHeight < 12 {
-			modalHeight = m.Height - 2
+		if modalHeight < kanbanChromeLines+kanbanCardHeight {
+			modalHeight = maxInnerH
 		}
 		if modalHeight > 50 {
 			modalHeight = 50
 		}
+		if modalHeight > maxInnerH {
+			modalHeight = maxInnerH
+		}
 	}
 
-	contentWidth := modalWidth - 4
-	numCols := len(kanbanColumnOrder)
+	// Width(modalWidth-2) plus border and padding wraps at modalWidth-6.
+	contentWidth := modalWidth - 6
+	numCols := len(visibleKanbanColumns(m.BoardMode.SwimlaneData))
+	if numCols < 1 {
+		numCols = 1
+	}
 	separatorWidth := numCols - 1
 	colWidth = (contentWidth - separatorWidth) / numCols
+	if colWidth < 1 {
+		colWidth = 1
+	}
+	// Prefer a readable column, but never exceed the wrap budget — one
+	// extra occupied lane used to inflate every grid line and clip the
+	// bottom rule.
 	if colWidth < minKanbanColWidth {
-		colWidth = minKanbanColWidth
+		fitted := minKanbanColWidth
+		if fitted*numCols+separatorWidth > contentWidth {
+			fitted = (contentWidth - separatorWidth) / numCols
+			if fitted < 1 {
+				fitted = 1
+			}
+		}
+		colWidth = fitted
 	}
 
-	// Available height for cards (subtract header, divider, column headers, divider,
-	// up scroll indicator, down scroll indicator)
-	availableCardHeight := modalHeight - 8
+	availableCardHeight := modalHeight - kanbanChromeLines
 	if availableCardHeight < kanbanCardHeight {
 		availableCardHeight = kanbanCardHeight
 	}
@@ -266,6 +374,10 @@ const kanbanCardHeight = 3
 // minKanbanColWidth is the minimum column width to render.
 const minKanbanColWidth = 16
 
+// kanbanChromeLines is the fixed row count around the card grid: title,
+// top rule, column headers, header rule, up hint, down hint, bottom rule.
+const kanbanChromeLines = 7
+
 // kanbanScrollInfo tracks whether a column has hidden content above/below.
 type kanbanScrollInfo struct {
 	hasAbove bool
@@ -274,11 +386,16 @@ type kanbanScrollInfo struct {
 
 // renderKanbanView renders the full kanban overlay content.
 func (m Model) renderKanbanView() string {
+	styles := m.renderStyles()
 	data := m.BoardMode.SwimlaneData
 
 	modalWidth, modalHeight, colWidth, maxVisibleCards := m.kanbanDimensions()
 
-	numCols := len(kanbanColumnOrder)
+	visible := visibleKanbanColumns(data)
+	numCols := len(visible)
+	if numCols < 1 {
+		numCols = 1
+	}
 	separatorWidth := numCols - 1
 	actualContentWidth := colWidth*numCols + separatorWidth
 
@@ -287,12 +404,12 @@ func (m Model) renderKanbanView() string {
 	if m.BoardMode.Board != nil {
 		boardName = m.BoardMode.Board.Name
 	}
-	titleText := kanbanTitleStyle.Render(fmt.Sprintf(" Kanban: %s ", boardName))
+	titleText := styles.kanbanTitle.Render(fmt.Sprintf(" Kanban: %s ", boardName))
 	fsHint := "f:fullscreen"
 	if m.KanbanFullscreen {
 		fsHint = "f:overlay"
 	}
-	hintText := kanbanHintStyle.Render(fmt.Sprintf("  h/l:cols  j/k:rows  enter:open  %s  esc:close", fsHint))
+	hintText := styles.kanbanHint.Render(fmt.Sprintf("  h/l:cols  j/k:rows  enter:open  %s  esc:close", fsHint))
 
 	header := titleText + hintText
 	headerWidth := lipgloss.Width(header)
@@ -302,18 +419,15 @@ func (m Model) renderKanbanView() string {
 
 	// Build column headers
 	var colHeaders []string
-	for i, cat := range kanbanColumnOrder {
+	for _, cat := range visible {
 		issues := kanbanColumnIssues(data, cat)
-		color := kanbanColumnColor(cat)
 		label := kanbanColumnLabel(cat)
 		countStr := fmt.Sprintf(" (%d)", len(issues))
 
-		headerStyle := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(color)
+		headerStyle := styles.category[cat].Bold(true)
 
 		// If this column is selected, underline the header
-		if i == m.KanbanCol {
+		if kanbanColumnIndex(cat) == m.KanbanCol {
 			headerStyle = headerStyle.Underline(true)
 		}
 
@@ -328,24 +442,22 @@ func (m Model) renderKanbanView() string {
 	}
 
 	// Separator character
-	sep := kanbanSepStyle.Render("│")
+	sep := styles.kanbanSeparator.Render("│")
 
 	// Build the column header line
 	headerLine := strings.Join(colHeaders, sep)
 
 	// Build separator line
-	divider := kanbanSepStyle.Render(strings.Repeat("─", actualContentWidth))
+	divider := styles.kanbanSeparator.Render(strings.Repeat("─", actualContentWidth))
 
-	// Compute per-column scroll offsets. Use stored offsets for all columns
-	// but ensure the selected column's cursor is visible.
+	// Compute per-visible-column scroll offsets from the order-indexed store.
 	colScrolls := make([]int, numCols)
-	for i := range kanbanColumnOrder {
-		if i < len(m.KanbanColScrolls) {
-			colScrolls[i] = m.KanbanColScrolls[i]
+	for i, cat := range visible {
+		orderIdx := kanbanColumnIndex(cat)
+		if orderIdx >= 0 && orderIdx < len(m.KanbanColScrolls) {
+			colScrolls[i] = m.KanbanColScrolls[orderIdx]
 		}
-		// Clamp scroll to valid bounds for this column
-		colCat := kanbanColumnOrder[i]
-		issues := kanbanColumnIssues(data, colCat)
+		issues := kanbanColumnIssues(data, cat)
 		maxScroll := len(issues) - maxVisibleCards
 		if maxScroll < 0 {
 			maxScroll = 0
@@ -358,8 +470,15 @@ func (m Model) renderKanbanView() string {
 		}
 	}
 	// For selected column, ensure cursor is visible
-	if m.KanbanCol >= 0 && m.KanbanCol < numCols {
-		scroll := colScrolls[m.KanbanCol]
+	selVis := -1
+	for i, cat := range visible {
+		if kanbanColumnIndex(cat) == m.KanbanCol {
+			selVis = i
+			break
+		}
+	}
+	if selVis >= 0 {
+		scroll := colScrolls[selVis]
 		if m.KanbanRow < scroll {
 			scroll = m.KanbanRow
 		} else if m.KanbanRow >= scroll+maxVisibleCards {
@@ -368,12 +487,12 @@ func (m Model) renderKanbanView() string {
 		if scroll < 0 {
 			scroll = 0
 		}
-		colScrolls[m.KanbanCol] = scroll
+		colScrolls[selVis] = scroll
 	}
 
 	// Build per-column scroll indicators
 	scrollInfos := make([]kanbanScrollInfo, numCols)
-	for i, colCat := range kanbanColumnOrder {
+	for i, colCat := range visible {
 		issues := kanbanColumnIssues(data, colCat)
 		scrollInfos[i] = kanbanScrollInfo{
 			hasAbove: colScrolls[i] > 0,
@@ -387,7 +506,7 @@ func (m Model) renderKanbanView() string {
 		// Each card takes kanbanCardHeight lines
 		for cardLine := 0; cardLine < kanbanCardHeight; cardLine++ {
 			var cells []string
-			for colIdx, colCat := range kanbanColumnOrder {
+			for colIdx, colCat := range visible {
 				issues := kanbanColumnIssues(data, colCat)
 
 				dataRow := visRow + colScrolls[colIdx]
@@ -395,7 +514,7 @@ func (m Model) renderKanbanView() string {
 				var cellContent string
 				if dataRow < len(issues) {
 					issue := issues[dataRow]
-					isSelected := colIdx == m.KanbanCol && dataRow == m.KanbanRow
+					isSelected := kanbanColumnIndex(colCat) == m.KanbanCol && dataRow == m.KanbanRow
 					cellContent = m.renderKanbanCardLine(issue, cardLine, colWidth, isSelected)
 				} else {
 					cellContent = strings.Repeat(" ", colWidth)
@@ -411,28 +530,22 @@ func (m Model) renderKanbanView() string {
 	upIndicatorLine := m.renderKanbanScrollIndicatorLine(scrollInfos, colWidth, sep, true)
 	downIndicatorLine := m.renderKanbanScrollIndicatorLine(scrollInfos, colWidth, sep, false)
 
-	// Assemble full content
-	var content strings.Builder
-	content.WriteString(header)
-	content.WriteString("\n")
-	content.WriteString(divider)
-	content.WriteString("\n")
-	content.WriteString(headerLine)
-	content.WriteString("\n")
-	content.WriteString(divider)
-	content.WriteString("\n")
-	content.WriteString(upIndicatorLine)
-	content.WriteString("\n")
-	for _, line := range cardLines {
-		content.WriteString(line)
-		content.WriteString("\n")
+	// Assemble full content. The last line is the bottom rule so the grid
+	// does not sit open-ended when OverlayModal or an embedder clips slack.
+	var body []string
+	body = append(body, header, divider, headerLine, divider, upIndicatorLine)
+	body = append(body, cardLines...)
+	body = append(body, downIndicatorLine)
+	for len(body)+1 < modalHeight {
+		body = append(body, strings.Repeat(" ", actualContentWidth))
 	}
-	content.WriteString(downIndicatorLine)
-
-	// Render in a modal box
-	boxContent := content.String()
-	// Trim trailing newline
-	boxContent = strings.TrimRight(boxContent, "\n")
+	body = append(body, divider)
+	for i, line := range body {
+		if ansi.StringWidth(line) > actualContentWidth {
+			body[i] = ansi.Truncate(line, actualContentWidth, "")
+		}
+	}
+	boxContent := strings.Join(body, "\n")
 
 	if m.KanbanFullscreen {
 		return m.renderKanbanFullscreen(boxContent, modalWidth, modalHeight)
@@ -442,9 +555,13 @@ func (m Model) renderKanbanView() string {
 	if m.ModalRenderer != nil {
 		// Add vertical padding to match lipgloss Padding behavior.
 		// Custom renderer only handles horizontal padding, so we add blank lines manually.
-		paddedContent := "\n" + boxContent + "\n"
-		// Add 2 to width/height: lipgloss Width/Height = content area, renderer expects outer with borders
-		return m.ModalRenderer(paddedContent, modalWidth+2, modalHeight+2, ModalTypeKanban, 1)
+		// The standalone box is Width(modalWidth-2) tall by modalHeight, so the
+		// host gets those same outer dimensions and draws its own chrome inside
+		// them. Filling the surface keeps it from padding short lines with
+		// unstyled spaces.
+		outerWidth := modalWidth - 2
+		paddedContent := m.fillModalSurface("\n"+boxContent+"\n", hostContentWidth(outerWidth))
+		return m.ModalRenderer(paddedContent, outerWidth, modalHeight, ModalTypeKanban, 1)
 	}
 	return m.renderKanbanBox(boxContent, modalWidth, modalHeight)
 }
@@ -463,7 +580,7 @@ func (m Model) renderKanbanScrollIndicatorLine(scrollInfos []kanbanScrollInfo, c
 			if !isUp {
 				arrow = "▼"
 			}
-			indicator := subtleStyle.Render(arrow)
+			indicator := m.renderStyles().subtle.Render(arrow)
 			indicatorWidth := lipgloss.Width(indicator)
 			padding := colWidth - indicatorWidth
 			if padding < 0 {
@@ -482,25 +599,17 @@ func (m Model) renderKanbanScrollIndicatorLine(scrollInfos []kanbanScrollInfo, c
 
 // renderKanbanBox wraps content in a styled box for the kanban overlay view.
 func (m Model) renderKanbanBox(content string, width, height int) string {
-	borderColor := primaryColor
-	style := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(0, 1).
+	style := m.renderStyles().kanbanBox.
 		Width(width - 2).
-		MaxHeight(height)
+		Height(height)
 	return style.Render(content)
 }
 
 // renderKanbanFullscreen renders the kanban content to fill the full viewport.
 func (m Model) renderKanbanFullscreen(content string, width, height int) string {
-	borderColor := primaryColor
-	style := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Padding(0, 1).
+	style := m.renderStyles().kanbanBox.
 		Width(width - 2).
-		Height(height - 2)
+		Height(height)
 	return style.Render(content)
 }
 
@@ -515,8 +624,8 @@ func (m Model) renderKanbanCardLine(issue models.Issue, line, width int, selecte
 	switch line {
 	case 0:
 		// Type icon + title
-		icon := formatTypeIcon(issue.Type)
-		prio := formatPriority(issue.Priority)
+		icon := m.formatTypeIcon(issue.Type)
+		prio := m.formatPriority(issue.Priority)
 		prefix := icon + " " + prio + " "
 		prefixWidth := lipgloss.Width(prefix)
 		titleWidth := cardWidth - prefixWidth
@@ -531,8 +640,8 @@ func (m Model) renderKanbanCardLine(issue models.Issue, line, width int, selecte
 
 	case 1:
 		// Issue ID + status badge
-		idStr := timestampStyle.Render(issue.ID)
-		statusStr := formatStatus(issue.Status)
+		idStr := m.renderStyles().timestamp.Render(issue.ID)
+		statusStr := m.formatStatus(issue.Status)
 		content = idStr + " " + statusStr
 
 	case 2:
@@ -552,7 +661,7 @@ func (m Model) renderKanbanCardLine(issue models.Issue, line, width int, selecte
 
 	// Apply selection highlight
 	if selected {
-		content = highlightRow(content, cardWidth)
+		content = m.highlightRow(content, cardWidth)
 	}
 
 	return content

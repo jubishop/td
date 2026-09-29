@@ -1,60 +1,85 @@
 # CLAUDE.md
 
-## MANDATORY: Use td for Task Management
+<!-- td-agent-instructions:start -->
+<!-- td-agent-instructions:version=3 -->
 
-Run td usage --new-session at conversation start (or after /clear). This tells you what to work on next.
+## Working with td
 
-Sessions are automatic (based on terminal/agent context). Optional:
-- td session "name" to label the current session
-- td session --new to force a new session in the same context
+td keeps task context durable across sessions. In a new context, run `td usage --new-session -q` to see current work.
 
-Use td usage -q after first read.
+Use your judgment about how much tracking a task needs. For substantive work: `td start <id>`, record progress with `td log`, hand off with `td handoff <id>`, then `td review <id>`.
 
-## MANDATORY: Use `td` for Task Management
+Closing needs a review. Say who did it (default trusted mode; delegated/strict allow only the first):
 
-Run `td usage --new-session` at conversation start (or after /clear). This tells you what to work on next.
+- independent session: `td approve <id> --reason "..."`
+- a sub-agent: `td approve <id> --reviewed-by "<who>"`
+- you: `td approve <id> --self-review --reason "..."`
 
-Sessions are automatic (based on your terminal/agent context). Optional:
-- `td session "name"` to label the current session
-- `td session --new` to force a new session in the same context
+Prefer a reviewer with its own `TD_CONTEXT_ID`; never name one who did not review.
 
-**Do NOT start a new session mid-work.** Sessions track implementers—new session = bypass review.
+Run `td usage` or `td <command> --help`.
 
-Use `td usage -q` after first read.
+<!-- td-agent-instructions:end -->
+
+## Review Model (Trusted Review)
+
+Work still needs a review before it closes. What changed is that td now asks you
+to say **who** reviewed it, rather than assuming the reviewing agent and the
+recording session are the same thing.
+
+In the default trusted mode:
+
+- An independent session reviews and closes: `td approve <id> --reason "..."`
+- A reviewer attests without closing and anyone closes after:
+  `td approve <id> --record-only --reason "..."`, then `td approve <id> --reason "..."`
+- You implemented it and a sub-agent reviewed it: `td approve <id> --reviewed-by "<who>"`
+- You implemented it and reviewed it yourself: `td approve <id> --self-review --reason "..."`
+
+Prefer the first two. When a reviewing sub-agent has its own `TD_CONTEXT_ID` its
+independence is mechanically verified rather than asserted — see
+[docs/multi-agent-sessions.md](docs/multi-agent-sessions.md).
+
+`--reviewed-by` is an attestation td cannot verify. It exists so an orchestrator
+recording a sub-agent's review writes a true record instead of claiming a
+self-review it did not perform. Do not use it to launder an unreviewed change:
+naming a reviewer who did not review is worse than `--self-review`, because it
+reads as independent in the audit trail. Do not create a throwaway session to
+make a review appear independent either.
+
+Pin `review_policy_mode=delegated|strict` when a project needs a mechanical
+independence boundary rather than an honesty-based one. In those modes an
+involved session cannot approve at all, and `--reviewed-by` records the
+attribution without granting anything.
 
 ## Build & Install
 
 ```bash
 go build -o td .           # Build locally
-go test ./...              # Test all
+make test                  # Test with the release-safe environment
+
+make install-local         # Activate the canonical main checkout machine-wide
+make install-worktree      # Deliberately activate the current branch/worktree
+make install-status        # Show the active install and real shell resolution
+make use-homebrew          # Restore the installed Homebrew release
 ```
+
+`make install` is an unmanaged `go install` into `GOBIN`; it does not alter
+Homebrew links or guarantee which `td` wins PATH precedence. Prefer
+`make install-local` / `make use-homebrew` to switch between builds, and
+`make install-status` when a stale binary is suspected.
 
 ## Version & Release
 
 ```bash
-# Commit changes with proper message
-git add .
-git commit -m "feat: description of changes
-
-Details here
-
-🤖 Generated with Claude Code
-
-Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>"
-
-# Create version tag (bump from current version, e.g., v0.2.0 → v0.3.0)
-git tag -a v0.3.0 -m "Release v0.3.0: description"
-
-# Push commit and tag
+# Update and commit CHANGELOG.md first, then:
 git push origin main
-git push origin v0.3.0
+make release VERSION=vX.Y.Z
 
-# Install locally with version
-go install -ldflags "-X main.Version=v0.3.0" ./...
-
-# Verify installation
-td version
+# Verify the release workflow, assets, Homebrew tap, and installed version.
 ```
+
+See [docs/guides/releasing-new-version.md](docs/guides/releasing-new-version.md)
+for the non-interactive runbook and complete verification checklist.
 
 ## Architecture
 
@@ -62,9 +87,28 @@ td version
 - `internal/db/` - SQLite (schema.go). DB stored at `<project>/.todos/issues.db`
 - `internal/models/` - Issue, Log, Handoff, WorkSession
 - `internal/session/` - Session management (DB-backed, scoped by branch + agent)
+- `internal/reviewpolicy/` - Shared review / close eligibility policy
 - `pkg/monitor/` - TUI monitor (see [docs/modal-system.md](docs/modal-system.md) for modal architecture)
 
 Issue lifecycle: open → in_progress → in_review → closed (or blocked)
+
+## Sync Enablement (per-project model)
+
+**Autosync is enabled per project by setting it up.** Once a project has a usable `sync_state` (via `td login` + `td sync init`/`link`), autosync just works — there is **no feature flag to flip** to turn sync on. The `sync_autosync` feature flag and the `config.json` `sync.autosync` switch are **optional overrides / a global kill-switch**, not the on-switch.
+
+Gate precedence (see `cmd/feature_gate.go:autosyncGateOpen`):
+
+1. **Global kill-switch** — `config.json` `sync.autosync: false` (or `TD_FEATURE_SYNC_AUTOSYNC=false` / `TD_SYNC_AUTO=false`) closes the gate everywhere. `td sync disable` / `td sync enable` write this tri-state field; an explicit `true` only *clears* the kill (does not force-enable an unconfigured project).
+2. **Explicit `sync_autosync` feature flag** (env or project config) decides outright.
+3. **Per-project configured (default)** — a configured project autosyncs; an unconfigured one does not.
+
+`TD_FEATURE_SYNC_AUTOSYNC` is now an **override, not the on-switch** — normal use should not depend on it. If you do set it, put it in `~/.zshenv` (sourced by all shells) **not** `~/.zshrc` (interactive-only), or non-interactive agent subshells silently strand changes with no error.
+
+**Diagnostics:** `td sync status` is always available (even when the sync CLI is gated) — run it first when sync seems stuck. It reports gate state + source, configured, authenticated, pending event count, and last sync. `td doctor` also covers sync.
+
+**Migration:** the gate reads only `sync.autosync`, never the legacy `sync.enabled` — a stale `sync.enabled: false` does not silently kill sync. Already-authenticated projects with a `sync_state` are automatically "configured"; no re-login needed.
+
+Full details: [docs/sync-client-guide.md](docs/sync-client-guide.md#enabling-autosync-the-per-project-model).
 
 ## Settings Persistence
 

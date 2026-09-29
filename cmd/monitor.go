@@ -1,17 +1,13 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
-	"log/slog"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/marcus/td/internal/db"
-	"github.com/marcus/td/internal/features"
 	"github.com/marcus/td/internal/output"
 	"github.com/marcus/td/internal/session"
-	"github.com/marcus/td/internal/syncconfig"
 	"github.com/marcus/td/pkg/monitor"
 	"github.com/spf13/cobra"
 )
@@ -48,10 +44,9 @@ Mouse support:
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
-
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
+			_ = database.Close()
 			output.Error("%v", err)
 			return err
 		}
@@ -62,45 +57,12 @@ Mouse support:
 		}
 
 		model := monitor.NewModel(database, sess.ID, interval, versionStr, baseDir)
+		defer func() { _ = model.Close() }()
 
-		// Enable periodic auto-sync in monitor if authenticated and linked
-		syncInterval := time.Duration(0)
-		if features.IsEnabled(baseDir, features.SyncAutosync.Name) && AutoSyncEnabled() && syncconfig.IsAuthenticated() {
-			syncState, _ := database.GetSyncState()
-			if syncState != nil && !syncState.SyncDisabled {
-				model.AutoSyncFunc = func() { autoSyncOnce() }
-				syncInterval = syncconfig.GetAutoSyncInterval()
-				model.AutoSyncInterval = syncInterval
-				slog.Debug("monitor: autosync configured", "interval", syncInterval)
-			}
-		}
-
-		// Start independent periodic sync goroutine. BubbleTea's tea.Cmd dispatch
-		// can stall under certain terminal/PTY conditions, so we run sync outside
-		// the event loop to guarantee it fires reliably.
-		ctx, cancelSync := context.WithCancel(context.Background())
-		if syncInterval > 0 {
-			go func() {
-				ticker := time.NewTicker(syncInterval)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						autoSyncOnce()
-					}
-				}
-			}()
-		}
-
-		p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
+		p := tea.NewProgram(model)
 		if _, err := p.Run(); err != nil {
-			cancelSync()
 			return fmt.Errorf("error running monitor: %w", err)
 		}
-
-		cancelSync()
 		return nil
 	},
 }

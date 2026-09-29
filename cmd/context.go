@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/output"
@@ -20,10 +19,28 @@ var resumeCmd = &cobra.Command{
 		baseDir := getBaseDir()
 
 		// Show issue details (using show command)
-		showCmd.Run(cmd, args)
+		if showCmd.RunE == nil {
+			return fmt.Errorf("show command is not executable")
+		}
+		if err := showCmd.RunE(showCmd, args); err != nil {
+			return err
+		}
+
+		database, err := db.Open(baseDir)
+		if err != nil {
+			output.Error("%v", err)
+			return err
+		}
+		defer func() { _ = database.Close() }()
+
+		_, scope, err := getCurrentStateSession(database, baseDir)
+		if err != nil {
+			output.Error("%v", err)
+			return err
+		}
 
 		// Set focus
-		_ = config.SetFocus(baseDir, args[0])
+		_ = database.SetFocus(scope, args[0])
 		fmt.Printf("FOCUSED %s\n", args[0])
 
 		return nil
@@ -42,11 +59,11 @@ var usageCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		compact, _ := cmd.Flags().GetBool("compact")
 		quiet, _ := cmd.Flags().GetBool("quiet")
-		jsonOutput, _ := cmd.Flags().GetBool("json")
+		jsonOutput := jsonMode(cmd)
 		newSession, _ := cmd.Flags().GetBool("new-session")
 
 		// Use GetOrCreate to detect context changes and auto-rotate sessions.
@@ -63,14 +80,16 @@ var usageCmd = &cobra.Command{
 		}
 
 		// Get focused issue
-		focusedID, _ := config.GetFocus(baseDir)
+		scope := currentStateScope(baseDir, sess)
+
+		focusedID, _ := database.GetFocus(scope)
 		var focusedIssue *models.Issue
 		if focusedID != "" {
 			focusedIssue, _ = database.GetIssue(focusedID)
 		}
 
 		// Get active work session
-		wsID, _ := config.GetActiveWorkSession(baseDir)
+		wsID, _ := database.GetActiveWorkSession(scope)
 		var activeWS *models.WorkSession
 		var wsIssues []string
 		if wsID != "" {
@@ -85,8 +104,22 @@ var usageCmd = &cobra.Command{
 			SortBy:      "priority",
 		})
 
-		// Get reviewable issues
-		reviewable, _ := database.ListIssues(reviewableByOptions(baseDir, sess.ID))
+		// Get reviewable issues and split into awaiting/ready-to-close.
+		allReviewable, _ := database.ListIssues(reviewableByOptions(baseDir, sess.ID))
+		reviewable := make([]models.Issue, 0, len(allReviewable))
+		readyToClose := make([]models.Issue, 0)
+		readyReviews := make(map[string]*models.IssueReview)
+		for _, issue := range allReviewable {
+			rev, _ := database.GetActiveApprovalReview(issue.ID)
+			if rev == nil {
+				reviewable = append(reviewable, issue)
+				continue
+			}
+			if closerAllowed(&issue, sess.ID, rev) {
+				readyToClose = append(readyToClose, issue)
+				readyReviews[issue.ID] = rev
+			}
+		}
 
 		// Get ready issues (open, not blocked by dependencies)
 		ready, _ := database.ListIssues(db.ListIssuesOptions{
@@ -98,13 +131,14 @@ var usageCmd = &cobra.Command{
 
 		if jsonOutput {
 			result := map[string]interface{}{
-				"session":      sess.ID,
-				"focused":      focusedIssue,
-				"work_session": activeWS,
-				"ws_issues":    wsIssues,
-				"in_progress":  inProgress,
-				"reviewable":   reviewable,
-				"ready":        ready,
+				"session":        sess.ID,
+				"focused":        focusedIssue,
+				"work_session":   activeWS,
+				"ws_issues":      jsonList(wsIssues),
+				"in_progress":    jsonList(inProgress),
+				"reviewable":     jsonList(reviewable),
+				"ready_to_close": jsonList(readyToClose),
+				"ready":          jsonList(ready),
 			}
 			return output.JSON(result)
 		}
@@ -116,7 +150,7 @@ var usageCmd = &cobra.Command{
 		// Show NEW SESSION notice if session just rotated
 		if sess.IsNew && sess.PreviousSessionID != "" {
 			fmt.Printf("NEW SESSION: %s on branch: %s (previous: %s)\n", sess.ID, sess.Branch, sess.PreviousSessionID)
-			fmt.Println("  You are a new context. You can now review issues implemented by the previous session.")
+			fmt.Println("  You are a new context. Issues from the previous session may be awaiting review.")
 			fmt.Println()
 		} else if sess.IsNew {
 			fmt.Printf("NEW SESSION: %s on branch: %s\n", sess.ID, sess.Branch)
@@ -181,6 +215,15 @@ var usageCmd = &cobra.Command{
 			fmt.Println()
 		}
 
+		if len(readyToClose) > 0 {
+			fmt.Printf("READY TO CLOSE (%d issues) — review already recorded:\n", len(readyToClose))
+			for _, issue := range readyToClose {
+				rev := readyReviews[issue.ID]
+				fmt.Printf("  %s \"%s\" %s - reviewed by %s (run `td approve %s` to close)\n", issue.ID, issue.Title, issue.Priority, rev.ReviewerSession, issue.ID)
+			}
+			fmt.Println()
+		}
+
 		if len(ready) > 0 {
 			fmt.Printf("READY TO START (%d issues):\n", len(ready))
 			for _, issue := range ready {
@@ -196,10 +239,16 @@ var usageCmd = &cobra.Command{
 			fmt.Println("     Multi-issue: `td ws start \"name\"` then `td ws tag <ids>`")
 			fmt.Println("  2. `td log \"msg\"` to track progress")
 			fmt.Println("     Multi-issue: `td ws log \"msg\"`")
-			fmt.Println("  3. `td handoff <id>` to capture state (REQUIRED)")
+			fmt.Println("  3. `td handoff <id>` to capture state for another context")
 			fmt.Println("     Multi-issue: `td ws handoff`")
 			fmt.Println("  4. `td review <id>` to submit for review")
-			fmt.Println("  5. Reviewer: `td approve <id>` to close in_review work, or `td reject <id>` to send it back to open")
+			fmt.Println("     (the submitting session is recorded as review_requested_by_session)")
+			fmt.Println("  5. Reviewer: `td approve <id>` to review + close, or `td reject <id>` to return to open")
+			fmt.Println("     Prefer an independent reviewer when practical; they run")
+			fmt.Println("     `td approve <id> --reason \"...\"` to approve and close.")
+			fmt.Println("     Trusted mode (default), if you implemented it: name whoever reviewed it")
+			fmt.Println("     with `td approve <id> --reviewed-by \"<who>\"`, or if you reviewed your")
+			fmt.Println("     own work, `td approve <id> --self-review --reason \"...\"`.")
 			fmt.Println()
 			fmt.Println("  Use `td ws` commands when implementing multiple related issues.")
 			fmt.Println()
@@ -212,23 +261,32 @@ var usageCmd = &cobra.Command{
 			fmt.Println("  td status --json        Machine-readable session and review state")
 			fmt.Println("  td list --json          Machine-readable issue listings for scripts")
 			fmt.Println("  td reviewable           Issues you can review")
+			fmt.Println("  td reviewable --include-approved  Also show reviewed issues you can close")
 			fmt.Println("  td approve/reject <id>  Complete review")
 			fmt.Println()
-			fmt.Println("IMPORTANT: You cannot approve issues you implemented.")
+			fmt.Println("REVIEW (review_policy_mode=trusted, the default):")
+			fmt.Println("  Closing needs a review, and td asks who performed it.")
+			fmt.Println("  An independent reviewer runs `td approve <id> --reason \"...\"`,")
+			fmt.Println("  or attests without closing via `--record-only --reason \"...\"`")
+			fmt.Println("  so any session can close after.")
+			fmt.Println("  If you implemented it and a sub-agent reviewed it, name them:")
+			fmt.Println("  `td approve <id> --reviewed-by \"<who>\"` (no --reason needed).")
+			fmt.Println("  If you reviewed it yourself, say so:")
+			fmt.Println("  `td approve <id> --self-review --reason \"...\"` (audited).")
+			fmt.Println("  td cannot verify --reviewed-by. Never name a reviewer who did not review.")
+			fmt.Println("  Pin delegated|strict for a mechanical independence boundary.")
 			fmt.Println("  Exception: `td add \"title\" --minor` creates self-reviewable tasks.")
 			fmt.Println()
-			fmt.Println("WARNING: Do NOT use `td close` for completed work!")
-			fmt.Println("  Use `td review` -> `td approve` workflow instead.")
+			fmt.Println("Use `td review` -> `td approve` for completed work.")
 			fmt.Println("  `td close` is for admin closures: duplicates, won't-fix, cleanup.")
 			fmt.Println()
-			fmt.Println("Use `td handoff` or `td ws handoff` before stopping work.")
+			fmt.Println("Leave a `td handoff` or `td ws handoff` when work will continue elsewhere.")
 			fmt.Println()
-			fmt.Println("FOR LLMs: Run `td usage --new-session` at conversation start (or after /clear).")
-			fmt.Println("  Do NOT start a new session mid-work—sessions track implementers for review.")
-			fmt.Println("Use `td ws start` when implementing multiple issues to group handoffs.")
+			fmt.Println("For a future agent context, start with `td usage --new-session -q`.")
+			fmt.Println("Use `td ws start` when related issues benefit from a shared handoff.")
 			fmt.Println("  - session = identity (always exists)  |  ws = work container (optional)")
 			fmt.Println()
-			fmt.Println("TIP: Use `td usage -q` to hide these instructions after first read.")
+			fmt.Println("Run `td <command> --help` for command details.")
 		}
 
 		return nil
@@ -255,6 +313,5 @@ func init() {
 
 	usageCmd.Flags().Bool("compact", false, "Shorter output")
 	usageCmd.Flags().BoolP("quiet", "q", false, "Hide workflow instructions (show only actionable items)")
-	usageCmd.Flags().Bool("json", false, "JSON output")
 	usageCmd.Flags().Bool("new-session", false, "Force create a new session (use at conversation start / after /clear)")
 }

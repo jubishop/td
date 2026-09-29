@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/output"
 	"github.com/spf13/cobra"
@@ -16,8 +16,8 @@ import (
 
 // Styles for sync tail output
 var (
-	pushArrow = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("→")  // green
-	pullArrow = lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Render("←")  // cyan
+	pushArrow = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("→") // green
+	pullArrow = lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Render("←") // cyan
 	dimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 )
 
@@ -41,7 +41,7 @@ Examples:
 			output.Error("open database: %v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		// Show initial entries
 		var entries []db.SyncHistoryEntry

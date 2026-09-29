@@ -17,6 +17,8 @@ const (
 	ctxKeyRequestID
 	_ // reserved
 	ctxKeyLogger
+	ctxKeyTdWatchSessionID
+	ctxKeyActingUser
 )
 
 // AuthUser holds the authenticated user information extracted from the API key.
@@ -117,6 +119,14 @@ func (sc *statusCapture) WriteHeader(code int) {
 	sc.ResponseWriter.WriteHeader(code)
 }
 
+// Flush implements http.Flusher so SSE and streaming handlers work correctly
+// when statusCapture is in the middleware chain.
+func (sc *statusCapture) Flush() {
+	if f, ok := sc.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // loggingMiddleware logs each request with method, path, status, and duration.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -176,9 +186,41 @@ func (s *Server) requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 			IsAdmin: isAdmin,
 		}
 
+		// Impersonation ("view-as") keys are tightly scoped: GET on
+		// /v1/projects/* only, with a sliding TTL bumped per successful
+		// request.
+		isImpersonation := false
+		for _, sc := range scopes {
+			if sc == ImpersonationScopeRead {
+				isImpersonation = true
+				break
+			}
+		}
+		if isImpersonation {
+			path := r.URL.Path
+			if !strings.HasPrefix(path, "/v1/projects") {
+				writeError(w, http.StatusForbidden, ErrCodeForbidden, "impersonation key is limited to /v1/projects read access")
+				return
+			}
+			if r.Method != http.MethodGet {
+				writeError(w, http.StatusForbidden, ErrCodeMethodNotAllowedViewAs, "read-only while viewing as user")
+				return
+			}
+		}
+
 		ctx := context.WithValue(r.Context(), ctxKeyAuthUser, authUser)
 		// Enrich logger with user ID
 		ctx = context.WithValue(ctx, ctxKeyLogger, logFor(ctx).With("uid", user.ID))
+
+		if isImpersonation {
+			sc := &statusCapture{ResponseWriter: w, code: http.StatusOK}
+			handler(sc, r.WithContext(ctx))
+			if sc.code < 400 {
+				s.store.ExtendImpersonationKey(ak.ID, impersonationRenewTTL, impersonationMaxTTL)
+			}
+			return
+		}
+
 		handler(w, r.WithContext(ctx))
 	}
 }
@@ -187,6 +229,10 @@ func (s *Server) requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 // the required role for the project identified by the "id" path value.
 func (s *Server) requireProjectAuth(requiredRole string, handler http.HandlerFunc) http.HandlerFunc {
 	return s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		r, ok := s.attachProjectActor(w, r)
+		if !ok {
+			return
+		}
 		projectID := r.PathValue("id")
 		if projectID == "" {
 			writeError(w, http.StatusBadRequest, "bad_request", "missing project id")
@@ -194,9 +240,27 @@ func (s *Server) requireProjectAuth(requiredRole string, handler http.HandlerFun
 		}
 
 		user := getUserFromContext(r.Context())
-		if err := s.store.Authorize(projectID, user.UserID, requiredRole); err != nil {
-			writeError(w, http.StatusForbidden, "forbidden", err.Error())
+		if !projectScopeAllowed(user) {
+			writeError(w, http.StatusForbidden, ErrCodeInsufficientScope, "key does not have the sync or impersonation:read scope required for project routes")
 			return
+		}
+
+		actor := getActingUserFromContext(r.Context())
+		if actor == nil || actor.UserID == "" {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing acting user")
+			return
+		}
+
+		if actor.IsImpersonating {
+			if err := s.store.Authorize(projectID, actor.UserID, requiredRole); err != nil {
+				writeError(w, http.StatusForbidden, "forbidden", err.Error())
+				return
+			}
+		} else {
+			if err := s.store.Authorize(projectID, user.UserID, requiredRole); err != nil {
+				writeError(w, http.StatusForbidden, "forbidden", err.Error())
+				return
+			}
 		}
 
 		// Enrich logger with project ID

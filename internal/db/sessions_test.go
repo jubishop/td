@@ -12,7 +12,7 @@ func setupSessionTestDB(t *testing.T) *DB {
 	if err != nil {
 		t.Fatalf("init db: %v", err)
 	}
-	t.Cleanup(func() { database.Close() })
+	t.Cleanup(func() { _ = database.Close() })
 	return database
 }
 
@@ -85,7 +85,7 @@ func TestUpsertUpdatesExisting(t *testing.T) {
 	}
 }
 
-func TestGetSessionByBranchAgent(t *testing.T) {
+func TestGetSessionByIdentity(t *testing.T) {
 	db := setupSessionTestDB(t)
 
 	now := time.Now().Truncate(time.Second)
@@ -98,7 +98,8 @@ func TestGetSessionByBranchAgent(t *testing.T) {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	got, err := db.GetSessionByBranchAgent("main", "claude-code", 100)
+	// Empty match context matches the empty-context row (backward compat).
+	got, err := db.GetSessionByIdentity("main", "claude-code", 100, "", "")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -110,12 +111,125 @@ func TestGetSessionByBranchAgent(t *testing.T) {
 	}
 
 	// Different agent = not found
-	got, err = db.GetSessionByBranchAgent("main", "cursor", 200)
+	got, err = db.GetSessionByIdentity("main", "cursor", 200, "", "")
 	if err != nil {
 		t.Fatalf("get different: %v", err)
 	}
 	if got != nil {
 		t.Errorf("expected nil for different agent, got %+v", got)
+	}
+}
+
+// TestGetSessionByIdentityContextKeying verifies that match_context_id is part
+// of the identity key: the same branch+agent+pid with a different context
+// resolves to a distinct session, and an exact context match re-finds the row.
+func TestGetSessionByIdentityContextKeying(t *testing.T) {
+	db := setupSessionTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	rowFoo := &SessionRow{
+		ID: "ses_foo", Branch: "main",
+		AgentType: "claude-code", AgentPID: 100,
+		MatchContextID: "foo",
+		StartedAt:      now, LastActivity: now,
+	}
+	if err := db.UpsertSession(rowFoo); err != nil {
+		t.Fatalf("upsert foo: %v", err)
+	}
+
+	// An empty-context lookup must NOT match the context="foo" row.
+	got, err := db.GetSessionByIdentity("main", "claude-code", 100, "", "")
+	if err != nil {
+		t.Fatalf("get empty: %v", err)
+	}
+	if got != nil {
+		t.Errorf("empty context should not match foo row, got %+v", got)
+	}
+
+	// Exact context match re-finds the same row.
+	got, err = db.GetSessionByIdentity("main", "claude-code", 100, "foo", "")
+	if err != nil {
+		t.Fatalf("get foo: %v", err)
+	}
+	if got == nil || got.ID != "ses_foo" {
+		t.Fatalf("expected ses_foo, got %+v", got)
+	}
+	if got.MatchContextID != "foo" {
+		t.Errorf("match_context_id = %q, want %q", got.MatchContextID, "foo")
+	}
+
+	// A second, distinct context on the same branch/agent/pid is independent.
+	rowBar := &SessionRow{
+		ID: "ses_bar", Branch: "main",
+		AgentType: "claude-code", AgentPID: 100,
+		MatchContextID: "bar",
+		StartedAt:      now, LastActivity: now,
+	}
+	if err := db.UpsertSession(rowBar); err != nil {
+		t.Fatalf("upsert bar: %v", err)
+	}
+	got, err = db.GetSessionByIdentity("main", "claude-code", 100, "bar", "")
+	if err != nil {
+		t.Fatalf("get bar: %v", err)
+	}
+	if got == nil || got.ID != "ses_bar" {
+		t.Fatalf("expected ses_bar, got %+v", got)
+	}
+}
+
+func TestGetSessionByIdentityWorktreeKeyingAndLegacyFallback(t *testing.T) {
+	db := setupSessionTestDB(t)
+	now := time.Now().Truncate(time.Second)
+
+	legacy := &SessionRow{
+		ID: "ses_legacy", Branch: "main",
+		AgentType: "claude-code", AgentPID: 100,
+		StartedAt: now, LastActivity: now,
+	}
+	if err := db.UpsertSession(legacy); err != nil {
+		t.Fatalf("upsert legacy: %v", err)
+	}
+
+	got, err := db.GetSessionByIdentity("main", "claude-code", 100, "", "wt_a")
+	if err != nil {
+		t.Fatalf("get legacy fallback: %v", err)
+	}
+	if got == nil || got.ID != "ses_legacy" {
+		t.Fatalf("expected legacy fallback ses_legacy, got %+v", got)
+	}
+
+	rowA := &SessionRow{
+		ID: "ses_wta", Branch: "main",
+		AgentType: "claude-code", AgentPID: 100,
+		WorktreeID: "wt_a",
+		StartedAt:  now.Add(time.Minute), LastActivity: now.Add(time.Minute),
+	}
+	if err := db.UpsertSession(rowA); err != nil {
+		t.Fatalf("upsert wt_a: %v", err)
+	}
+	got, err = db.GetSessionByIdentity("main", "claude-code", 100, "", "wt_a")
+	if err != nil {
+		t.Fatalf("get exact wt_a: %v", err)
+	}
+	if got == nil || got.ID != "ses_wta" {
+		t.Fatalf("expected exact worktree match ses_wta, got %+v", got)
+	}
+
+	rowB := &SessionRow{
+		ID: "ses_wtb", Branch: "main",
+		AgentType: "claude-code", AgentPID: 100,
+		WorktreeID: "wt_b",
+		StartedAt:  now.Add(2 * time.Minute), LastActivity: now.Add(2 * time.Minute),
+	}
+	if err := db.UpsertSession(rowB); err != nil {
+		t.Fatalf("upsert wt_b: %v", err)
+	}
+	got, err = db.GetSessionByIdentity("main", "claude-code", 100, "", "wt_b")
+	if err != nil {
+		t.Fatalf("get exact wt_b: %v", err)
+	}
+	if got == nil || got.ID != "ses_wtb" {
+		t.Fatalf("expected exact worktree match ses_wtb, got %+v", got)
 	}
 }
 

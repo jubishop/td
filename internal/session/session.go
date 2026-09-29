@@ -14,6 +14,7 @@ import (
 
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/git"
+	"github.com/marcus/td/internal/workdir"
 )
 
 const (
@@ -27,10 +28,14 @@ var getOrCreateMu sync.Mutex
 type Session struct {
 	ID                string    `json:"id"`
 	Name              string    `json:"name,omitempty"`
-	Branch            string    `json:"branch,omitempty"`            // git branch for session scoping
-	AgentType         string    `json:"agent_type,omitempty"`        // agent type (claude-code, cursor, terminal, etc.)
-	AgentPID          int       `json:"agent_pid,omitempty"`         // stable parent agent process ID
-	ContextID         string    `json:"context_id,omitempty"`        // audit only, not used for matching
+	Branch            string    `json:"branch,omitempty"`           // git branch for session scoping
+	AgentType         string    `json:"agent_type,omitempty"`       // agent type (claude-code, cursor, terminal, etc.)
+	AgentPID          int       `json:"agent_pid,omitempty"`        // stable parent agent process ID
+	ContextID         string    `json:"context_id,omitempty"`       // audit-only execution-context fingerprint
+	MatchContextID    string    `json:"match_context_id,omitempty"` // identity-key dimension fed by TD_CONTEXT_ID
+	WorktreeID        string    `json:"worktree_id,omitempty"`
+	WorktreeRoot      string    `json:"worktree_root,omitempty"`
+	RepoRoot          string    `json:"repo_root,omitempty"`
 	PreviousSessionID string    `json:"previous_session_id,omitempty"`
 	StartedAt         time.Time `json:"started_at"`
 	LastActivity      time.Time `json:"last_activity,omitempty"` // heartbeat for session liveness
@@ -43,6 +48,18 @@ func (s *Session) Display() string {
 		return fmt.Sprintf("%s (%s)", s.ID, s.Name)
 	}
 	return s.ID
+}
+
+// LastActive returns the session's liveness timestamp: its last recorded
+// activity, falling back to its start time for sessions that predate activity
+// tracking (or were never touched again). This is the single definition of
+// "when was this session last seen" shared by `session list`, `session
+// cleanup`, and stale-claim reclamation.
+func (s *Session) LastActive() time.Time {
+	if s.LastActivity.IsZero() {
+		return s.StartedAt
+	}
+	return s.LastActivity
 }
 
 // DisplayWithAgent returns session info including agent: "ses_abc123 [claude-code]" or with name
@@ -90,6 +107,19 @@ func getCurrentBranch() string {
 		return defaultBranch
 	}
 	return branch
+}
+
+// matchContextID returns the explicit context dimension used in the session
+// identity key. It is sourced solely from TD_CONTEXT_ID. When unset (the normal
+// interactive case) it returns "", which makes the lookup behave exactly as
+// before: empty matches the empty match_context_id of existing rows.
+//
+// This is intentionally separate from getContextID() (the audit-only context
+// fingerprint). The stored match_context_id and the lookup value MUST use this
+// same normalization so a session created under TD_CONTEXT_ID=foo is re-found
+// (not recreated) on a later lookup with the same TD_CONTEXT_ID=foo.
+func matchContextID() string {
+	return os.Getenv("TD_CONTEXT_ID")
 }
 
 // getContextID generates a unique identifier for the current execution context.
@@ -148,10 +178,22 @@ func sessionFromRow(row *db.SessionRow) *Session {
 		AgentType:         row.AgentType,
 		AgentPID:          row.AgentPID,
 		ContextID:         row.ContextID,
+		MatchContextID:    row.MatchContextID,
+		WorktreeID:        row.WorktreeID,
+		WorktreeRoot:      row.WorktreeRoot,
+		RepoRoot:          row.RepoRoot,
 		PreviousSessionID: row.PreviousSessionID,
 		StartedAt:         row.StartedAt,
 		LastActivity:      row.LastActivity,
 	}
+}
+
+func currentWorktree() (workdir.WorktreeInfo, error) {
+	wt, err := workdir.CurrentWorktree()
+	if err != nil {
+		return workdir.WorktreeInfo{}, fmt.Errorf("resolve worktree identity: %w", err)
+	}
+	return wt, nil
 }
 
 // GetOrCreate returns the current session for the current git branch and agent.
@@ -163,6 +205,10 @@ func GetOrCreate(database *db.DB) (*Session, error) {
 
 	branch := getCurrentBranch()
 	fp := GetAgentFingerprint()
+	wt, err := currentWorktree()
+	if err != nil {
+		return nil, err
+	}
 
 	// One-time migration from filesystem (no-op after first run)
 	// Migrate from the resolved root dir and also from cwd (for worktrees)
@@ -171,13 +217,21 @@ func GetOrCreate(database *db.DB) (*Session, error) {
 		_ = database.MigrateFileSystemSessions(cwd)
 	}
 
-	// Look up existing session for this branch + agent fingerprint
-	row, err := database.GetSessionByBranchAgent(branch, fp.String(), fp.PID)
+	// Look up existing session for this branch + agent fingerprint + context.
+	// The context dimension (TD_CONTEXT_ID) keeps distinct sub-agent contexts
+	// that share one process/branch/checkout from collapsing into one session.
+	row, err := database.GetSessionByIdentity(branch, fp.String(), fp.PID, matchContextID(), wt.WorktreeID)
 	if err != nil {
 		return nil, fmt.Errorf("lookup session: %w", err)
 	}
 
 	if row != nil {
+		if row.WorktreeID == "" && wt.WorktreeID != "" {
+			_ = database.UpdateSessionWorktreeMetadata(row.ID, wt.WorktreeID, wt.WorktreeRoot, wt.RepoRoot)
+			row.WorktreeID = wt.WorktreeID
+			row.WorktreeRoot = wt.WorktreeRoot
+			row.RepoRoot = wt.RepoRoot
+		}
 		// Found existing session - update heartbeat
 		now := time.Now()
 		_ = database.UpdateSessionActivity(row.ID, now)
@@ -188,15 +242,19 @@ func GetOrCreate(database *db.DB) (*Session, error) {
 	}
 
 	// No session found - create new one
-	return createSession(database, branch, fp, "")
+	return createSession(database, branch, fp, "", wt)
 }
 
 // Get returns the current session without creating one
 func Get(database *db.DB) (*Session, error) {
 	branch := getCurrentBranch()
 	fp := GetAgentFingerprint()
+	wt, err := currentWorktree()
+	if err != nil {
+		return nil, err
+	}
 
-	row, err := database.GetSessionByBranchAgent(branch, fp.String(), fp.PID)
+	row, err := database.GetSessionByIdentity(branch, fp.String(), fp.PID, matchContextID(), wt.WorktreeID)
 	if err != nil {
 		return nil, fmt.Errorf("lookup session: %w", err)
 	}
@@ -210,15 +268,19 @@ func Get(database *db.DB) (*Session, error) {
 func ForceNewSession(database *db.DB) (*Session, error) {
 	branch := getCurrentBranch()
 	fp := GetAgentFingerprint()
+	wt, err := currentWorktree()
+	if err != nil {
+		return nil, err
+	}
 
 	// Get previous session ID if exists
 	var previousID string
-	row, err := database.GetSessionByBranchAgent(branch, fp.String(), fp.PID)
+	row, err := database.GetSessionByIdentity(branch, fp.String(), fp.PID, matchContextID(), wt.WorktreeID)
 	if err == nil && row != nil {
 		previousID = row.ID
 	}
 
-	return createSession(database, branch, fp, previousID)
+	return createSession(database, branch, fp, previousID, wt)
 }
 
 // SetName sets the session name
@@ -258,7 +320,7 @@ func CleanupStaleSessions(database *db.DB, maxAge time.Duration) (int, error) {
 }
 
 // createSession creates a new session in the DB
-func createSession(database *db.DB, branch string, fp AgentFingerprint, previousID string) (*Session, error) {
+func createSession(database *db.DB, branch string, fp AgentFingerprint, previousID string, wt workdir.WorktreeInfo) (*Session, error) {
 	id, err := generateID()
 	if err != nil {
 		return nil, err
@@ -272,6 +334,10 @@ func createSession(database *db.DB, branch string, fp AgentFingerprint, previous
 		AgentType:         fp.String(),
 		AgentPID:          fp.PID,
 		ContextID:         getContextID(),
+		MatchContextID:    matchContextID(),
+		WorktreeID:        wt.WorktreeID,
+		WorktreeRoot:      wt.WorktreeRoot,
+		RepoRoot:          wt.RepoRoot,
 		PreviousSessionID: previousID,
 		StartedAt:         now,
 		LastActivity:      now,
@@ -291,16 +357,31 @@ func GetWithContextCheck(database *db.DB) (*Session, error) {
 	return GetOrCreate(database)
 }
 
-// ParseDuration parses human-readable duration strings
+// maxDurationDays is the largest whole-day value time.Duration can hold
+// (math.MaxInt64 nanoseconds ≈ 106751 days). Anything beyond it overflows.
+const maxDurationDays = int64(1<<63-1) / int64(24*time.Hour)
+
+// ParseDuration parses human-readable duration strings.
+//
+// The `d` (days) suffix is td's own extension — time.ParseDuration stops at
+// hours. Days are multiplied into nanoseconds, so the multiplication MUST be
+// range-checked: an unchecked `days * 24 * time.Hour` wraps silently, and a
+// wrapped value that lands back in positive territory is indistinguishable
+// from a deliberate short duration. That is not a cosmetic bug where the
+// result gates a destructive sweep — an operator writing an
+// intended-as-never `--stale 213504d` would get a 25-minute reaper.
 func ParseDuration(s string) (time.Duration, error) {
 	if d, err := time.ParseDuration(s); err == nil {
 		return d, nil
 	}
 
 	if strings.HasSuffix(s, "d") {
-		days, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		days, err := strconv.ParseInt(strings.TrimSuffix(s, "d"), 10, 64)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("invalid duration: %s", s)
+		}
+		if days > maxDurationDays || days < -maxDurationDays {
+			return 0, fmt.Errorf("duration out of range: %s (max %dd)", s, maxDurationDays)
 		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}

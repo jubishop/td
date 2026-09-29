@@ -3,8 +3,9 @@ package modal
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 
+	"github.com/marcus/td/pkg/monitor/ansifill"
 	"github.com/marcus/td/pkg/monitor/mouse"
 )
 
@@ -32,11 +33,25 @@ func (m *Modal) buildLayout(screenW, screenH int, handler *mouse.Handler) string
 		contentWidth = 1
 	}
 
-	// 1. Render sections individually, measure heights, collect focusables
-	focusID := m.currentFocusID()
-	rendered := make([]renderedSection, 0, len(m.sections))
-	m.focusIDs = m.focusIDs[:0] // Reset focusable IDs
+	// 1. Discover focusables before choosing the focused element. A new modal
+	// starts with an empty focusIDs slice; choosing focus first would therefore
+	// render every input blurred. The first key arriving before another render
+	// would then be silently discarded by bubbles/textinput.
+	m.focusIDs = m.focusIDs[:0]
+	for _, s := range m.sections {
+		res := s.Render(contentWidth, "", m.hoverID)
+		for _, f := range res.Focusables {
+			m.focusIDs = append(m.focusIDs, f.ID)
+		}
+	}
 
+	// Ensure focusIdx is valid before rendering the visible, focused layout.
+	if len(m.focusIDs) > 0 && m.focusIdx >= len(m.focusIDs) {
+		m.focusIdx = 0
+	}
+	focusID := m.currentFocusID()
+
+	rendered := make([]renderedSection, 0, len(m.sections))
 	for _, s := range m.sections {
 		res := s.Render(contentWidth, focusID, m.hoverID)
 		height := measureHeight(res.Content)
@@ -47,15 +62,6 @@ func (m *Modal) buildLayout(screenW, screenH int, handler *mouse.Handler) string
 			focusables: res.Focusables,
 		})
 
-		// Collect focusable IDs in order
-		for _, f := range res.Focusables {
-			m.focusIDs = append(m.focusIDs, f.ID)
-		}
-	}
-
-	// Ensure focusIdx is valid
-	if len(m.focusIDs) > 0 && m.focusIdx >= len(m.focusIDs) {
-		m.focusIdx = 0
 	}
 
 	// Filter out zero-height sections (e.g., inactive When)
@@ -103,18 +109,26 @@ func (m *Modal) buildLayout(screenW, screenH int, handler *mouse.Handler) string
 	// 4. Build modal content
 	var inner strings.Builder
 	if m.title != "" {
-		inner.WriteString(renderTitleLine(m.title, m.variant))
+		inner.WriteString(m.renderTitleLine(m.title))
 		inner.WriteString("\n\n") // title + blank line separator
 	}
 	inner.WriteString(viewport)
 	if m.showHints {
 		inner.WriteString("\n")
-		inner.WriteString(renderHintLine())
+		inner.WriteString(m.renderHintLine())
 	}
 
-	// 5. Apply modal style
-	styled := m.modalStyle(modalWidth).Render(inner.String())
+	// 5. Apply modal style. Fill the surface behind the content first: nested
+	// styles reset, which clears the block background Lip Gloss emits once per
+	// line, leaving the surface splotchy behind styled text.
+	body := ansifill.Lines(inner.String(), ansifill.Code(m.styles.theme.Surface), 0)
+	styled := m.modalStyle(modalWidth).Render(body)
 	modalH := lipgloss.Height(styled)
+	if m.chromeRenderer != nil {
+		hostInner := m.hostInnerStyle(modalWidth - 4).Render(body)
+		styled = m.chromeRenderer(hostInner, modalWidth, modalH)
+		modalH = lipgloss.Height(styled)
+	}
 	modalX := (screenW - modalWidth) / 2
 	modalY := (screenH - modalH) / 2
 
@@ -156,43 +170,61 @@ func (m *Modal) buildLayout(screenW, screenH int, handler *mouse.Handler) string
 	return styled
 }
 
+func (m *Modal) hostInnerStyle(width int) lipgloss.Style {
+	style := lipgloss.NewStyle().
+		Background(lipgloss.Color(m.styles.theme.Surface)).
+		Padding(1, 1).
+		Width(width)
+	if !m.styles.isDefault {
+		style = style.Foreground(lipgloss.Color(m.styles.theme.TextPrimary))
+	}
+	return style
+}
+
 // modalStyle returns the lipgloss style for the modal box based on variant.
 func (m *Modal) modalStyle(width int) lipgloss.Style {
-	borderColor := Primary
+	borderColor := lipgloss.Color(m.styles.theme.Primary)
 	switch m.variant {
 	case VariantDanger:
-		borderColor = Error
+		borderColor = lipgloss.Color(m.styles.theme.Error)
 	case VariantWarning:
-		borderColor = Warning
+		borderColor = lipgloss.Color(m.styles.theme.Warning)
 	case VariantInfo:
-		borderColor = Info
+		borderColor = lipgloss.Color(m.styles.theme.Info)
 	}
 
-	return lipgloss.NewStyle().
+	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
-		Background(BgSecondary).
+		Background(lipgloss.Color(m.styles.theme.Surface)).
 		Padding(1, 2).
 		Width(width)
+	if !m.styles.isDefault {
+		style = style.Foreground(lipgloss.Color(m.styles.theme.TextPrimary))
+	}
+	return style
 }
 
 // renderTitleLine renders the modal title.
-func renderTitleLine(title string, variant Variant) string {
-	titleStyle := ModalTitle
-	switch variant {
+func (m *Modal) renderTitleLine(title string) string {
+	titleStyle := m.styles.modalTitle
+	if !m.styles.isDefault {
+		titleStyle = titleStyle.Foreground(lipgloss.Color(m.styles.theme.Primary))
+	}
+	switch m.variant {
 	case VariantDanger:
-		titleStyle = titleStyle.Foreground(Error)
+		titleStyle = titleStyle.Foreground(lipgloss.Color(m.styles.theme.Error))
 	case VariantWarning:
-		titleStyle = titleStyle.Foreground(Warning)
+		titleStyle = titleStyle.Foreground(lipgloss.Color(m.styles.theme.Warning))
 	case VariantInfo:
-		titleStyle = titleStyle.Foreground(Info)
+		titleStyle = titleStyle.Foreground(lipgloss.Color(m.styles.theme.Info))
 	}
 	return titleStyle.Render(title)
 }
 
 // renderHintLine renders the keyboard hint line.
-func renderHintLine() string {
-	return MutedText.Render("Tab to switch · Enter to confirm · Esc to cancel")
+func (m *Modal) renderHintLine() string {
+	return m.styles.mutedText.Render("Tab to switch · Enter to confirm · Esc to cancel")
 }
 
 // hintLines returns the number of lines the hint takes (0 if hidden, 1 if shown).

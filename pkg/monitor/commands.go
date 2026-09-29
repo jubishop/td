@@ -6,14 +6,15 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/huh"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/huh/v2"
 	"github.com/marcus/td/internal/agent"
 	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/features"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/query"
+	"github.com/marcus/td/internal/reviewpolicy"
 	"github.com/marcus/td/internal/syncclient"
 	"github.com/marcus/td/internal/syncconfig"
 	"github.com/marcus/td/pkg/monitor/keymap"
@@ -99,16 +100,17 @@ func (m Model) currentContext() keymap.Context {
 func (m Model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Handle our custom key bindings first
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		key := keyMsg.String()
 		switch {
-		case keyMsg.Type == tea.KeyCtrlS:
+		case key == "ctrl+s":
 			return m.executeCommand(keymap.CmdFormSubmit)
-		case keyMsg.Type == tea.KeyEsc && (m.FormState == nil || m.FormState.Autofill == nil || !m.FormState.Autofill.Active):
+		case key == "esc" && (m.FormState == nil || m.FormState.Autofill == nil || !m.FormState.Autofill.Active):
 			// Only cancel form if autofill dropdown is not active; Esc with dropdown
 			// active is handled below to dismiss just the dropdown.
 			return m.executeCommand(keymap.CmdFormCancel)
-		case keyMsg.Type == tea.KeyCtrlX:
+		case key == "ctrl+x":
 			return m.executeCommand(keymap.CmdFormToggleExtend)
-		case keyMsg.Type == tea.KeyCtrlO:
+		case key == "ctrl+o":
 			return m.executeCommand(keymap.CmdFormOpenEditor)
 		}
 
@@ -117,7 +119,7 @@ func (m Model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Only intercept when form fields are focused (not buttons).
 		if m.FormState != nil && m.FormState.Autofill != nil && m.FormState.Autofill.Active &&
 			len(m.FormState.Autofill.Filtered) > 0 && m.FormState.ButtonFocus == formButtonFocusForm {
-			switch keyMsg.Type {
+			switch keyMsg.Key().Code {
 			case tea.KeyUp:
 				if m.FormState.Autofill.Idx > 0 {
 					m.FormState.Autofill.Idx--
@@ -134,7 +136,7 @@ func (m Model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Esc closes the autofill dropdown without closing the form
 		if m.FormState != nil && m.FormState.Autofill != nil && m.FormState.Autofill.Active {
-			if keyMsg.Type == tea.KeyEsc {
+			if key == "esc" {
 				m.FormState.Autofill = nil
 				return m, nil
 			}
@@ -161,16 +163,17 @@ func (m Model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.FormState.ButtonFocus = focus
 				m.FormState.ButtonHover = 0
 				// Auto-scroll: buttons at bottom need scroll down; returning to fields scrolls to focused field
-				if focus == formButtonFocusSubmit || focus == formButtonFocusCancel {
+				switch focus {
+				case formButtonFocusSubmit, formButtonFocusCancel:
 					m.FormScrollOffset = m.formScrollToBottom()
-				} else if focus == formButtonFocusForm {
+				case formButtonFocusForm:
 					m.FormScrollOffset = m.formScrollForFocusedField()
 				}
 				return m, nil
 			}
 
-			switch keyMsg.Type {
-			case tea.KeyTab:
+			switch key {
+			case "tab":
 				if m.FormState.ButtonFocus >= 0 {
 					switch m.FormState.ButtonFocus {
 					case formButtonFocusSubmit:
@@ -184,7 +187,7 @@ func (m Model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.FormState.focusedFieldKey() == m.FormState.lastFieldKey() {
 					return moveToButtons(formButtonFocusSubmit)
 				}
-			case tea.KeyShiftTab:
+			case "shift+tab":
 				if m.FormState.ButtonFocus >= 0 {
 					switch m.FormState.ButtonFocus {
 					case formButtonFocusCancel:
@@ -198,7 +201,7 @@ func (m Model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.FormState.focusedFieldKey() == m.FormState.firstFieldKey() {
 					return moveToButtons(formButtonFocusCancel)
 				}
-			case tea.KeyEnter:
+			case "enter":
 				switch m.FormState.ButtonFocus {
 				case formButtonFocusSubmit:
 					return m.executeCommand(keymap.CmdFormSubmit)
@@ -240,14 +243,14 @@ func (m Model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Height = sizeMsg.Height
 		m.updatePanelBounds()
 		modalWidth, _ := m.formModalDimensions()
-		formWidth := modalWidth - 4
+		formWidth := modalInnerWidth(modalWidth)
 		m.FormState.Width = formWidth
 		m.FormState.Form.WithWidth(formWidth)
 	}
 
 	// Handle PgUp/PgDn scroll for form overflow (before huh processes)
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
-		switch keyMsg.Type {
+		switch keyMsg.Key().Code {
 		case tea.KeyPgUp:
 			maxHeight := m.Height - 2
 			availableLines := maxHeight - 4
@@ -292,7 +295,8 @@ func (m Model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Auto-scroll to keep the focused field visible after Tab/Shift+Tab
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
-		if keyMsg.Type == tea.KeyTab || keyMsg.Type == tea.KeyShiftTab {
+		switch keyMsg.String() {
+		case "tab", "shift+tab":
 			m.FormScrollOffset = m.formScrollForFocusedField()
 		}
 	}
@@ -308,6 +312,7 @@ func (m Model) handleFormUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleKey processes key input using the centralized keymap registry
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	ctx := m.currentContext()
+	key := msg.String()
 
 	// Sync Prompt modal: let declarative modal handle keys first
 	if m.SyncPromptOpen && m.SyncPromptModal != nil {
@@ -359,7 +364,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Help modal filter mode: handle typing when filtering
 	if m.HelpOpen && m.HelpFilterMode {
-		switch msg.Type {
+		switch msg.Key().Code {
 		case tea.KeyEsc:
 			// Clear filter and exit filter mode
 			m.HelpFilter = ""
@@ -377,23 +382,25 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.HelpScroll = 0
 			}
 			return m, nil
-		case tea.KeyRunes:
-			m.HelpFilter += string(msg.Runes)
-			m.HelpScroll = 0
-			return m, nil
+		default:
+			if msg.Key().Text != "" {
+				m.HelpFilter += msg.Key().Text
+				m.HelpScroll = 0
+				return m, nil
+			}
 		}
 		// Fall through to keymap for other keys
 	}
 
 	// Help modal: "/" enters filter mode, Esc clears filter first
 	if m.HelpOpen && !m.HelpFilterMode {
-		if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == '/' {
+		if msg.Key().Text == "/" {
 			m.HelpFilterMode = true
 			m.HelpFilter = ""
 			return m, nil
 		}
 		// Esc clears filter if active, otherwise falls through to close help
-		if msg.Type == tea.KeyEsc && m.HelpFilter != "" {
+		if key == "esc" && m.HelpFilter != "" {
 			m.HelpFilter = ""
 			m.HelpScroll = 0
 			return m, nil
@@ -440,7 +447,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 			// Handle esc to cancel delete
-			if msg.Type == tea.KeyEsc {
+			if key == "esc" {
 				return m.handleBoardEditorAction("delete-cancel")
 			}
 			return m, nil
@@ -455,7 +462,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if cmd != nil {
 				return m, cmd
 			}
-			if msg.Type == tea.KeyEsc {
+			if key == "esc" {
 				return m.handleBoardEditorAction("cancel")
 			}
 			return m, nil
@@ -468,7 +475,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// No manual forwarding or Focus/Blur sync needed.
 
 		// Intercept Ctrl+S (modal doesn't know this shortcut)
-		if msg.Type == tea.KeyCtrlS {
+		if key == "ctrl+s" {
 			return m.handleBoardEditorAction("save")
 		}
 
@@ -511,7 +518,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Delete confirmation modal: let declarative modal handle keys first
 	if m.ConfirmOpen && m.DeleteConfirmModal != nil && m.DeleteConfirmMouseHandler != nil {
 		// Handle Y/N quick keys directly (modal doesn't know about these)
-		key := msg.String()
 		switch key {
 		case "y", "Y":
 			return m.handleDeleteConfirmAction("yes")
@@ -542,13 +548,80 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// Consume keys that the modal handles internally (focus cycling, input)
 		// to prevent double-handling by keymap
-		key := msg.String()
 		switch key {
 		case "tab", "shift+tab", "enter", "up", "down", "left", "right", "home", "end", "backspace", "delete":
 			return m, nil // Key was handled by modal
 		}
 		// Also consume regular character keys for the input field
-		if msg.Type == tea.KeyRunes {
+		if msg.Key().Text != "" {
+			return m, nil
+		}
+		// Fall through to keymap only for unhandled keys (like esc)
+	}
+
+	// Self-review confirmation modal (trusted mode): route keys through the
+	// declarative modal (tab/shift+tab/enter/esc and its text inputs).
+	if m.SelfReviewConfirmOpen && m.SelfReviewConfirmModal != nil && m.SelfReviewConfirmMouseHandler != nil {
+		action, cmd := m.SelfReviewConfirmModal.HandleKey(msg)
+		if action != "" {
+			return m.handleSelfReviewConfirmAction(action)
+		}
+		if cmd != nil {
+			return m, cmd
+		}
+		switch key {
+		case "tab", "shift+tab", "enter", "up", "down", "left", "right", "home", "end", "backspace", "delete":
+			return m, nil // Key was handled by modal
+		}
+		if msg.Key().Text != "" {
+			return m, nil
+		}
+		// Fall through to keymap only for unhandled keys (like esc)
+	}
+
+	// Record-review modal: 'c' toggles decision between approved and
+	// changes_requested. All other keys are routed through the declarative
+	// modal (tab/shift+tab/enter/esc + text input). Without this block the
+	// modal's "c: toggle changes_requested" hint is dead — the decision stays
+	// stuck on "approved".
+	if m.RecordReviewOpen && m.RecordReviewModal != nil && m.RecordReviewMouseHandler != nil {
+		// Toggle only when focus is outside both text inputs. A literal c typed
+		// into a summary or reviewer name belongs to the input.
+		focusedID := m.RecordReviewModal.FocusedID()
+		if msg.String() == "c" && focusedID != "reason" && focusedID != "reviewed_by" {
+			// Modal inputs point into a by-value Model copy. Snapshot through
+			// the modal before rebuilding so the decision display refresh
+			// cannot discard text already entered.
+			reason := m.RecordReviewModal.InputValue("reason")
+			reviewedBy := m.RecordReviewModal.InputValue("reviewed_by")
+			if m.RecordReviewDecision == reviewpolicy.DecisionChangesRequested {
+				m.RecordReviewDecision = reviewpolicy.DecisionApproved
+			} else {
+				m.RecordReviewDecision = reviewpolicy.DecisionChangesRequested
+			}
+			m.RecordReviewInput.SetValue(reason)
+			m.RecordReviewReviewerInput.SetValue(reviewedBy)
+			// Rebuild modal so the rendered "Decision: ..." line reflects the
+			// new state.
+			m.RecordReviewModal = m.createRecordReviewModal()
+			m.RecordReviewModal.Reset()
+			_ = m.RecordReviewModal.Render(m.Width, m.Height, m.RecordReviewMouseHandler)
+			m.RecordReviewModal.SetFocus(focusedID)
+			return m, nil
+		}
+
+		action, cmd := m.RecordReviewModal.HandleKey(msg)
+		if action != "" {
+			return m.handleRecordReviewAction(action)
+		}
+		if cmd != nil {
+			return m, cmd
+		}
+		switch key {
+		case "tab", "shift+tab", "enter", "up", "down", "left", "right", "home", "end", "backspace", "delete":
+			return m, nil
+		}
+		if msg.Key().Text != "" {
 			return m, nil
 		}
 		// Fall through to keymap only for unhandled keys (like esc)
@@ -557,7 +630,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Search mode: forward most keys to textinput for cursor support
 	if ctx == keymap.ContextSearch {
 		// Special case: ? triggers help even in search mode
-		if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == '?' {
+		if msg.Key().Text == "?" {
 			return m.executeCommand(keymap.CmdToggleHelp)
 		}
 
@@ -648,15 +721,11 @@ func (m Model) executeCommand(cmd keymap.Command) (tea.Model, tea.Cmd) {
 
 	// Panel navigation (main context)
 	case keymap.CmdNextPanel:
-		m.ActivePanel = (m.ActivePanel + 1) % 3
-		m.clampCursor(m.ActivePanel)
-		m.ensureCursorVisible(m.ActivePanel)
+		m.cycleFocusPanel(1)
 		return m, nil
 
 	case keymap.CmdPrevPanel:
-		m.ActivePanel = (m.ActivePanel + 2) % 3
-		m.clampCursor(m.ActivePanel)
-		m.ensureCursorVisible(m.ActivePanel)
+		m.cycleFocusPanel(-1)
 		return m, nil
 
 	// Cursor movement
@@ -1216,6 +1285,12 @@ func (m Model) executeCommand(cmd keymap.Command) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case keymap.CmdRecordReview:
+		if m.ActivePanel == PanelTaskList {
+			return m.recordReviewAction()
+		}
+		return m, nil
+
 	case keymap.CmdDelete:
 		return m.confirmDelete()
 
@@ -1288,6 +1363,10 @@ func (m Model) executeCommand(cmd keymap.Command) (tea.Model, tea.Cmd) {
 			m.CloseConfirmOpen = false
 			m.CloseConfirmIssueID = ""
 			m.CloseConfirmTitle = ""
+			return m, nil
+		}
+		if m.SelfReviewConfirmOpen {
+			m.closeSelfReviewConfirmModal()
 			return m, nil
 		}
 		// Delete confirmation is now handled by declarative modal in handleKey
@@ -1782,6 +1861,7 @@ func (m Model) moveIssueInBacklog(direction int) (Model, tea.Cmd) {
 			m.StatusIsError = true
 			return m, nil
 		}
+		m.wakeSync()
 		m.BoardMode.Issues[targetIdx].HasPosition = true
 		m.BoardMode.Issues[targetIdx].Position = targetPos
 		targetIssue = m.BoardMode.Issues[targetIdx] // Refresh local variable
@@ -1801,6 +1881,7 @@ func (m Model) moveIssueInBacklog(direction int) (Model, tea.Cmd) {
 			m.StatusIsError = true
 			return m, nil
 		}
+		m.wakeSync()
 		// Track the issue we want selected after refresh (positions change sort order)
 		m.BoardMode.PendingSelectionID = currentIssue.Issue.ID
 	} else {
@@ -1815,6 +1896,7 @@ func (m Model) moveIssueInBacklog(direction int) (Model, tea.Cmd) {
 		// Log both sides of the swap (positions are exchanged)
 		_ = m.DB.SetIssuePositionLogged(m.BoardMode.Board.ID, currentIssue.Issue.ID, tgtPos, m.SessionID)
 		_ = m.DB.SetIssuePositionLogged(m.BoardMode.Board.ID, targetIssue.Issue.ID, curPos, m.SessionID)
+		m.wakeSync()
 		// Track the issue we want selected after refresh
 		m.BoardMode.PendingSelectionID = currentIssue.Issue.ID
 	}
@@ -1884,6 +1966,7 @@ func (m Model) moveIssueInSwimlane(direction int) (Model, tea.Cmd) {
 			m.StatusIsError = true
 			return m, nil
 		}
+		m.wakeSync()
 		targetBIV.HasPosition = true
 		targetBIV.Position = targetPos
 	}
@@ -1902,6 +1985,7 @@ func (m Model) moveIssueInSwimlane(direction int) (Model, tea.Cmd) {
 			m.StatusIsError = true
 			return m, nil
 		}
+		m.wakeSync()
 		// Track the issue we want selected after refresh (positions change sort order)
 		m.BoardMode.PendingSelectionID = currentBIV.Issue.ID
 	} else {
@@ -1916,6 +2000,7 @@ func (m Model) moveIssueInSwimlane(direction int) (Model, tea.Cmd) {
 		// Log both sides of the swap (positions are exchanged)
 		_ = m.DB.SetIssuePositionLogged(m.BoardMode.Board.ID, currentBIV.Issue.ID, tgtPos, m.SessionID)
 		_ = m.DB.SetIssuePositionLogged(m.BoardMode.Board.ID, targetBIV.Issue.ID, curPos, m.SessionID)
+		m.wakeSync()
 		// Track the issue we want selected after refresh
 		m.BoardMode.PendingSelectionID = currentBIV.Issue.ID
 	}
@@ -1986,6 +2071,7 @@ func (m Model) moveIssueToTop() (Model, tea.Cmd) {
 		m.StatusIsError = true
 		return m, nil
 	}
+	m.wakeSync()
 
 	m.BoardMode.PendingSelectionID = issueID
 	return m, m.fetchBoardIssues(boardID)
@@ -2051,6 +2137,7 @@ func (m Model) moveIssueToBottom() (Model, tea.Cmd) {
 		m.StatusIsError = true
 		return m, nil
 	}
+	m.wakeSync()
 
 	m.BoardMode.PendingSelectionID = issueID
 	return m, m.fetchBoardIssues(boardID)
@@ -2276,12 +2363,12 @@ func (m Model) handleBoardPickerAction(action string) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// installAgentInstructions installs td instructions to the agent file
+// installAgentInstructions installs compact td guidance to the agent file.
 func (m Model) installAgentInstructions() (Model, tea.Cmd) {
 	return m, m.doInstallInstructions()
 }
 
-// doInstallInstructions returns a command that installs agent instructions
+// doInstallInstructions returns a command that installs agent guidance.
 func (m Model) doInstallInstructions() tea.Cmd {
 	return func() tea.Msg {
 		targetPath := m.AgentFilePath
@@ -2299,7 +2386,7 @@ func (m Model) doInstallInstructions() tea.Cmd {
 		}
 		return InstallInstructionsResultMsg{
 			Success: true,
-			Message: "Added td instructions to " + filepath.Base(targetPath),
+			Message: "Added td guidance to " + filepath.Base(targetPath),
 		}
 	}
 }
@@ -2307,13 +2394,33 @@ func (m Model) doInstallInstructions() tea.Cmd {
 // checkFirstRun returns a command that checks if this is a first-time run
 func (m Model) checkFirstRun() tea.Cmd {
 	return func() tea.Msg {
-		agentPath := agent.DetectAgentFile(m.BaseDir)
+		outdatedPath := agent.OutdatedMarkedInstructionsFile(m.BaseDir)
+		agentPath := outdatedPath
+		if agentPath == "" {
+			agentPath = agent.DetectAgentFile(m.BaseDir)
+		}
 		hasTD := agent.AnyFileHasTDInstructions(m.BaseDir)
+		// Suppress the modal once it has been shown in this project, even if the
+		// user declined to install instructions. This keeps td from re-prompting
+		// on every launch. The seen flag is recorded when the modal is shown.
+		seen, _ := config.GetGettingStartedSeen(m.BaseDir)
 
 		return FirstRunCheckMsg{
-			IsFirstRun:      !hasTD, // Show modal if no instructions found
-			AgentFilePath:   agentPath,
-			HasInstructions: hasTD,
+			IsFirstRun:              !seen && !hasTD, // Show only on the first open of a project without instructions
+			AgentFilePath:           agentPath,
+			HasInstructions:         hasTD,
+			NeedsInstructionsUpdate: outdatedPath != "",
 		}
+	}
+}
+
+// markGettingStartedSeen persists the flag that suppresses the Getting Started
+// modal on future launches. Fire-and-forget: failures are ignored so a config
+// write error never disrupts the monitor.
+func (m Model) markGettingStartedSeen() tea.Cmd {
+	baseDir := m.BaseDir
+	return func() tea.Msg {
+		_ = config.SetGettingStartedSeen(baseDir, true)
+		return nil
 	}
 }

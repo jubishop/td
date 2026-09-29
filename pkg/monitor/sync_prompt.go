@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
 
-	"github.com/marcus/td/internal/syncconfig"
 	"github.com/marcus/td/internal/syncclient"
+	"github.com/marcus/td/internal/syncconfig"
 	"github.com/marcus/td/pkg/monitor/modal"
 	"github.com/marcus/td/pkg/monitor/mouse"
 )
@@ -21,7 +21,7 @@ const (
 
 // buildSyncPromptListModal builds the list-phase modal showing remote projects.
 func (m *Model) buildSyncPromptListModal(projects []syncclient.ProjectResponse) *modal.Modal {
-	md := modal.New("SYNC THIS PROJECT?",
+	md := m.newModal("SYNC THIS PROJECT?", ModalTypeSync,
 		modal.WithWidth(55),
 		modal.WithVariant(modal.VariantInfo),
 	)
@@ -65,7 +65,7 @@ func (m *Model) buildSyncPromptListModal(projects []syncclient.ProjectResponse) 
 
 // buildSyncPromptCreateModal builds the create-phase modal with a name input.
 func (m *Model) buildSyncPromptCreateModal() *modal.Modal {
-	md := modal.New("CREATE SYNC PROJECT",
+	md := m.newModal("CREATE SYNC PROJECT", ModalTypeSync,
 		modal.WithWidth(55),
 		modal.WithVariant(modal.VariantInfo),
 		modal.WithPrimaryAction("create_confirm"),
@@ -76,7 +76,7 @@ func (m *Model) buildSyncPromptCreateModal() *modal.Modal {
 		ti := textinput.New()
 		ti.Placeholder = "Project name"
 		ti.CharLimit = 100
-		ti.Width = 40
+		ti.SetWidth(40)
 		m.SyncPromptNameInput = &ti
 	}
 
@@ -115,6 +115,7 @@ func (m *Model) handleSyncPromptAction(action string) tea.Cmd {
 			if err != nil {
 				return SyncPromptLinkResultMsg{Success: false, ProjectName: project.Name, Error: err}
 			}
+			m.wakeSync()
 			return SyncPromptLinkResultMsg{Success: true, ProjectName: project.Name}
 		}
 
@@ -158,6 +159,7 @@ func (m *Model) handleSyncPromptAction(action string) tea.Cmd {
 			if err := db.SetSyncState(project.ID); err != nil {
 				return SyncPromptCreateResultMsg{Success: false, ProjectName: name, Error: err}
 			}
+			m.wakeSync()
 
 			return SyncPromptCreateResultMsg{Success: true, ProjectName: name}
 		}

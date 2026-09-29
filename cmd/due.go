@@ -24,7 +24,7 @@ var dueCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
@@ -45,11 +45,11 @@ var dueCmd = &cobra.Command{
 			issue.DueDate = nil
 
 			if err := database.UpdateIssueLogged(issue, sess.ID, models.ActionUpdate); err != nil {
-				output.Error("failed to update %s: %v", issueID, err)
+				output.Error("%s", describeIssueWriteFailure(database, "update the due date for", issueID, err))
 				return err
 			}
 
-			database.AddLog(&models.Log{
+			_ = database.AddLog(&models.Log{
 				IssueID:   issueID,
 				SessionID: sess.ID,
 				Message:   "Due date cleared",
@@ -71,11 +71,11 @@ var dueCmd = &cobra.Command{
 			issue.DueDate = &dateStr
 
 			if err := database.UpdateIssueLogged(issue, sess.ID, models.ActionUpdate); err != nil {
-				output.Error("failed to update %s: %v", issueID, err)
+				output.Error("%s", describeIssueWriteFailure(database, "update the due date for", issueID, err))
 				return err
 			}
 
-			database.AddLog(&models.Log{
+			_ = database.AddLog(&models.Log{
 				IssueID:   issueID,
 				SessionID: sess.ID,
 				Message:   "Due date set: " + dateStr,

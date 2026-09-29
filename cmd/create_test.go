@@ -85,7 +85,7 @@ func TestCreateIssueWithValidData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:       "Test Issue",
@@ -130,7 +130,7 @@ func TestCreateIssueWithDependency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create prerequisite issue
 	prereq := &models.Issue{
@@ -173,7 +173,7 @@ func TestCreateIssueWithBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create blocked issue first
 	blocked := &models.Issue{
@@ -216,7 +216,7 @@ func TestCreateIssueWithLabels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:  "Labeled Issue",
@@ -240,7 +240,7 @@ func TestCreateIssueWithParent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create parent (epic)
 	parent := &models.Issue{
@@ -273,12 +273,14 @@ func TestIssueDefaultStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title: "New Issue",
 	}
-	database.CreateIssue(issue)
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 
 	retrieved, _ := database.GetIssue(issue.ID)
 	if retrieved.Status != models.StatusOpen {
@@ -293,19 +295,27 @@ func TestCreateMultipleDependencies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create three prerequisite issues
 	prereq1 := &models.Issue{Title: "Prereq 1"}
 	prereq2 := &models.Issue{Title: "Prereq 2"}
 	prereq3 := &models.Issue{Title: "Prereq 3"}
-	database.CreateIssue(prereq1)
-	database.CreateIssue(prereq2)
-	database.CreateIssue(prereq3)
+	if err := database.CreateIssue(prereq1); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateIssue(prereq2); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateIssue(prereq3); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create dependent issue
 	dependent := &models.Issue{Title: "Dependent"}
-	database.CreateIssue(dependent)
+	if err := database.CreateIssue(dependent); err != nil {
+		t.Fatal(err)
+	}
 
 	// Add multiple dependencies
 	if err := database.AddDependency(dependent.ID, prereq1.ID, "depends_on"); err != nil {
@@ -348,10 +358,12 @@ func TestCreateIssueIDFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{Title: "Test Issue"}
-	database.CreateIssue(issue)
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 
 	// ID should be "td-" + 6 hex chars = 9 total chars
 	if !strings.HasPrefix(issue.ID, "td-") {
@@ -369,10 +381,12 @@ func TestCreateIssueTimestamps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{Title: "Test Issue"}
-	database.CreateIssue(issue)
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 
 	if issue.CreatedAt.IsZero() {
 		t.Error("Expected CreatedAt to be set")
@@ -406,7 +420,9 @@ func TestCreateNotesFlagAlias(t *testing.T) {
 	}
 
 	// Reset
-	createCmd.Flags().Set("notes", "")
+	if err := createCmd.Flags().Set("notes", ""); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestCreateTagFlagParsing tests that --tag and --tags flags are defined and work
@@ -462,7 +478,7 @@ func TestCreateIssueWithMinorFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create issue with Minor flag set
 	issue := &models.Issue{
@@ -487,7 +503,7 @@ func TestMinorTaskAllowsSelfReview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionID := "ses_creator"
 
@@ -534,7 +550,7 @@ func TestNormalTaskDoesNotAllowSelfReview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionID := "ses_implementer"
 
@@ -581,7 +597,7 @@ func TestMinorTaskBypass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionA := "ses_aaaa"
 	sessionB := "ses_bbbb"
@@ -647,7 +663,7 @@ func TestMinorVsNormalWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionA := "ses_implementer"
 	sessionB := "ses_reviewer"
@@ -735,7 +751,7 @@ func TestMinorTaskDoesNotAppearToOthersAsNormalTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create a minor issue
 	issue := &models.Issue{
@@ -782,7 +798,7 @@ func TestMinorFlagDefaultIsFalse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create issue without explicitly setting Minor
 	issue := &models.Issue{
@@ -807,7 +823,7 @@ func TestMultipleMinorTasksByCreator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionA := "ses_creator"
 
@@ -841,16 +857,17 @@ func TestMultipleMinorTasksByCreator(t *testing.T) {
 	}
 }
 
-// TestValidateTitleMinLength tests that titles shorter than min are rejected
+// TestValidateTitleMinLength tests that titles shorter than min are no longer
+// rejected: they succeed (no error) but surface a non-empty warning.
 func TestValidateTitleMinLength(t *testing.T) {
 	tests := []struct {
-		title     string
-		minLen    int
-		maxLen    int
-		wantError bool
+		title       string
+		minLen      int
+		maxLen      int
+		wantWarning bool
 	}{
-		{"Short", 15, 200, true},                        // 5 chars < 15
-		{"This is fine!", 15, 200, true},                // 13 chars < 15
+		{"Short", 15, 200, true},                        // 5 chars < 15 -> warn, no error
+		{"This is fine!", 15, 200, true},                // 13 chars < 15 -> warn, no error
 		{"This is long enough to pass", 15, 200, false}, // 27 chars >= 15
 		{"Exactly fifteen!", 15, 200, false},            // 16 chars >= 15
 		{"Fix the login bug", 15, 200, false},           // 17 chars >= 15
@@ -859,12 +876,16 @@ func TestValidateTitleMinLength(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		err := validateTitle(tt.title, tt.minLen, tt.maxLen)
-		if tt.wantError && err == nil {
-			t.Errorf("validateTitle(%q, %d, %d) expected error, got nil", tt.title, tt.minLen, tt.maxLen)
-		}
-		if !tt.wantError && err != nil {
+		warning, err := validateTitle(tt.title, tt.minLen, tt.maxLen)
+		// A too-short title must never abort creation.
+		if err != nil {
 			t.Errorf("validateTitle(%q, %d, %d) unexpected error: %v", tt.title, tt.minLen, tt.maxLen, err)
+		}
+		if tt.wantWarning && warning == "" {
+			t.Errorf("validateTitle(%q, %d, %d) expected a warning, got none", tt.title, tt.minLen, tt.maxLen)
+		}
+		if !tt.wantWarning && warning != "" {
+			t.Errorf("validateTitle(%q, %d, %d) unexpected warning: %q", tt.title, tt.minLen, tt.maxLen, warning)
 		}
 	}
 }
@@ -886,7 +907,7 @@ func TestValidateTitleMaxLength(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		err := validateTitle(tt.title, tt.minLen, tt.maxLen)
+		_, err := validateTitle(tt.title, tt.minLen, tt.maxLen)
 		if tt.wantError && err == nil {
 			t.Errorf("validateTitle(len=%d, min=%d, max=%d) expected error, got nil", len(tt.title), tt.minLen, tt.maxLen)
 		}
@@ -907,7 +928,7 @@ func TestValidateTitleGenericRejection(t *testing.T) {
 	}
 
 	for _, title := range genericTitles {
-		err := validateTitle(title, 1, 100) // Use min=1 to isolate generic check
+		_, err := validateTitle(title, 1, 100) // Use min=1 to isolate generic check
 		if err == nil {
 			t.Errorf("validateTitle(%q) should reject generic title", title)
 		}
@@ -917,19 +938,22 @@ func TestValidateTitleGenericRejection(t *testing.T) {
 	}
 }
 
-// TestValidateTitleErrorMessages tests that error messages are helpful
+// TestValidateTitleErrorMessages tests that warning/error messages are helpful
 func TestValidateTitleErrorMessages(t *testing.T) {
-	// Too short error
-	err := validateTitle("Short", 15, 100)
-	if err == nil || !strings.Contains(err.Error(), "too short") {
-		t.Errorf("Expected 'too short' error, got: %v", err)
+	// Too short is now a non-fatal warning, not an error.
+	warning, err := validateTitle("Short", 15, 100)
+	if err != nil {
+		t.Errorf("Too-short title should not error, got: %v", err)
 	}
-	if err != nil && !strings.Contains(err.Error(), "5 chars") {
-		t.Errorf("Error should include actual length, got: %v", err)
+	if warning == "" || !strings.Contains(warning, "short") {
+		t.Errorf("Expected 'short' warning, got: %q", warning)
+	}
+	if !strings.Contains(warning, "5 chars") {
+		t.Errorf("Warning should include actual length, got: %q", warning)
 	}
 
 	// Too long error
-	err = validateTitle(strings.Repeat("a", 150), 15, 100)
+	_, err = validateTitle(strings.Repeat("a", 150), 15, 100)
 	if err == nil || !strings.Contains(err.Error(), "too long") {
 		t.Errorf("Expected 'too long' error, got: %v", err)
 	}
@@ -972,7 +996,7 @@ func TestCreateRichTextFromFileAndStdin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	saveAndRestoreCommandFlags(t, createCmd, "description", "desc", "body", "notes", "description-file", "acceptance", "acceptance-file")
 
@@ -1023,7 +1047,7 @@ func TestCreateRichTextConflictErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	saveAndRestoreCommandFlags(t, createCmd, "description", "desc", "body", "notes", "description-file")
 

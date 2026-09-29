@@ -19,7 +19,7 @@ func newTestServerWithDB(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("init db: %v", err)
 	}
-	t.Cleanup(func() { database.Close() })
+	t.Cleanup(func() { _ = database.Close() })
 	return NewServer(database, tmpDir, "ses_test123", ServeConfig{})
 }
 
@@ -47,7 +47,7 @@ func doJSON(t *testing.T, ts *httptest.Server, method, path string, body interfa
 	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return resp, env
 }
 
@@ -98,6 +98,75 @@ func TestCreateIssue_ValidMinimal(t *testing.T) {
 	// creator_session should be the server's session
 	if issue["creator_session"] != "ses_test123" {
 		t.Errorf("creator_session = %v, want ses_test123", issue["creator_session"])
+	}
+}
+
+func TestHandleSetFocus_DoesNotNotifyForSetOrClear(t *testing.T) {
+	tmpDir := t.TempDir()
+	database, err := db.Initialize(tmpDir)
+	if err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	issue := &models.Issue{Title: "Focus mutation notify test"}
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	notifyCount := 0
+	ctx := HandlerContext{
+		DB:         database,
+		SessionID:  "ses_focus_notify",
+		WorktreeID: worktreeIDForBaseDir(tmpDir),
+		BaseDir:    tmpDir,
+		Config: HandlerConfig{
+			NotifyChange: func() { notifyCount++ },
+		},
+	}
+
+	for _, body := range []interface{}{
+		map[string]interface{}{"issue_id": issue.ID},
+		map[string]interface{}{"issue_id": nil},
+	} {
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatalf("encode body: %v", err)
+		}
+		req := httptest.NewRequest("PUT", "/v1/focus", &buf)
+		rec := httptest.NewRecorder()
+
+		HandleSetFocus(ctx, rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+	}
+
+	if notifyCount != 0 {
+		t.Fatalf("NotifyChange called %d times, want 0", notifyCount)
+	}
+}
+
+func TestHandleSetFocus_NoLocalRootUnavailable(t *testing.T) {
+	tmpDir := t.TempDir()
+	database, err := db.Initialize(tmpDir)
+	if err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	req := httptest.NewRequest("PUT", "/v1/focus", bytes.NewBufferString(`{"issue_id":null}`))
+	rec := httptest.NewRecorder()
+
+	HandleSetFocus(HandlerContext{
+		DB:        database,
+		SessionID: "ses_no_root",
+		BaseDir:   "",
+	}, rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
 	}
 }
 
@@ -316,7 +385,7 @@ func TestCreateIssue_InvalidJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
@@ -610,7 +679,7 @@ func TestUpdateIssue_InvalidJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)

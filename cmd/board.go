@@ -32,7 +32,7 @@ var boardListCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		boards, err := database.ListBoards()
 		if err != nil {
@@ -40,9 +40,9 @@ var boardListCmd = &cobra.Command{
 			return err
 		}
 
-		asJSON, _ := cmd.Flags().GetBool("json")
+		asJSON := jsonMode(cmd)
 		if asJSON {
-			data, _ := json.MarshalIndent(boards, "", "  ")
+			data, _ := json.MarshalIndent(jsonList(boards), "", "  ")
 			fmt.Println(string(data))
 			return nil
 		}
@@ -89,7 +89,7 @@ var boardCreateCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		queryStr, _ := cmd.Flags().GetString("query")
 
@@ -123,7 +123,7 @@ var boardDeleteCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		board, err := database.ResolveBoardRef(ref)
 		if err != nil {
@@ -160,7 +160,7 @@ var boardShowCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		board, err := database.ResolveBoardRef(ref)
 		if err != nil {
@@ -234,9 +234,9 @@ var boardShowCmd = &cobra.Command{
 			}
 		}
 
-		asJSON, _ := cmd.Flags().GetBool("json")
+		asJSON := jsonMode(cmd)
 		if asJSON {
-			data, _ := json.MarshalIndent(issues, "", "  ")
+			data, _ := json.MarshalIndent(jsonList(issues), "", "  ")
 			fmt.Println(string(data))
 			return nil
 		}
@@ -287,7 +287,7 @@ var boardEditCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		board, err := database.ResolveBoardRef(ref)
 		if err != nil {
@@ -347,7 +347,7 @@ var boardMoveCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		board, err := database.ResolveBoardRef(boardRef)
 		if err != nil {
@@ -409,7 +409,7 @@ var boardUnpositionCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		board, err := database.ResolveBoardRef(boardRef)
 		if err != nil {
@@ -468,9 +468,7 @@ func init() {
 	boardCmd.AddCommand(boardUnpositionCmd)
 
 	// Flags
-	boardListCmd.Flags().Bool("json", false, "Output as JSON")
 	boardCreateCmd.Flags().StringP("query", "q", "", "TDQ query for the board")
-	boardShowCmd.Flags().Bool("json", false, "Output as JSON")
 	boardShowCmd.Flags().StringArrayP("status", "s", nil, "Filter by status")
 	boardEditCmd.Flags().StringP("name", "n", "", "New name for the board")
 	boardEditCmd.Flags().StringP("query", "q", "", "New query for the board")

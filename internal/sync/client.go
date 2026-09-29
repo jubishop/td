@@ -3,6 +3,7 @@ package sync
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -48,7 +49,7 @@ func GetPendingEvents(tx *sql.Tx, deviceID, sessionID string) ([]Event, error) {
 	if err != nil {
 		return nil, fmt.Errorf("query pending events: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var events []Event
 	for rows.Next() {
@@ -86,6 +87,8 @@ func GetPendingEvents(tx *sql.Tx, deviceID, sessionID string) ([]Event, error) {
 		if prevDataStr.Valid && prevDataStr.String != "" {
 			prevData = json.RawMessage(prevDataStr.String)
 		}
+		newData = scrubLocalOnlySyncPayload(canonicalType, newData)
+		prevData = scrubLocalOnlySyncPayload(canonicalType, prevData)
 
 		payload := map[string]any{
 			"schema_version": 1,
@@ -130,9 +133,19 @@ func ApplyRemoteEvents(tx *sql.Tx, events []Event, myDeviceID string, validator 
 		}
 		if err := json.Unmarshal(ev.Payload, &wrapper); err != nil {
 			slog.Warn("apply remote: unmarshal payload", "seq", ev.ServerSeq, "err", err)
-			result.Failed = append(result.Failed, FailedEvent{ServerSeq: ev.ServerSeq, Error: err})
+			result.Failed = append(result.Failed, FailedEvent{
+				ServerSeq:  ev.ServerSeq,
+				DeviceID:   ev.DeviceID,
+				ActionType: ev.ActionType,
+				EntityType: ev.EntityType,
+				EntityID:   ev.EntityID,
+				Payload:    ev.Payload,
+				Error:      fmt.Errorf("unmarshal payload: %w", err),
+			})
 			continue
 		}
+		wrapper.NewData = scrubLocalOnlySyncPayload(ev.EntityType, wrapper.NewData)
+		wrapper.PreviousData = scrubLocalOnlySyncPayload(ev.EntityType, wrapper.PreviousData)
 
 		// Build event with raw new_data as payload for ApplyEvent
 		applyEv := Event{
@@ -149,17 +162,58 @@ func ApplyRemoteEvents(tx *sql.Tx, events []Event, myDeviceID string, validator 
 
 		res, err := applyEventWithPrevious(tx, applyEv, validator, wrapper.PreviousData)
 		if err != nil {
+			// An orphaned create is a deliberate drop, not a failure: its
+			// ON DELETE CASCADE parent is gone, so no peer keeps this row.
+			// See OrphanedParentError for why skipping converges.
+			var orphan *OrphanedParentError
+			if errors.As(err, &orphan) {
+				slog.Info("apply remote: skipped orphaned create",
+					"seq", ev.ServerSeq, "entity", ev.EntityType+"/"+ev.EntityID,
+					"missing_parent", orphan.ParentTable+"/"+orphan.ParentID)
+				result.Skipped = append(result.Skipped, SkippedEvent{
+					ServerSeq:  ev.ServerSeq,
+					DeviceID:   ev.DeviceID,
+					ActionType: ev.ActionType,
+					EntityType: ev.EntityType,
+					EntityID:   ev.EntityID,
+					Reason:     SkipReasonOrphanedParent,
+					Detail:     orphan.Error(),
+					Payload:    ev.Payload,
+				})
+				continue
+			}
 			slog.Warn("apply remote: apply event", "seq", ev.ServerSeq, "err", err)
-			result.Failed = append(result.Failed, FailedEvent{ServerSeq: ev.ServerSeq, Error: err})
+			result.Failed = append(result.Failed, FailedEvent{
+				ServerSeq:  ev.ServerSeq,
+				DeviceID:   ev.DeviceID,
+				ActionType: ev.ActionType,
+				EntityType: ev.EntityType,
+				EntityID:   ev.EntityID,
+				Payload:    ev.Payload,
+				Error:      err,
+			})
 			continue
 		}
-		if res.Overwritten && localModifiedSinceSync(res.OldData, lastSyncAt) {
+		// Self-authored events are never true conflicts: a sync pulls back the
+		// client's own just-pushed events (to keep sequence convergence), and
+		// replaying them in server_seq order can transiently overwrite newer
+		// local state (e.g. an issue's creation event landing on top of a later
+		// local close) before a subsequent event in the same batch restores it.
+		// Those overwrites are self-replays, not concurrent edits — the latest
+		// event always wins and it's the client's own intent, so no data is
+		// lost. Only events authored by another device (ev.DeviceID != myDeviceID)
+		// can be a genuine conflict worth warning about. Note: this assumes
+		// deviceID is per-install; two distinct users sharing one install would
+		// share a deviceID and a real conflict between them would be suppressed,
+		// which is an accepted trade-off (conflicts flow cross-device via the
+		// server, not within a single install).
+		if res.Overwritten && ev.DeviceID != myDeviceID && localModifiedSinceSync(res.OldData, lastSyncAt) {
 			result.Overwrites++
 			result.Conflicts = append(result.Conflicts, ConflictRecord{
 				EntityType:    ev.EntityType,
 				EntityID:      ev.EntityID,
 				ServerSeq:     ev.ServerSeq,
-				LocalData:     res.OldData,
+				LocalData:     scrubLocalOnlySyncPayload(ev.EntityType, res.OldData),
 				RemoteData:    wrapper.NewData,
 				OverwrittenAt: time.Now().UTC(),
 			})
@@ -206,6 +260,113 @@ func localModifiedSinceSync(oldData json.RawMessage, lastSyncAt *time.Time) bool
 
 	// No timestamp field found — be conservative, record conflict
 	return true
+}
+
+// GetPendingEventsPreserveSession reads unsynced, non-undone action_log rows
+// and returns them as Events whose SessionID is the value stored on each row
+// (NOT a caller-supplied session). Use this from the td-sync post-commit
+// promotion path so per-actor session_ids stamped by the REST middleware
+// (`twu_*` / `twa_*_as_*`) propagate end-to-end into events.db.
+//
+// Behavioural differences vs GetPendingEvents:
+//   - Per-row session_id is taken from action_log.session_id rather than
+//     overwritten with the caller's session.
+//   - DeviceID is the constant supplied by the caller (typically
+//     api.TdWatchServerDeviceID = "td_watch_server" — see plan §10 Q2).
+//   - No backfill (BackfillOrphanEntities / BackfillStaleIssues): promotion
+//     is for fresh writes from the REST handler that just committed. The
+//     backfill helpers exist to repair pre-existing data on the local CLI
+//     before the first push and would race / duplicate when run repeatedly
+//     on the server side.
+//
+// Other field semantics (action_type mapping, entity_type normalization,
+// {schema_version, new_data, previous_data} payload envelope, timestamp
+// parsing, ClientActionID = rowid) match GetPendingEvents exactly so
+// downstream consumers (InsertServerEvents, ApplyRemoteEvents) can't tell
+// the two paths apart.
+func GetPendingEventsPreserveSession(tx *sql.Tx, deviceID string) ([]Event, error) {
+	rows, err := tx.Query(`
+		SELECT rowid, id, session_id, action_type, entity_type, entity_id, new_data, previous_data, timestamp
+		FROM action_log
+		WHERE synced_at IS NULL AND undone = 0
+		ORDER BY rowid ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query pending events: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var events []Event
+	for rows.Next() {
+		var (
+			rowid                                   int64
+			id                                      sql.NullString
+			rowSessionID                            sql.NullString
+			actionType, entityType, entityID, tsStr string
+			newDataStr, prevDataStr                 sql.NullString
+		)
+		if err := rows.Scan(&rowid, &id, &rowSessionID, &actionType, &entityType, &entityID, &newDataStr, &prevDataStr, &tsStr); err != nil {
+			return nil, fmt.Errorf("scan action_log row: %w", err)
+		}
+		if !id.Valid || id.String == "" {
+			slog.Warn("sync: skipping action_log with NULL/empty id", "rowid", rowid)
+			continue
+		}
+		if !rowSessionID.Valid || rowSessionID.String == "" {
+			// Defensive: action_log.session_id is NOT NULL per schema, so
+			// this branch shouldn't fire; skip rather than emit an event
+			// with empty session_id (InsertServerEvents would reject anyway).
+			slog.Warn("sync: skipping action_log with empty session_id", "rowid", rowid)
+			continue
+		}
+
+		clientTS, err := parseTimestamp(tsStr)
+		if err != nil {
+			return nil, fmt.Errorf("parse timestamp rowid=%d: %w", rowid, err)
+		}
+
+		canonicalType, ok := normalizeEntityType(entityType)
+		if !ok {
+			slog.Warn("sync: skipping unsupported entity type", "entity_type", entityType, "action_id", id.String)
+			continue
+		}
+
+		newData := json.RawMessage("{}")
+		if newDataStr.Valid && newDataStr.String != "" {
+			newData = json.RawMessage(newDataStr.String)
+		}
+		prevData := json.RawMessage("{}")
+		if prevDataStr.Valid && prevDataStr.String != "" {
+			prevData = json.RawMessage(prevDataStr.String)
+		}
+		newData = scrubLocalOnlySyncPayload(canonicalType, newData)
+		prevData = scrubLocalOnlySyncPayload(canonicalType, prevData)
+
+		payload := map[string]any{
+			"schema_version": 1,
+			"new_data":       newData,
+			"previous_data":  prevData,
+		}
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("marshal payload rowid=%d: %w", rowid, err)
+		}
+
+		events = append(events, Event{
+			ClientActionID:  rowid,
+			DeviceID:        deviceID,
+			SessionID:       rowSessionID.String,
+			ActionType:      mapActionType(actionType),
+			EntityType:      canonicalType,
+			EntityID:        entityID,
+			Payload:         payloadBytes,
+			ClientTimestamp: clientTS,
+			ServerSeq:       0,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return events, nil
 }
 
 // MarkEventsSynced updates action_log rows with their server-assigned sequence numbers.

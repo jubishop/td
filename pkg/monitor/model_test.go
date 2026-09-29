@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
 	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/pkg/monitor/keymap"
@@ -178,27 +178,31 @@ func TestBuildTaskListRows(t *testing.T) {
 	m := Model{
 		TaskList: TaskListData{
 			Reviewable:    []models.Issue{{ID: "r1"}, {ID: "r2"}},
+			ReadyToClose:  []models.Issue{{ID: "rtc1"}},
 			NeedsRework:   []models.Issue{{ID: "rw1"}},
 			InProgress:    []models.Issue{{ID: "ip1"}},
 			Ready:         []models.Issue{{ID: "rd1"}},
 			PendingReview: []models.Issue{{ID: "pr1"}},
+			PendingOther:  []models.Issue{{ID: "oth1"}},
 			Blocked:       []models.Issue{{ID: "b1"}, {ID: "b2"}, {ID: "b3"}},
 		},
 	}
 
 	m.buildTaskListRows()
 
-	// Order should be: Reviewable, NeedsRework, InProgress, Ready, PendingReview, Blocked
+	// Order should be: Reviewable, ReadyToClose, NeedsRework, InProgress, Ready, PendingReview, PendingOther, Blocked
 	expected := []struct {
 		id       string
 		category TaskListCategory
 	}{
 		{"r1", CategoryReviewable},
 		{"r2", CategoryReviewable},
+		{"rtc1", CategoryReadyToClose},
 		{"rw1", CategoryNeedsRework},
 		{"ip1", CategoryInProgress},
 		{"rd1", CategoryReady},
 		{"pr1", CategoryPendingReview},
+		{"oth1", CategoryPendingOther},
 		{"b1", CategoryBlocked},
 		{"b2", CategoryBlocked},
 		{"b3", CategoryBlocked},
@@ -265,7 +269,7 @@ func TestHandleKey_JMovesCursorAndKeepsVisible(t *testing.T) {
 	m.Cursor[PanelTaskList] = 3
 	m.ScrollOffset[PanelTaskList] = 0
 
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m2 := updated.(Model)
 
 	if m2.Cursor[PanelTaskList] != 4 {
@@ -297,7 +301,7 @@ func TestHandleKey_PanelSwitchEnsuresCursorVisible(t *testing.T) {
 	m.ScrollOffset[PanelTaskList] = 10 // invalid: cursor would be offscreen
 
 	// Tab cycles from PanelCurrentWork (0) to PanelTaskList (1)
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	m2 := updated.(Model)
 
 	if m2.ActivePanel != PanelTaskList {
@@ -321,7 +325,7 @@ func TestEscapeClearsSearchAndExitsSearchMode(t *testing.T) {
 	}
 
 	// Press Escape in search mode
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 	m2 := updated.(Model)
 
 	if m2.SearchMode {
@@ -345,7 +349,7 @@ func TestEscapeClearsSearchFilterFromMainView(t *testing.T) {
 	}
 
 	// Press Escape in main view with active filter
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 	m2 := updated.(Model)
 
 	if m2.SearchQuery != "" {
@@ -366,7 +370,7 @@ func TestEscapeDoesNothingWithNoFilter(t *testing.T) {
 	}
 
 	// Press Escape with no filter - should return nil cmd (no fetch)
-	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	_, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if cmd != nil {
 		t.Fatal("Escape with no filter should not trigger fetch")
@@ -606,7 +610,7 @@ func TestCursorClampsAtBottom(t *testing.T) {
 	m.Cursor[PanelTaskList] = 2
 
 	// Press j - should stay at 2 (clamped)
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m2 := updated.(Model)
 
 	if m2.Cursor[PanelTaskList] != 2 {
@@ -614,7 +618,7 @@ func TestCursorClampsAtBottom(t *testing.T) {
 	}
 
 	// Press j again - should still be 2
-	updated, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ = m2.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m3 := updated.(Model)
 
 	if m3.Cursor[PanelTaskList] != 2 {
@@ -835,7 +839,7 @@ func TestEpicTasksCursor(t *testing.T) {
 	}
 
 	// Move cursor down
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m2 := updated.(Model)
 
 	if m2.CurrentModal().EpicTasksCursor != 1 {
@@ -843,7 +847,7 @@ func TestEpicTasksCursor(t *testing.T) {
 	}
 
 	// Move cursor down again
-	updated, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ = m2.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m3 := updated.(Model)
 
 	if m3.CurrentModal().EpicTasksCursor != 2 {
@@ -851,7 +855,7 @@ func TestEpicTasksCursor(t *testing.T) {
 	}
 
 	// Move cursor down at bottom (should stay at 2)
-	updated, _ = m3.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ = m3.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m4 := updated.(Model)
 
 	if m4.CurrentModal().EpicTasksCursor != 2 {
@@ -859,7 +863,7 @@ func TestEpicTasksCursor(t *testing.T) {
 	}
 
 	// Move cursor up
-	updated, _ = m4.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	updated, _ = m4.handleKey(tea.KeyPressMsg{Code: 'k', Text: ""})
 	m5 := updated.(Model)
 
 	if m5.CurrentModal().EpicTasksCursor != 1 {
@@ -883,7 +887,7 @@ func TestToggleTaskSectionFocus(t *testing.T) {
 	}
 
 	// Toggle focus on
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	m2 := updated.(Model)
 
 	if !m2.CurrentModal().TaskSectionFocused {
@@ -891,7 +895,7 @@ func TestToggleTaskSectionFocus(t *testing.T) {
 	}
 
 	// Toggle focus off
-	updated, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ = m2.handleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	m3 := updated.(Model)
 
 	if m3.CurrentModal().TaskSectionFocused {
@@ -918,7 +922,7 @@ func TestBlockedByCursorNavigation(t *testing.T) {
 	}
 
 	// Move cursor down
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m2 := updated.(Model)
 
 	if m2.CurrentModal().BlockedByCursor != 1 {
@@ -926,7 +930,7 @@ func TestBlockedByCursorNavigation(t *testing.T) {
 	}
 
 	// Move cursor down again
-	updated, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ = m2.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m3 := updated.(Model)
 
 	if m3.CurrentModal().BlockedByCursor != 2 {
@@ -934,7 +938,7 @@ func TestBlockedByCursorNavigation(t *testing.T) {
 	}
 
 	// Move cursor down at bottom (should stay at 2)
-	updated, _ = m3.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ = m3.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m4 := updated.(Model)
 
 	if m4.CurrentModal().BlockedByCursor != 2 {
@@ -942,7 +946,7 @@ func TestBlockedByCursorNavigation(t *testing.T) {
 	}
 
 	// Move cursor up
-	updated, _ = m4.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	updated, _ = m4.handleKey(tea.KeyPressMsg{Code: 'k', Text: ""})
 	m5 := updated.(Model)
 
 	if m5.CurrentModal().BlockedByCursor != 1 {
@@ -968,7 +972,7 @@ func TestBlocksSectionNavigation(t *testing.T) {
 	}
 
 	// Move cursor down
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m2 := updated.(Model)
 
 	if m2.CurrentModal().BlocksCursor != 1 {
@@ -976,7 +980,7 @@ func TestBlocksSectionNavigation(t *testing.T) {
 	}
 
 	// Move cursor down at bottom (should stay at 1)
-	updated, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ = m2.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m3 := updated.(Model)
 
 	if m3.CurrentModal().BlocksCursor != 1 {
@@ -984,7 +988,7 @@ func TestBlocksSectionNavigation(t *testing.T) {
 	}
 
 	// Move cursor up
-	updated, _ = m3.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	updated, _ = m3.handleKey(tea.KeyPressMsg{Code: 'k', Text: ""})
 	m4 := updated.(Model)
 
 	if m4.CurrentModal().BlocksCursor != 0 {
@@ -1075,7 +1079,7 @@ func TestTabCyclesThroughSections(t *testing.T) {
 	}
 
 	// Tab to blocked-by section
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	m2 := updated.(Model)
 
 	if !m2.CurrentModal().BlockedBySectionFocused {
@@ -1083,7 +1087,7 @@ func TestTabCyclesThroughSections(t *testing.T) {
 	}
 
 	// Tab to blocks section
-	updated, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ = m2.handleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	m3 := updated.(Model)
 
 	if !m3.CurrentModal().BlocksSectionFocused {
@@ -1094,7 +1098,7 @@ func TestTabCyclesThroughSections(t *testing.T) {
 	}
 
 	// Tab back to scroll mode
-	updated, _ = m3.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ = m3.handleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	m4 := updated.(Model)
 
 	if m4.CurrentModal().BlockedBySectionFocused || m4.CurrentModal().BlocksSectionFocused {
@@ -1356,7 +1360,7 @@ func TestParentEpicFocus_JKeyFocusesEpicWhenScroll0(t *testing.T) {
 		},
 	}
 
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m2 := updated.(Model)
 
 	if !m2.CurrentModal().ParentEpicFocused {
@@ -1381,7 +1385,7 @@ func TestParentEpicFocus_JKeyUnfocusesAndScrollsPastEpicZone(t *testing.T) {
 		},
 	}
 
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m2 := updated.(Model)
 
 	if m2.CurrentModal().ParentEpicFocused {
@@ -1392,7 +1396,7 @@ func TestParentEpicFocus_JKeyUnfocusesAndScrollsPastEpicZone(t *testing.T) {
 	}
 
 	// Pressing j again should NOT re-focus (it should scroll)
-	updated, _ = m2.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ = m2.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m3 := updated.(Model)
 
 	if m3.CurrentModal().ParentEpicFocused {
@@ -1418,7 +1422,7 @@ func TestParentEpicFocus_KKeyAtScroll0FocusesEpic(t *testing.T) {
 		},
 	}
 
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'k', Text: ""})
 	m2 := updated.(Model)
 
 	if !m2.CurrentModal().ParentEpicFocused {
@@ -1442,7 +1446,7 @@ func TestParentEpicFocus_EnterOpensEpicModal(t *testing.T) {
 		},
 	}
 
-	updated, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m2 := updated.(Model)
 
 	if m2.ModalDepth() != 2 {
@@ -1473,7 +1477,7 @@ func TestParentEpicFocus_EscClosesModalDoesNotOpenEpic(t *testing.T) {
 		},
 	}
 
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 	m2 := updated.(Model)
 
 	if m2.ModalOpen() {
@@ -1501,7 +1505,7 @@ func TestParentEpicFocus_OrphanStoryNoEpic(t *testing.T) {
 	}
 
 	// j should scroll, not try to focus a nonexistent epic
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'j', Text: ""})
 	m2 := updated.(Model)
 
 	if m2.CurrentModal().ParentEpicFocused {
@@ -1546,7 +1550,7 @@ func TestParentEpicFocus_KKeyStaysOnEpicWhenAlreadyFocused(t *testing.T) {
 		},
 	}
 
-	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: 'k', Text: ""})
 	m2 := updated.(Model)
 
 	// Should stay focused on epic, not open it or do anything else
@@ -1609,12 +1613,7 @@ func TestMouseWheelScrollDownInModal(t *testing.T) {
 		PaneHeights: defaultPaneHeights(),
 	}
 
-	downMsg := tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-		X:      40,
-		Y:      15,
-	}
+	downMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelDown}
 	updated, _ := m.handleMouse(downMsg)
 	m2 := updated.(Model)
 
@@ -1641,12 +1640,7 @@ func TestMouseWheelScrollUpInModal(t *testing.T) {
 		PaneHeights: defaultPaneHeights(),
 	}
 
-	upMsg := tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelUp,
-		X:      40,
-		Y:      15,
-	}
+	upMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelUp}
 	updated, _ := m.handleMouse(upMsg)
 	m2 := updated.(Model)
 
@@ -1674,12 +1668,7 @@ func TestMouseWheelScrollInModalClampsBounds(t *testing.T) {
 	}
 
 	// Scroll up at top should stay at 0
-	upMsg := tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelUp,
-		X:      40,
-		Y:      15,
-	}
+	upMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelUp}
 	updated, _ := m.handleMouse(upMsg)
 	m2 := updated.(Model)
 
@@ -1711,12 +1700,7 @@ func TestMouseWheelScrollInEpicScrollsContent(t *testing.T) {
 	}
 
 	// Scroll down should scroll modal content, not task cursor
-	downMsg := tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-		X:      40,
-		Y:      15,
-	}
+	downMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelDown}
 	updated, _ := m.handleMouse(downMsg)
 	m2 := updated.(Model)
 
@@ -1739,22 +1723,22 @@ func TestModalContentWidth(t *testing.T) {
 		{
 			name:        "normal terminal 100 chars",
 			termWidth:   100,
-			expectWidth: 76, // (100 * 80 / 100) - 4 = 76
+			expectWidth: 74, // (100 * 80 / 100) - 6 = 74
 		},
 		{
 			name:        "wide terminal 150 chars",
 			termWidth:   150,
-			expectWidth: 96, // capped at 100, minus 4 = 96
+			expectWidth: 94, // capped at 100, minus 6 = 94
 		},
 		{
 			name:        "narrow terminal 50 chars",
 			termWidth:   50,
-			expectWidth: 36, // (50 * 80 / 100) - 4 = 36
+			expectWidth: 34, // (50 * 80 / 100) - 6 = 34
 		},
 		{
 			name:        "very narrow terminal 30 chars",
 			termWidth:   30,
-			expectWidth: 36, // modal min 40, content min 36
+			expectWidth: 34, // modal min 40, content 34
 		},
 	}
 
@@ -2965,12 +2949,7 @@ func TestModalScrollNotAccumulatingAtBottom(t *testing.T) {
 			}
 
 			// Scroll down via mouse wheel using actual handler
-			downMsg := tea.MouseMsg{
-				Action: tea.MouseActionPress,
-				Button: tea.MouseButtonWheelDown,
-				X:      40,
-				Y:      15,
-			}
+			downMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelDown}
 			updated, _ := m.handleMouse(downMsg)
 			m2 := updated.(Model)
 
@@ -3038,12 +3017,7 @@ func TestModalScrollPositionUpdatesCorrectly(t *testing.T) {
 			}
 
 			// Scroll down via mouse wheel using actual handler
-			downMsg := tea.MouseMsg{
-				Action: tea.MouseActionPress,
-				Button: tea.MouseButtonWheelDown,
-				X:      40,
-				Y:      15,
-			}
+			downMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelDown}
 			updated, _ := m.handleMouse(downMsg)
 			m2 := updated.(Model)
 
@@ -3112,7 +3086,7 @@ func TestModalScrollKeyboardDownAtBottom(t *testing.T) {
 			}
 
 			// Send j key through handleKey
-			jKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}}
+			jKey := tea.KeyPressMsg{Code: 'j', Text: ""}
 			updated, _ := m.handleKey(jKey)
 			m2 := updated.(Model)
 
@@ -3189,7 +3163,7 @@ func TestModalScrollKeyboardUpWorks(t *testing.T) {
 			}
 
 			// Send k key through handleKey
-			kKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}}
+			kKey := tea.KeyPressMsg{Code: 'k', Text: ""}
 			updated, _ := m.handleKey(kKey)
 			m2 := updated.(Model)
 
@@ -3265,12 +3239,7 @@ func TestModalScrollPageDownClampsBounds(t *testing.T) {
 			}
 
 			// Scroll down via mouse wheel using actual handler
-			downMsg := tea.MouseMsg{
-				Action: tea.MouseActionPress,
-				Button: tea.MouseButtonWheelDown,
-				X:      40,
-				Y:      15,
-			}
+			downMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelDown}
 			updated, _ := m.handleMouse(downMsg)
 			m2 := updated.(Model)
 
@@ -3346,12 +3315,7 @@ func TestModalScrollPageUpClampsBounds(t *testing.T) {
 			}
 
 			// Scroll up via mouse wheel using actual handler
-			upMsg := tea.MouseMsg{
-				Action: tea.MouseActionPress,
-				Button: tea.MouseButtonWheelUp,
-				X:      40,
-				Y:      15,
-			}
+			upMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelUp}
 			updated, _ := m.handleMouse(upMsg)
 			m2 := updated.(Model)
 
@@ -3389,12 +3353,7 @@ func TestModalScrollEdgeCaseEmptyModal(t *testing.T) {
 	}
 
 	// Trying to scroll down should clamp to 0 via actual handler
-	downMsg := tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-		X:      40,
-		Y:      15,
-	}
+	downMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelDown}
 	updated, _ := m.handleMouse(downMsg)
 	m2 := updated.(Model)
 
@@ -3429,12 +3388,7 @@ func TestModalScrollEdgeCaseSingleItemModal(t *testing.T) {
 	}
 
 	// Try to scroll down via actual handler - should stay at 0
-	downMsg := tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-		X:      40,
-		Y:      15,
-	}
+	downMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelDown}
 	updated, _ := m.handleMouse(downMsg)
 	m2 := updated.(Model)
 
@@ -3472,12 +3426,7 @@ func TestModalScrollEdgeCaseFullModal(t *testing.T) {
 	m.CurrentModal().Scroll = maxScroll
 
 	// Try to scroll down more via actual handler
-	downMsg := tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-		X:      40,
-		Y:      15,
-	}
+	downMsg := tea.MouseWheelMsg{X: 40, Y: 15, Button: tea.MouseWheelDown}
 	updated, _ := m.handleMouse(downMsg)
 	m2 := updated.(Model)
 
@@ -3617,8 +3566,8 @@ func TestCloseConfirm_InitializesTextInput(t *testing.T) {
 	if m2.CloseConfirmInput.Placeholder != "Optional: reason for closing" {
 		t.Errorf("Placeholder = %q, want 'Optional: reason for closing'", m2.CloseConfirmInput.Placeholder)
 	}
-	if m2.CloseConfirmInput.Width != 40 {
-		t.Errorf("Width = %d, want 40", m2.CloseConfirmInput.Width)
+	if m2.CloseConfirmInput.Width() != 40 {
+		t.Errorf("Width = %d, want 40", m2.CloseConfirmInput.Width())
 	}
 	// Check declarative modal is initialized
 	if m2.CloseConfirmModal == nil {
@@ -3685,7 +3634,7 @@ func TestCloseConfirm_CancelWithEscapeKey(t *testing.T) {
 	m = m.openCloseConfirmModal("td-test-001", "Test Issue")
 
 	// Simulate Escape key press via Update
-	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	result, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	m2 := result.(Model)
 
 	if m2.CloseConfirmOpen {
@@ -3715,7 +3664,7 @@ func TestCloseConfirm_TextInputCapturesUserInput(t *testing.T) {
 	m.CloseConfirmInput.Focus()
 	testChars := []rune{'D', 'u', 'p', 'l', 'i', 'c', 'a', 't', 'e'}
 	for _, r := range testChars {
-		m.CloseConfirmInput, _ = m.CloseConfirmInput.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m.CloseConfirmInput, _ = m.CloseConfirmInput.Update(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 
 	if m.CloseConfirmInput.Value() != "Duplicate" {
@@ -3845,7 +3794,7 @@ func TestCloseConfirm_EnterKeyTriggersExecute(t *testing.T) {
 
 	// Simulate Enter key press - this should trigger executeCloseWithReason
 	// With empty IssueID, it will exit early and clear state
-	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	result, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m2 := result.(Model)
 
 	// Execute with empty IssueID clears state
@@ -4047,12 +3996,7 @@ func TestScrollIndependent(t *testing.T) {
 		m.ScrollIndependent[PanelTaskList] = true
 
 		// Click on TaskList panel (y=10 is within TaskList bounds)
-		msg := tea.MouseMsg{
-			X:      25,
-			Y:      10,
-			Button: tea.MouseButtonLeft,
-			Action: tea.MouseActionPress,
-		}
+		msg := tea.MouseClickMsg{X: 25, Y: 10, Button: tea.MouseLeft}
 
 		updated, _ := m.handleMouse(msg)
 		m2 := updated.(Model)
@@ -4069,12 +4013,7 @@ func TestScrollIndependent(t *testing.T) {
 		m.ScrollIndependent[PanelTaskList] = true
 
 		// Click on a different row in TaskList panel
-		msg := tea.MouseMsg{
-			X:      25,
-			Y:      12, // Different row
-			Button: tea.MouseButtonLeft,
-			Action: tea.MouseActionPress,
-		}
+		msg := tea.MouseClickMsg{X: 25, Y: 12, Button: tea.MouseLeft}
 
 		updated, _ := m.handleMouse(msg)
 		m2 := updated.(Model)
@@ -4226,7 +4165,7 @@ func TestBoardPickerSelectBoard(t *testing.T) {
 	}
 
 	// Press Enter to select the board
-	enterKey := tea.KeyMsg{Type: tea.KeyEnter}
+	enterKey := tea.KeyPressMsg{Code: tea.KeyEnter}
 	updated, _ := m.handleKey(enterKey)
 	m2 := updated.(Model)
 
@@ -4266,7 +4205,7 @@ func TestBoardPickerNavigateAndSelect(t *testing.T) {
 	m.BoardPickerModal.Render(m.Width, m.Height, nil)
 
 	// Navigate down twice (to board 3)
-	jKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}}
+	jKey := tea.KeyPressMsg{Code: 'j', Text: ""}
 	updated, _ := m.handleKey(jKey)
 	m = updated.(Model)
 	updated, _ = m.handleKey(jKey)
@@ -4278,7 +4217,7 @@ func TestBoardPickerNavigateAndSelect(t *testing.T) {
 	}
 
 	// Press Enter to select
-	enterKey := tea.KeyMsg{Type: tea.KeyEnter}
+	enterKey := tea.KeyPressMsg{Code: tea.KeyEnter}
 	updated, _ = m.handleKey(enterKey)
 	m2 := updated.(Model)
 
@@ -4312,10 +4251,10 @@ func TestSwimlaneLinesFromOffset(t *testing.T) {
 	}{
 		// Note: at offset 0, currentCategory starts as zero-value, so the first
 		// category always triggers a header (matching rendering behavior).
-		{"all from start", 0, 5, 10},      // header(ready)+2items + sep+header(blocked)+2items + sep+header(closed)+1item = 1+2+2+2+2+1=10
-		{"single category", 0, 2, 3},      // header(ready) + 2 items = 3
-		{"across boundary", 1, 4, 5},      // item2 + sep+header(blocked) + item3 + item4 = 5
-		{"from second cat", 2, 5, 6},      // header(blocked)+item3+item4 + sep+header(closed)+item5 = 1+2+2+1=6
+		{"all from start", 0, 5, 10}, // header(ready)+2items + sep+header(blocked)+2items + sep+header(closed)+1item = 1+2+2+2+2+1=10
+		{"single category", 0, 2, 3}, // header(ready) + 2 items = 3
+		{"across boundary", 1, 4, 5}, // item2 + sep+header(blocked) + item3 + item4 = 5
+		{"from second cat", 2, 5, 6}, // header(blocked)+item3+item4 + sep+header(closed)+item5 = 1+2+2+1=6
 		{"empty range", 3, 3, 0},
 		{"single item last cat", 4, 5, 2}, // header(closed) + item5 = 2
 		{"single item same cat", 1, 2, 1}, // just item2, same category as item1 before it

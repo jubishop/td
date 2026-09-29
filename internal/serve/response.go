@@ -5,6 +5,7 @@ package serve
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -102,6 +103,23 @@ func WriteValidation(w http.ResponseWriter, fields []FieldError) {
 	}
 }
 
+// WriteIssueWriteError maps an error from an issue write helper onto the right
+// HTTP status. A stale-snapshot rejection (db.StaleIssueUpdateError) is a
+// client-retryable conflict, not a server fault: the caller loaded the issue,
+// someone else wrote it, and the caller should re-read and re-apply. Reporting
+// it as 500 would tell an API client (usually an agent) to back off from a
+// healthy server instead of retrying. Anything else stays a 500.
+func WriteIssueWriteError(w http.ResponseWriter, err error, issueID, fallback string) {
+	var stale *db.StaleIssueUpdateError
+	if errors.As(err, &stale) {
+		WriteError(w, ErrConflict, fmt.Sprintf(
+			"issue %s was modified by another session after it was read; re-read the issue and retry",
+			issueID), http.StatusConflict)
+		return
+	}
+	WriteError(w, ErrInternal, fallback, http.StatusInternalServerError)
+}
+
 // ============================================================================
 // Issue DTO
 // ============================================================================
@@ -111,30 +129,75 @@ func WriteValidation(w http.ResponseWriter, fields []FieldError) {
 // Nullable fields use *string so they serialize as JSON null when nil.
 // Collections serialize as [] when empty, never null.
 type IssueDTO struct {
-	Revision           string   `json:"revision"`
-	ID                 string   `json:"id"`
-	Title              string   `json:"title"`
-	Description        string   `json:"description"`
-	Status             string   `json:"status"`
-	Type               string   `json:"type"`
-	Priority           string   `json:"priority"`
-	Points             int      `json:"points"`
-	Labels             []string `json:"labels"`
-	ParentID           *string  `json:"parent_id"`
-	Acceptance         string   `json:"acceptance"`
-	Sprint             string   `json:"sprint"`
-	ImplementerSession *string  `json:"implementer_session"`
-	CreatorSession     *string  `json:"creator_session"`
-	ReviewerSession    *string  `json:"reviewer_session"`
-	CreatedAt          string   `json:"created_at"`
-	UpdatedAt          string   `json:"updated_at"`
-	ClosedAt           *string  `json:"closed_at"`
-	DeletedAt          *string  `json:"deleted_at"`
-	Minor              bool     `json:"minor"`
-	CreatedBranch      *string  `json:"created_branch"`
-	DeferUntil         *string  `json:"defer_until"`
-	DueDate            *string  `json:"due_date"`
-	DeferCount         int      `json:"defer_count"`
+	Revision                 string   `json:"revision"`
+	ID                       string   `json:"id"`
+	Title                    string   `json:"title"`
+	Description              string   `json:"description"`
+	Status                   string   `json:"status"`
+	Type                     string   `json:"type"`
+	Priority                 string   `json:"priority"`
+	Points                   int      `json:"points"`
+	Labels                   []string `json:"labels"`
+	ParentID                 *string  `json:"parent_id"`
+	Acceptance               string   `json:"acceptance"`
+	Sprint                   string   `json:"sprint"`
+	ImplementerSession       *string  `json:"implementer_session"`
+	CreatorSession           *string  `json:"creator_session"`
+	ReviewerSession          *string  `json:"reviewer_session"`
+	ReviewRequestedBySession *string  `json:"review_requested_by_session"`
+	ClosedBySession          *string  `json:"closed_by_session"`
+	CreatedAt                string   `json:"created_at"`
+	UpdatedAt                string   `json:"updated_at"`
+	ReviewedAt               *string  `json:"reviewed_at"`
+	ClosedAt                 *string  `json:"closed_at"`
+	DeletedAt                *string  `json:"deleted_at"`
+	Minor                    bool     `json:"minor"`
+	CreatedBranch            *string  `json:"created_branch"`
+	DeferUntil               *string  `json:"defer_until"`
+	DueDate                  *string  `json:"due_date"`
+	DeferCount               int      `json:"defer_count"`
+
+	// ActiveReview is populated by GET /v1/issues/{id} and transition-response
+	// payloads when the issue carries a non-superseded approval. Clients can
+	// key off this field to distinguish "reviewed, awaiting close" from
+	// "not yet reviewed". Omitted for issues without an active approval.
+	ActiveReview *IssueReviewSummary `json:"active_review,omitempty"`
+
+	// Reviews is populated by GET /v1/issues/{id}?with=reviews only. Kept
+	// off the default response to keep list payloads compact.
+	Reviews []IssueReviewDTO `json:"reviews,omitempty"`
+
+	// AvailableTransitions lists the transition action names the requesting
+	// session can perform on this issue right now (start/review/approve/reject/
+	// block/unblock/close/reopen). Populated by GET /v1/issues/{id} only — it
+	// requires session context and per-issue policy evaluation, so it is omitted
+	// from list payloads. Clients should render exactly these actions and treat
+	// an absent field as "unknown" (fall back to a status-based default).
+	AvailableTransitions []string `json:"available_transitions,omitempty"`
+
+	// DependencySummary is populated ONLY on board + list paths and carries a
+	// compact view of this issue's unresolved blockers (the issues it depends on
+	// whose status is not closed). It powers a "blocked" indicator without a
+	// per-issue detail fetch. Left nil/omitted when the issue has zero unresolved
+	// blockers, so the single-issue detail response and dependency-free issues
+	// are unaffected.
+	DependencySummary *DependencySummaryDTO `json:"dependency_summary,omitempty"`
+}
+
+// BlockerRefDTO is a compact reference to a single unresolved blocker — an
+// issue that the card issue depends on (depends_on direction) whose status is
+// not closed.
+type BlockerRefDTO struct {
+	DepID        string `json:"dep_id"`
+	IssueID      string `json:"issue_id"` // the BLOCKER's id (= depends_on_id)
+	Title        string `json:"title"`
+	Status       string `json:"status"`        // never "closed" (filtered out)
+	RelationType string `json:"relation_type"` // "depends_on"
+}
+
+// DependencySummaryDTO wraps the unresolved blockers for an issue.
+type DependencySummaryDTO struct {
+	Blockers []BlockerRefDTO `json:"blockers"`
 }
 
 // IssueToDTO converts a models.Issue to an IssueDTO with proper null/empty
@@ -168,6 +231,8 @@ func IssueToDTO(issue *models.Issue) IssueDTO {
 	dto.ImplementerSession = nullableString(issue.ImplementerSession)
 	dto.CreatorSession = nullableString(issue.CreatorSession)
 	dto.ReviewerSession = nullableString(issue.ReviewerSession)
+	dto.ReviewRequestedBySession = nullableString(issue.ReviewRequestedBySession)
+	dto.ClosedBySession = nullableString(issue.ClosedBySession)
 	dto.CreatedBranch = nullableString(issue.CreatedBranch)
 
 	// Nullable *string fields (already pointers in model)
@@ -175,10 +240,25 @@ func IssueToDTO(issue *models.Issue) IssueDTO {
 	dto.DueDate = issue.DueDate
 
 	// Nullable *time.Time fields
+	dto.ReviewedAt = nullableTime(issue.ReviewedAt)
 	dto.ClosedAt = nullableTime(issue.ClosedAt)
 	dto.DeletedAt = nullableTime(issue.DeletedAt)
 
 	return dto
+}
+
+// slimForBoard blanks the heavy text fields that the board/kanban and
+// issue-list views never render off store-hydrated issues. The single-issue
+// detail endpoint (HandleGetIssue) refetches the full issue, so clients still
+// get description/acceptance when they open the detail panel. This keeps the
+// board/list payload small (description/acceptance dominate the response — some
+// descriptions contain whole code blocks) without changing detail output.
+//
+// Only call this on board/list serialization paths, never on the detail path.
+func (d IssueDTO) slimForBoard() IssueDTO {
+	d.Description = ""
+	d.Acceptance = ""
+	return d
 }
 
 // IssuesToDTOs converts a slice of issues to DTOs.

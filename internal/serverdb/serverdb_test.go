@@ -12,7 +12,7 @@ func newTestDB(t *testing.T) *ServerDB {
 	if err != nil {
 		t.Fatalf("open test db: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
@@ -269,6 +269,52 @@ func TestRevokeAPIKeyWrongUser(t *testing.T) {
 	}
 }
 
+func TestAdminRevokeAPIKey(t *testing.T) {
+	t.Run("successful revoke deletes the row", func(t *testing.T) {
+		db := newTestDB(t)
+		u, _ := db.CreateUser("admin-revoke@test.com")
+		_, ak, _ := db.GenerateAPIKey(u.ID, "to-admin-revoke", "sync", nil)
+
+		if err := db.AdminRevokeAPIKey(ak.ID); err != nil {
+			t.Fatalf("AdminRevokeAPIKey: %v", err)
+		}
+
+		keys, _ := db.ListAPIKeys(u.ID)
+		if len(keys) != 0 {
+			t.Fatalf("expected 0 keys after AdminRevokeAPIKey, got %d", len(keys))
+		}
+	})
+
+	t.Run("non-existent keyID returns non-nil error", func(t *testing.T) {
+		db := newTestDB(t)
+		err := db.AdminRevokeAPIKey("ak_doesnotexist")
+		if err == nil {
+			t.Fatal("expected non-nil error for non-existent key")
+		}
+		if err != ErrNotFound {
+			t.Fatalf("expected ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("revoked key returns nil from VerifyAPIKey", func(t *testing.T) {
+		db := newTestDB(t)
+		u, _ := db.CreateUser("admin-revoke-verify@test.com")
+		plaintext, ak, _ := db.GenerateAPIKey(u.ID, "verify-after-revoke", "sync", nil)
+
+		if err := db.AdminRevokeAPIKey(ak.ID); err != nil {
+			t.Fatalf("AdminRevokeAPIKey: %v", err)
+		}
+
+		verifiedKey, verifiedUser, err := db.VerifyAPIKey(plaintext)
+		if err != nil {
+			t.Fatalf("VerifyAPIKey unexpected error: %v", err)
+		}
+		if verifiedKey != nil || verifiedUser != nil {
+			t.Fatal("expected nil from VerifyAPIKey after AdminRevokeAPIKey")
+		}
+	})
+}
+
 func TestListAPIKeys(t *testing.T) {
 	db := newTestDB(t)
 	u, _ := db.CreateUser("list@test.com")
@@ -434,6 +480,53 @@ func TestUpdateMemberRole(t *testing.T) {
 	m, _ := db.GetMembership(p.ID, reader.ID)
 	if m.Role != RoleWriter {
 		t.Fatalf("expected writer, got %s", m.Role)
+	}
+}
+
+func TestUpdateMemberRoleCannotDemoteLastOwner(t *testing.T) {
+	db := newTestDB(t)
+	owner, _ := db.CreateUser("o@test.com")
+	reader, _ := db.CreateUser("r@test.com")
+	p, _ := db.CreateProject("proj", "", owner.ID)
+	_, _ = db.AddMember(p.ID, reader.ID, RoleReader, owner.ID)
+
+	// Sole owner cannot demote themselves, even with other (non-owner) members.
+	err := db.UpdateMemberRole(p.ID, owner.ID, RoleReader)
+	if err == nil {
+		t.Fatal("expected error demoting last owner")
+	}
+	if !strings.Contains(err.Error(), "last owner") {
+		t.Fatalf("expected last-owner error, got %v", err)
+	}
+	// Role must be unchanged after the rejected demotion.
+	m, _ := db.GetMembership(p.ID, owner.ID)
+	if m.Role != RoleOwner {
+		t.Fatalf("expected role to remain owner, got %s", m.Role)
+	}
+
+	// With a second owner, demotion is allowed.
+	if err := db.UpdateMemberRole(p.ID, reader.ID, RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateMemberRole(p.ID, owner.ID, RoleReader); err != nil {
+		t.Fatalf("demotion should succeed with another owner present: %v", err)
+	}
+}
+
+func TestListMembersIncludesEmail(t *testing.T) {
+	db := newTestDB(t)
+	owner, _ := db.CreateUser("owner@test.com")
+	p, _ := db.CreateProject("proj", "", owner.ID)
+
+	members, err := db.ListMembers(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 1 {
+		t.Fatalf("expected 1 member, got %d", len(members))
+	}
+	if members[0].Email != "owner@test.com" {
+		t.Fatalf("expected member email owner@test.com, got %q", members[0].Email)
 	}
 }
 
@@ -680,8 +773,9 @@ func TestSchemaVersion(t *testing.T) {
 
 func TestMigrationV3_SchemaVersion(t *testing.T) {
 	db := newTestDB(t)
-	if v := db.getSchemaVersion(); v != 3 {
-		t.Fatalf("expected schema version 3, got %d", v)
+	// A fresh DB runs all migrations; check that we are at least v3.
+	if v := db.getSchemaVersion(); v < 3 {
+		t.Fatalf("expected schema version >= 3, got %d", v)
 	}
 }
 

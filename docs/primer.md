@@ -54,16 +54,35 @@ open → in_progress → in_review → closed
 - `open` — created but not started
 - `in_progress` — someone (or some agent) is actively working on it
 - `blocked` — work is stuck on something
-- `in_review` — work is done, waiting for a different session to review
+- `in_review` — work is done and awaiting review
 - `closed` — reviewed and approved
 
-An important rule: the session that implemented an issue cannot approve it. A different session must review the work. This prevents an AI agent from silently approving its own output.
+Status is only half the picture. Approvals live on a separate `issue_reviews` row that can outlive a close; reopen starts a new review epoch. See [Status and review](status-and-review.md) for the two machines and how the monitor buckets are derived from them.
+
+Independent review is preferred. In the default `trusted` mode, an implementer who cannot get one has two honest options: name whoever actually reviewed the work with `td approve <id> --reviewed-by "<who>"`, or acknowledge a genuine self-review with `td approve <id> --self-review --reason "..."`. td records which path was used. Once an approval has been recorded, any session may perform the final close.
 
 ### Sessions
 
 A session represents a single agent or terminal context. Sessions are created automatically — each terminal window or AI agent context gets a unique ID like `claude-7f3a`.
 
-Sessions matter because td tracks *who* did *what*. The implementer session, creator session, and reviewer session are all recorded on each issue. This is what enforces the rule that you can't review your own work.
+Sessions matter because td tracks *who* did *what*. The implementer session,
+creator session, review-requester session, reviewer-of-record, and closing
+session are recorded on each issue, along with who a review was attributed to
+when that differs from the recording session. Independent, attributed, and
+self-review paths are therefore all explicit, and delegated closure remains
+auditable.
+
+td has four review policy modes (`review_policy_mode`):
+
+- `trusted` — **default for new installs.** Independent review is preferred; an
+  involved session may approve by naming who reviewed the work
+  (`--reviewed-by`) or acknowledging a self-review (`--self-review --reason`).
+  Both are recorded; neither is verifiable by td.
+- `delegated` — review attestations + delegated close. A reviewer session records approval via `td approve --record-only --reason "..."`, and any session can then close with `td approve --reason "..."`.
+- `strict` — no prior involvement allowed on the reviewer.
+- `balanced` — strict, plus a creator-approval exception with `--reason`. Retained for projects that explicitly opt in.
+
+The legacy `balanced_review_policy` flag is deprecated; prefer `review_policy_mode=balanced` instead.
 
 ### Epics
 

@@ -97,6 +97,23 @@ CREATE INDEX IF NOT EXISTS idx_sync_conflicts_entity ON sync_conflicts(entity_ty
 CREATE INDEX IF NOT EXISTS idx_sync_conflicts_time ON sync_conflicts(overwritten_at);
 CREATE INDEX IF NOT EXISTS idx_sync_conflicts_seq ON sync_conflicts(server_seq);
 
+-- issue_reviews (migrations v33/v35/v37)
+CREATE TABLE IF NOT EXISTS issue_reviews (
+    id TEXT PRIMARY KEY,
+    issue_id TEXT NOT NULL,
+    reviewer_session TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    requested_by_session TEXT DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    superseded_at DATETIME,
+    self_review INTEGER NOT NULL DEFAULT 0,
+    reviewed_by TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (issue_id) REFERENCES issues(id)
+);
+CREATE INDEX IF NOT EXISTS idx_issue_reviews_issue_id ON issue_reviews(issue_id);
+CREATE INDEX IF NOT EXISTS idx_issue_reviews_active ON issue_reviews(issue_id) WHERE superseded_at IS NULL;
+
 -- notes table
 CREATE TABLE IF NOT EXISTS notes (
     id TEXT PRIMARY KEY,
@@ -120,7 +137,7 @@ var migrationColumns = []string{
 }
 
 // entityTables lists the tables that hold user data (not action_log or sync_state).
-var entityTables = []string{"issues", "logs", "handoffs", "comments", "boards", "work_sessions", "board_issue_positions", "issue_dependencies", "issue_files", "work_session_issues", "notes"}
+var entityTables = []string{"issues", "logs", "handoffs", "comments", "boards", "work_sessions", "board_issue_positions", "issue_dependencies", "issue_files", "work_session_issues", "issue_reviews", "notes"}
 
 // validEntities is the set of entity types accepted by the validator.
 var validEntities = map[string]bool{
@@ -134,6 +151,7 @@ var validEntities = map[string]bool{
 	"issue_dependencies":    true,
 	"issue_files":           true,
 	"work_session_issues":   true,
+	"issue_reviews":         true,
 	"notes":                 true,
 }
 
@@ -155,6 +173,11 @@ type Harness struct {
 	Validator  tdsync.EntityValidator
 	actionSeq  atomic.Int64
 	serverMu   sync.Mutex // serializes server DB writes (SQLite single-writer)
+
+	// LastSkipped holds the events the most recent Pull declined to apply
+	// (deliberate drops and quarantined poison events), so a test can assert
+	// that a skip was recorded rather than silently swallowed.
+	LastSkipped []tdsync.SkippedEvent
 }
 
 // NewHarness creates a test harness with numClients and one server DB for projectID.
@@ -177,7 +200,7 @@ func NewHarness(t *testing.T, numClients int, projectID string) *Harness {
 		t.Fatalf("init server event log: %v", err)
 	}
 	h.ProjectDBs[projectID] = serverDB
-	t.Cleanup(func() { serverDB.Close() })
+	t.Cleanup(func() { _ = serverDB.Close() })
 
 	// Create clients
 	for i := 0; i < numClients; i++ {
@@ -190,10 +213,16 @@ func NewHarness(t *testing.T, numClients int, projectID string) *Harness {
 		if err != nil {
 			t.Fatalf("open client %s db: %v", clientID, err)
 		}
+		// Pin to a single connection, as the real client does
+		// (internal/db/conn.go SetMaxOpenConns(1)). Connection-scoped PRAGMAs
+		// — foreign_keys in particular — are otherwise applied to whichever
+		// pooled connection happens to serve the Exec, and silently absent on
+		// the next one.
+		db.SetMaxOpenConns(1)
 		if err := initClientSchema(db); err != nil {
 			t.Fatalf("create schema client %s: %v", clientID, err)
 		}
-		t.Cleanup(func() { db.Close() })
+		t.Cleanup(func() { _ = db.Close() })
 
 		h.Clients[clientID] = &SimulatedClient{
 			DeviceID:  deviceID,
@@ -224,6 +253,95 @@ func initClientSchema(clientDB *sql.DB) error {
 	}
 	return nil
 }
+
+// EnableBoardPositionFKs restores the ON DELETE CASCADE foreign keys that the
+// real client enforces on board_issue_positions (migration 30,
+// internal/db/migration_fk_enforcement.go) and turns FK enforcement on.
+//
+// The harness's base schema declares no FKs on this table and runs with
+// PRAGMA foreign_keys off, so no FK-class sync bug can reproduce here by
+// default — which is why td-8fe2bc only ever surfaced in the chaos e2e run.
+// It is opt-in per test rather than harness-wide because the base schema
+// carries other FKs (issues, comments, logs) that existing harness fixtures do
+// not satisfy; switching them all on is a separate piece of work.
+//
+// Call before creating any rows.
+func (h *Harness) EnableBoardPositionFKs() {
+	h.t.Helper()
+	for _, clientID := range h.clientKeys {
+		c := h.Clients[clientID]
+		// The harness's base schema still carries a FOREIGN KEY on
+		// issues.parent_id. The real migration deliberately drops it, because
+		// '' is td's "no parent" sentinel and SQLite reads '' as a real FK
+		// value — see the NOTE in rewriteIssuesTable. Drop it here too, or
+		// enabling enforcement would reject every parentless issue.
+		if _, err := c.DB.Exec(issuesNoParentFKSchema); err != nil {
+			h.t.Fatalf("%s: drop issues parent_id FK: %v", clientID, err)
+		}
+		if _, err := c.DB.Exec(boardPositionFKSchema); err != nil {
+			h.t.Fatalf("%s: install board position FKs: %v", clientID, err)
+		}
+		if _, err := c.DB.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+			h.t.Fatalf("%s: enable foreign keys: %v", clientID, err)
+		}
+	}
+}
+
+// issuesNoParentFKSchema rebuilds issues without the parent_id foreign key,
+// mirroring rewriteIssuesTable. The column list is the harness's base schema
+// plus migrationColumns, spelled out rather than SELECT *-copied so the primary
+// key and column defaults survive the rebuild.
+const issuesNoParentFKSchema = `
+CREATE TABLE issues_nofk (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    type TEXT NOT NULL DEFAULT 'task',
+    priority TEXT NOT NULL DEFAULT 'P2',
+    points INTEGER DEFAULT 0,
+    labels TEXT DEFAULT '',
+    parent_id TEXT DEFAULT '',
+    acceptance TEXT DEFAULT '',
+    implementer_session TEXT DEFAULT '',
+    reviewer_session TEXT DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at DATETIME,
+    deleted_at DATETIME,
+    minor INTEGER DEFAULT 0,
+    created_branch TEXT DEFAULT '',
+    creator_session TEXT DEFAULT '',
+    sprint TEXT DEFAULT ''
+);
+INSERT INTO issues_nofk SELECT
+    id, title, description, status, type, priority, points, labels, parent_id,
+    acceptance, implementer_session, reviewer_session, created_at, updated_at,
+    closed_at, deleted_at, minor, created_branch, creator_session, sprint
+    FROM issues;
+DROP TABLE issues;
+ALTER TABLE issues_nofk RENAME TO issues;
+`
+
+// boardPositionFKSchema mirrors the DDL in rewriteBoardIssuePositionsTable so
+// the harness cannot drift from the constraint the real client enforces.
+const boardPositionFKSchema = `
+CREATE TABLE board_issue_positions_fknew (
+    id TEXT PRIMARY KEY,
+    board_id TEXT NOT NULL,
+    issue_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at DATETIME,
+    UNIQUE(board_id, issue_id),
+    FOREIGN KEY (board_id) REFERENCES boards(id) ON DELETE CASCADE,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+INSERT INTO board_issue_positions_fknew (id, board_id, issue_id, position, added_at, deleted_at)
+    SELECT id, board_id, issue_id, position, added_at, deleted_at FROM board_issue_positions;
+DROP TABLE board_issue_positions;
+ALTER TABLE board_issue_positions_fknew RENAME TO board_issue_positions;
+`
 
 // Mutate performs a local mutation on a client's database and records it in action_log.
 // For "delete" action: uses soft-delete on tables with deleted_at column (issues, board_issue_positions),
@@ -327,7 +445,7 @@ func readEntityFiltered(tx *sql.Tx, entityType, entityID string, filterSoftDelet
 	if err != nil {
 		return nil
 	}
-	defer row.Close()
+	defer func() { _ = row.Close() }()
 
 	if !row.Next() {
 		return nil
@@ -495,6 +613,17 @@ func (h *Harness) Pull(clientID, projectID string) (tdsync.PullResult, error) {
 		return tdsync.PullResult{}, fmt.Errorf("apply remote events: %w", err)
 	}
 
+	// Mirror the real client's batch semantics (cmd/sync.go runPull): a
+	// transient per-event failure rolls the whole batch back and leaves the
+	// cursor where it was, so the retry replays it. Without this the harness
+	// would advance unconditionally and could never reproduce a wedge.
+	outcome := tdsync.ResolvePullOutcome(applyResult)
+	if outcome.Abort != nil {
+		_ = clientTx.Rollback()
+		return tdsync.PullResult{}, fmt.Errorf("apply events: %w", outcome.Abort)
+	}
+	h.LastSkipped = outcome.Record
+
 	if err := clientTx.Commit(); err != nil {
 		return tdsync.PullResult{}, fmt.Errorf("commit client tx: %w", err)
 	}
@@ -560,9 +689,9 @@ func (h *Harness) Diff(clientA, clientB string) string {
 		rowsA := dumpTable(cA.DB, table)
 		rowsB := dumpTable(cB.DB, table)
 		if rowsA != rowsB {
-			sb.WriteString(fmt.Sprintf("=== %s ===\n", table))
-			sb.WriteString(fmt.Sprintf("--- %s ---\n%s\n", clientA, rowsA))
-			sb.WriteString(fmt.Sprintf("--- %s ---\n%s\n", clientB, rowsB))
+			fmt.Fprintf(&sb, "=== %s ===\n", table)
+			fmt.Fprintf(&sb, "--- %s ---\n%s\n", clientA, rowsA)
+			fmt.Fprintf(&sb, "--- %s ---\n%s\n", clientB, rowsB)
 		}
 	}
 	if sb.Len() == 0 {
@@ -590,10 +719,11 @@ var softDeleteTables = map[string]bool{
 // that mapActionType() converts to hard "delete" (not "soft_delete").
 // Without this, "delete" action on these tables would become "soft_delete" and fail.
 var hardDeleteActionTypes = map[string]string{
-	"issue_dependencies":    "remove_dependency",
-	"issue_files":           "unlink_file",
-	"work_session_issues":   "work_session_untag",
-	"boards":                "board_delete",
+	"issue_dependencies":  "remove_dependency",
+	"issue_files":         "unlink_file",
+	"work_session_issues": "work_session_untag",
+	"issue_reviews":       "review_delete",
+	"boards":              "board_delete",
 }
 
 // dumpTable returns a deterministic string representation of all rows in a table.
@@ -609,7 +739,7 @@ func dumpTable(db *sql.DB, table string) string {
 	if err != nil {
 		return fmt.Sprintf("ERROR: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -624,7 +754,7 @@ func dumpTable(db *sql.DB, table string) string {
 			ptrs[i] = &vals[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			sb.WriteString(fmt.Sprintf("SCAN ERROR: %v\n", err))
+			fmt.Fprintf(&sb, "SCAN ERROR: %v\n", err)
 			continue
 		}
 
@@ -786,6 +916,14 @@ func (h *Harness) PullAll(clientID, projectID string) (tdsync.PullResult, error)
 		_ = clientTx.Rollback()
 		return tdsync.PullResult{}, fmt.Errorf("apply remote events: %w", err)
 	}
+
+	// Same batch semantics as the real client's runPull — see Pull.
+	outcome := tdsync.ResolvePullOutcome(applyResult)
+	if outcome.Abort != nil {
+		_ = clientTx.Rollback()
+		return tdsync.PullResult{}, fmt.Errorf("apply events: %w", outcome.Abort)
+	}
+	h.LastSkipped = outcome.Record
 
 	if err := clientTx.Commit(); err != nil {
 		return tdsync.PullResult{}, fmt.Errorf("commit client tx: %w", err)

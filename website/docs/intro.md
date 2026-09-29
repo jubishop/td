@@ -17,7 +17,10 @@ There's no structured way to say "here's what's done, here's what remains, here'
 Three mechanisms eliminate context loss:
 
 - **Structured handoffs** -- Each session records what's done, what remains, decisions made, and uncertainties. The next session reads this instead of guessing.
-- **Session isolation** -- The session that did the work can't approve its own output. A different session must review, catching errors the implementer is blind to.
+- **Audited review** -- Independent review is preferred. In the default trusted
+  mode, an involved session may instead record who actually reviewed the work
+  (`--reviewed-by "<who>"`) or acknowledge a self-review (`--self-review
+  --reason`); every path stays visible in the review history.
 - **Single-command context** -- `td usage` gives the incoming session everything it needs: current issues, recent logs, pending handoffs, and what to work on next.
 
 ## Installation
@@ -70,7 +73,7 @@ td log "OAuth callback working"
 # Hand off before context ends
 td handoff td-a1b2 --done "OAuth flow" --remaining "Token refresh"
 
-# Submit for review (different session approves)
+# Submit for review
 td review td-a1b2
 ```
 
@@ -83,10 +86,12 @@ Issue IDs like `td-a1b2` are generated automatically when you create an issue. U
 Add this to your `CLAUDE.md`, system prompt, or agent instructions:
 
 ```
-Run `td usage --new-session` at conversation start (or after /clear).
+Use td when durable task context will help. At the start of a new agent
+context, run `td usage --new-session -q`. Run `td usage` for workflow guidance.
 ```
 
-This gives the agent full project context on startup -- open issues, recent activity, pending reviews, and what to work on next.
+This gives the agent current work, recent activity, and pending reviews without
+repeating the full workflow on every context.
 
 Works with Claude Code, Cursor, Codex, Copilot, and Gemini CLI.
 

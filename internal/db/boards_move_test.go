@@ -11,7 +11,7 @@ func TestBoardMovePreservesReservedPositions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	board, err := database.CreateBoard("Move test", "")
 	if err != nil {
 		t.Fatal(err)

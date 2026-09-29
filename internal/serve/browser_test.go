@@ -96,8 +96,8 @@ func requestRevision(t *testing.T, ts *httptest.Server, method, path, revision s
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode
 }
 
@@ -137,6 +137,37 @@ func TestBrowserStaleWritesPreserveAgentChange(t *testing.T) {
 	current, _ = srv.db.GetIssue(issue.ID)
 	if current.Title != "Agent updated the task" || current.Description != "Explicitly reconciled" {
 		t.Fatalf("partial save lost fields: %+v", current)
+	}
+}
+
+func TestBrowserRecordedApprovalRevisionGuard(t *testing.T) {
+	t.Setenv("TD_FEATURE_REVIEW_POLICY_MODE", "trusted")
+	srv := newBrowserTestServer(t)
+	id := seedInReviewIssue(t, srv.db, "ses_agent")
+	original, _ := srv.db.GetIssue(id)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp, env := doJSON(t, ts, "POST", "/v1/issues/"+id+"/reviews", map[string]string{
+		"decision": "approved", "summary": "Verified current evidence",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("record approval: %d %+v", resp.StatusCode, env.Error)
+	}
+	body := map[string]string{"reason": "Close using recorded approval"}
+	if status := requestRevision(t, ts, "POST", "/v1/issues/"+id+"/approve", issueRevision(original), body); status != http.StatusConflict {
+		t.Fatalf("stale close after review: %d", status)
+	}
+	current, _ := srv.db.GetIssue(id)
+	if current.Status != models.StatusInReview {
+		t.Fatalf("stale action closed task: %+v", current)
+	}
+	if status := requestRevision(t, ts, "POST", "/v1/issues/"+id+"/approve", issueRevision(current), body); status != http.StatusOK {
+		t.Fatalf("fresh close after review: %d", status)
+	}
+	closed, _ := srv.db.GetIssue(id)
+	reviews, err := srv.db.ListIssueReviews(id)
+	if closed.Status != models.StatusClosed || closed.ReviewerSession != current.ReviewerSession || err != nil || len(reviews) != 1 {
+		t.Fatalf("recorded approval not preserved: %+v, %v, %v", closed, reviews, err)
 	}
 }
 

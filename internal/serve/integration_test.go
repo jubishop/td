@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 )
 
@@ -34,7 +35,7 @@ func setupIntegrationServer(t *testing.T) (baseURL string, database *db.DB, clea
 
 	sess, err := GetOrCreateWebSession(database)
 	if err != nil {
-		database.Close()
+		_ = database.Close()
 		t.Fatalf("GetOrCreateWebSession: %v", err)
 	}
 
@@ -43,7 +44,7 @@ func setupIntegrationServer(t *testing.T) (baseURL string, database *db.DB, clea
 
 	cleanup = func() {
 		ts.Close()
-		database.Close()
+		_ = database.Close()
 	}
 
 	return ts.URL, database, cleanup
@@ -84,7 +85,7 @@ func iDoJSON(t *testing.T, method, url string, body interface{}) *http.Response 
 // and error payload map.
 func iParseEnvelope(t *testing.T, resp *http.Response) (ok bool, data map[string]interface{}, errPayload map[string]interface{}) {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var env map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
@@ -130,6 +131,35 @@ func iCreateIssueWithFields(t *testing.T, baseURL string, fields map[string]inte
 		t.Fatal("created issue has no id")
 	}
 	return id
+}
+
+func iCurrentSessionID(t *testing.T, baseURL string) string {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	ok, data, errP := iParseEnvelope(t, resp)
+	if !ok {
+		t.Fatalf("health failed: status=%d, error=%v", resp.StatusCode, errP)
+	}
+	sessionID, _ := data["session_id"].(string)
+	if sessionID == "" {
+		t.Fatal("health returned empty session_id")
+	}
+	return sessionID
+}
+
+func iSessionStateScope(t *testing.T, database *db.DB, sessionID string) db.SessionStateScope {
+	t.Helper()
+	return db.SessionStateScope{
+		SessionID:     sessionID,
+		WorktreeID:    worktreeIDForBaseDir(database.BaseDir()),
+		ConfigBaseDir: database.BaseDir(),
+		LegacyGetFocus: func(baseDir string) (string, error) {
+			return config.GetFocus(baseDir)
+		},
+	}
 }
 
 // ============================================================================
@@ -547,6 +577,76 @@ func TestIntegration_ListIssues_FilterByLabels(t *testing.T) {
 		if issue["id"] != labelledID {
 			t.Errorf("expected id=%s, got %v", labelledID, issue["id"])
 		}
+	}
+}
+
+func TestIntegration_ListLabels_ReturnsDistinctSortedCatalog(t *testing.T) {
+	baseURL, _, cleanup := setupIntegrationServer(t)
+	defer cleanup()
+
+	iCreateIssueWithFields(t, baseURL, map[string]interface{}{
+		"title":  "Label catalog one",
+		"labels": []string{"dispatch", "agent:codex"},
+	})
+	iCreateIssueWithFields(t, baseURL, map[string]interface{}{
+		"title":  "Label catalog two",
+		"labels": []string{"backend", "dispatch"},
+	})
+
+	closedID := iCreateIssueWithFields(t, baseURL, map[string]interface{}{
+		"title":  "Closed issue label source",
+		"labels": []string{"release"},
+	})
+	closeResp := iDoJSON(t, "POST", baseURL+"/v1/issues/"+closedID+"/close", map[string]interface{}{})
+	if closeResp.StatusCode != http.StatusOK {
+		t.Fatalf("close issue: status=%d", closeResp.StatusCode)
+	}
+	_ = closeResp.Body.Close()
+
+	deletedID := iCreateIssueWithFields(t, baseURL, map[string]interface{}{
+		"title":  "Deleted issue label source",
+		"labels": []string{"ghost"},
+	})
+	deleteResp := iDoJSON(t, "DELETE", baseURL+"/v1/issues/"+deletedID, nil)
+	if deleteResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete issue: status=%d", deleteResp.StatusCode)
+	}
+	_ = deleteResp.Body.Close()
+
+	resp := iDoJSON(t, "GET", baseURL+"/v1/labels", nil)
+	ok, data, _ := iParseEnvelope(t, resp)
+	if !ok {
+		t.Fatal("list labels failed")
+	}
+
+	dataBytes, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("marshal response data: %v", err)
+	}
+
+	var payload struct {
+		Labels          []string         `json:"labels"`
+		Workflows       []map[string]any `json:"workflows"`
+		DefaultWorkflow string           `json:"default_workflow"`
+	}
+	if err := json.Unmarshal(dataBytes, &payload); err != nil {
+		t.Fatalf("decode labels payload: %v", err)
+	}
+
+	want := []string{"agent:codex", "backend", "dispatch", "release"}
+	if len(payload.Labels) != len(want) {
+		t.Fatalf("labels len = %d, want %d (%v)", len(payload.Labels), len(want), payload.Labels)
+	}
+	for i := range want {
+		if payload.Labels[i] != want[i] {
+			t.Fatalf("labels[%d] = %q, want %q (full=%v)", i, payload.Labels[i], want[i], payload.Labels)
+		}
+	}
+	if len(payload.Workflows) != 0 {
+		t.Fatalf("workflows len = %d, want 0", len(payload.Workflows))
+	}
+	if payload.DefaultWorkflow != "standard" {
+		t.Fatalf("default_workflow = %q, want standard", payload.DefaultWorkflow)
 	}
 }
 
@@ -1140,7 +1240,14 @@ func TestIntegration_Approve_ClosesIssue(t *testing.T) {
 	baseURL, _, cleanup := setupIntegrationServer(t)
 	defer cleanup()
 
-	id := iCreateIssue(t, baseURL, "To be approved integration")
+	// Mark the test issue as minor so it bypasses the review-policy gate;
+	// this test verifies the state-machine transition + DTO shape, not the
+	// reviewer-independence rule. Non-minor coverage of the policy lives in
+	// cmd/parity_surface_test.go.
+	id := iCreateIssueWithFields(t, baseURL, map[string]interface{}{
+		"title": "To be approved integration",
+		"minor": true,
+	})
 
 	// Move to in_review first
 	iDoJSON(t, "POST", baseURL+"/v1/issues/"+id+"/review", nil)
@@ -1388,14 +1495,19 @@ func TestIntegration_Approve_ParentCascade(t *testing.T) {
 		"type":  "epic",
 	})
 
-	// Create two child issues
+	// Create two child issues. Mark them minor so the parity-aligned
+	// review-policy gate doesn't block the single-session
+	// review+approve flow this cascade test exercises; the cascade
+	// behavior is independent of the reviewer-independence rule.
 	child1 := iCreateIssueWithFields(t, baseURL, map[string]interface{}{
 		"title":     "Child 1 for cascade",
 		"parent_id": parentID,
+		"minor":     true,
 	})
 	child2 := iCreateIssueWithFields(t, baseURL, map[string]interface{}{
 		"title":     "Child 2 for cascade",
 		"parent_id": parentID,
+		"minor":     true,
 	})
 
 	// Move both children to in_review
@@ -1860,10 +1972,11 @@ func TestIntegration_DeleteDependency_WrongIssue(t *testing.T) {
 // ============================================================================
 
 func TestIntegration_SetFocus(t *testing.T) {
-	baseURL, _, cleanup := setupIntegrationServer(t)
+	baseURL, database, cleanup := setupIntegrationServer(t)
 	defer cleanup()
 
 	id := iCreateIssue(t, baseURL, "Issue for focus integration test")
+	sessionID := iCurrentSessionID(t, baseURL)
 
 	resp := iDoJSON(t, "PUT", baseURL+"/v1/focus", map[string]interface{}{
 		"issue_id": id,
@@ -1878,13 +1991,29 @@ func TestIntegration_SetFocus(t *testing.T) {
 	if data["focused_issue_id"] != id {
 		t.Errorf("focused_issue_id = %v, want %s", data["focused_issue_id"], id)
 	}
+
+	focused, err := database.GetFocus(iSessionStateScope(t, database, sessionID))
+	if err != nil {
+		t.Fatalf("db GetFocus: %v", err)
+	}
+	if focused != id {
+		t.Fatalf("db focus = %q, want %q", focused, id)
+	}
+	configFocus, err := config.GetFocus(database.BaseDir())
+	if err != nil {
+		t.Fatalf("config GetFocus: %v", err)
+	}
+	if configFocus != "" {
+		t.Fatalf("config focus = %q, want empty", configFocus)
+	}
 }
 
 func TestIntegration_ClearFocus(t *testing.T) {
-	baseURL, _, cleanup := setupIntegrationServer(t)
+	baseURL, database, cleanup := setupIntegrationServer(t)
 	defer cleanup()
 
 	id := iCreateIssue(t, baseURL, "Issue for clear focus test")
+	sessionID := iCurrentSessionID(t, baseURL)
 
 	// Set focus first
 	resp := iDoJSON(t, "PUT", baseURL+"/v1/focus", map[string]interface{}{
@@ -1905,6 +2034,24 @@ func TestIntegration_ClearFocus(t *testing.T) {
 	}
 	if data["focused_issue_id"] != nil {
 		t.Errorf("focused_issue_id = %v, want nil", data["focused_issue_id"])
+	}
+
+	focused, err := database.GetFocus(iSessionStateScope(t, database, sessionID))
+	if err != nil {
+		t.Fatalf("db GetFocus after clear: %v", err)
+	}
+	if focused != "" {
+		t.Fatalf("db focus after clear = %q, want empty", focused)
+	}
+	if err := config.SetFocus(database.BaseDir(), "td-stale-config"); err != nil {
+		t.Fatalf("seed stale config focus: %v", err)
+	}
+	focused, err = database.GetFocus(iSessionStateScope(t, database, sessionID))
+	if err != nil {
+		t.Fatalf("db GetFocus after stale config seed: %v", err)
+	}
+	if focused != "" {
+		t.Fatalf("cleared session_state should suppress config fallback, got %q", focused)
 	}
 }
 
@@ -1953,6 +2100,31 @@ func TestIntegration_FocusAppearsInMonitor(t *testing.T) {
 	focusedIssue, _ := mon["focused_issue"].(map[string]interface{})
 	if focusedIssue == nil {
 		t.Fatal("monitor.focused_issue should not be nil after setting focus")
+	}
+	if focusedIssue["id"] != id {
+		t.Errorf("focused_issue.id = %v, want %s", focusedIssue["id"], id)
+	}
+}
+
+func TestIntegration_MonitorUsesLegacyConfigFocusFallback(t *testing.T) {
+	baseURL, database, cleanup := setupIntegrationServer(t)
+	defer cleanup()
+
+	id := iCreateIssue(t, baseURL, "Legacy config focus monitor test")
+	if err := config.SetFocus(database.BaseDir(), id); err != nil {
+		t.Fatalf("config.SetFocus: %v", err)
+	}
+
+	resp := iDoJSON(t, "GET", baseURL+"/v1/monitor", nil)
+	ok, data, errP := iParseEnvelope(t, resp)
+	if !ok {
+		t.Fatalf("monitor failed: status=%d, err=%v", resp.StatusCode, errP)
+	}
+
+	mon, _ := data["monitor"].(map[string]interface{})
+	focusedIssue, _ := mon["focused_issue"].(map[string]interface{})
+	if focusedIssue == nil {
+		t.Fatal("monitor.focused_issue should use legacy config fallback")
 	}
 	if focusedIssue["id"] != id {
 		t.Errorf("focused_issue.id = %v, want %s", focusedIssue["id"], id)
@@ -2091,6 +2263,188 @@ func TestIntegration_GetBoard(t *testing.T) {
 	}
 	if len(issues) < 2 {
 		t.Errorf("board issues has %d items, want >= 2", len(issues))
+	}
+}
+
+func TestIntegration_GetBoard_DependencySummary(t *testing.T) {
+	baseURL, database, cleanup := setupIntegrationServer(t)
+	defer cleanup()
+
+	// A depends on B (open) and C (closed). Only B is an unresolved blocker.
+	aID := iCreateIssue(t, baseURL, "Card A depends on others")
+	bID := iCreateIssue(t, baseURL, "Blocker B stays open")
+	cID := iCreateIssue(t, baseURL, "Blocker C will be closed")
+
+	if err := database.AddDependencyLogged(aID, bID, "depends_on", "test-session"); err != nil {
+		t.Fatalf("add dependency A->B: %v", err)
+	}
+	if err := database.AddDependencyLogged(aID, cID, "depends_on", "test-session"); err != nil {
+		t.Fatalf("add dependency A->C: %v", err)
+	}
+
+	// Close C so it becomes a resolved (excluded) blocker.
+	resp := iDoJSON(t, "POST", baseURL+"/v1/issues/"+cID+"/close", nil)
+	ok, _, _ := iParseEnvelope(t, resp)
+	if !ok {
+		t.Fatal("close C failed")
+	}
+
+	// Board covering all open issues (A and B remain open; C is closed/excluded).
+	boardID := iCreateBoard(t, baseURL, "Dep Summary Board", "status:open")
+
+	resp = iDoJSON(t, "GET", baseURL+"/v1/boards/"+boardID, nil)
+	ok, data, _ := iParseEnvelope(t, resp)
+	if !ok {
+		t.Fatal("get board failed")
+	}
+
+	issues, _ := data["issues"].([]interface{})
+	if issues == nil {
+		t.Fatal("data.issues should be an array")
+	}
+
+	var aCard, bCard map[string]interface{}
+	for _, raw := range issues {
+		card, _ := raw.(map[string]interface{})
+		issue, _ := card["issue"].(map[string]interface{})
+		switch issue["id"] {
+		case aID:
+			aCard = issue
+		case bID:
+			bCard = issue
+		}
+	}
+	if aCard == nil {
+		t.Fatal("card A not found on board")
+	}
+	if bCard == nil {
+		t.Fatal("card B not found on board")
+	}
+
+	// A must carry a dependency_summary with B (open) and NOT C (closed).
+	summary, ok := aCard["dependency_summary"].(map[string]interface{})
+	if !ok || summary == nil {
+		t.Fatalf("A dependency_summary missing; got %v", aCard["dependency_summary"])
+	}
+	blockers, _ := summary["blockers"].([]interface{})
+	if len(blockers) != 1 {
+		t.Fatalf("expected 1 unresolved blocker on A, got %d (%v)", len(blockers), blockers)
+	}
+	blocker, _ := blockers[0].(map[string]interface{})
+	if blocker["issue_id"] != bID {
+		t.Errorf("expected blocker issue_id = B (%s), got %v", bID, blocker["issue_id"])
+	}
+	if blocker["status"] == "closed" {
+		t.Errorf("blocker status should never be closed, got %v", blocker["status"])
+	}
+	if blocker["relation_type"] != "depends_on" {
+		t.Errorf("relation_type = %v, want depends_on", blocker["relation_type"])
+	}
+	// dep_id must match the detail-path derivation: DependencyID(A, B, depends_on).
+	wantDepID := db.DependencyID(aID, bID, "depends_on")
+	if blocker["dep_id"] != wantDepID {
+		t.Errorf("dep_id = %v, want %s", blocker["dep_id"], wantDepID)
+	}
+
+	// Direction check: B (the blocker) must NOT carry a summary — nothing blocks B.
+	if _, present := bCard["dependency_summary"]; present {
+		t.Errorf("B should have no dependency_summary (direction check), got %v", bCard["dependency_summary"])
+	}
+}
+
+// TestIntegration_SlimBoardListPayload verifies that the board and issue-list
+// endpoints OMIT the heavy text fields (description, acceptance) that the
+// board/list views never render, while the single-issue detail endpoint still
+// returns them in full. This is the payload-slimming optimization: the board
+// cards and list rows don't need description/acceptance, and the detail panel
+// refetches the full issue separately.
+func TestIntegration_SlimBoardListPayload(t *testing.T) {
+	baseURL, _, cleanup := setupIntegrationServer(t)
+	defer cleanup()
+
+	const (
+		desc = "This is a long description with a code block:\n```go\nfunc main() {}\n```"
+		acc  = "Given X, when Y, then Z must hold."
+	)
+
+	issueID := iCreateIssueWithFields(t, baseURL, map[string]interface{}{
+		"title":       "Issue with heavy fields",
+		"description": desc,
+		"acceptance":  acc,
+	})
+
+	// --- List path: description/acceptance must be blanked. ---
+	resp := iDoJSON(t, "GET", baseURL+"/v1/issues", nil)
+	ok, data, _ := iParseEnvelope(t, resp)
+	if !ok {
+		t.Fatal("list issues failed")
+	}
+	listIssues, _ := data["issues"].([]interface{})
+	var listIssue map[string]interface{}
+	for _, raw := range listIssues {
+		issue, _ := raw.(map[string]interface{})
+		if issue["id"] == issueID {
+			listIssue = issue
+			break
+		}
+	}
+	if listIssue == nil {
+		t.Fatal("issue not found in list response")
+	}
+	// Heavy fields present (no omitempty) but blanked to empty string.
+	if got := listIssue["description"]; got != "" {
+		t.Errorf("list: description = %q, want empty", got)
+	}
+	if got := listIssue["acceptance"]; got != "" {
+		t.Errorf("list: acceptance = %q, want empty", got)
+	}
+	// Card-rendered fields must survive.
+	if listIssue["title"] != "Issue with heavy fields" {
+		t.Errorf("list: title = %v, want preserved", listIssue["title"])
+	}
+
+	// --- Board path: description/acceptance must be blanked. ---
+	boardID := iCreateBoard(t, baseURL, "Slim Board", "status:open")
+	resp = iDoJSON(t, "GET", baseURL+"/v1/boards/"+boardID, nil)
+	ok, data, _ = iParseEnvelope(t, resp)
+	if !ok {
+		t.Fatal("get board failed")
+	}
+	boardIssues, _ := data["issues"].([]interface{})
+	var boardCard map[string]interface{}
+	for _, raw := range boardIssues {
+		card, _ := raw.(map[string]interface{})
+		issue, _ := card["issue"].(map[string]interface{})
+		if issue["id"] == issueID {
+			boardCard = issue
+			break
+		}
+	}
+	if boardCard == nil {
+		t.Fatal("issue not found on board")
+	}
+	if got := boardCard["description"]; got != "" {
+		t.Errorf("board: description = %q, want empty", got)
+	}
+	if got := boardCard["acceptance"]; got != "" {
+		t.Errorf("board: acceptance = %q, want empty", got)
+	}
+
+	// --- Detail path: description/acceptance must be FULLY present. ---
+	resp = iDoJSON(t, "GET", baseURL+"/v1/issues/"+issueID, nil)
+	ok, data, _ = iParseEnvelope(t, resp)
+	if !ok {
+		t.Fatal("get issue detail failed")
+	}
+	detail, _ := data["issue"].(map[string]interface{})
+	if detail == nil {
+		t.Fatal("detail issue missing")
+	}
+	if got := detail["description"]; got != desc {
+		t.Errorf("detail: description = %q, want full %q", got, desc)
+	}
+	if got := detail["acceptance"]; got != acc {
+		t.Errorf("detail: acceptance = %q, want full %q", got, acc)
 	}
 }
 
@@ -2321,7 +2675,7 @@ func TestIntegration_SSE_Connect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /v1/events: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200", resp.StatusCode)
@@ -2347,11 +2701,11 @@ func TestIntegration_SSE_ReceivesRefreshOnWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("db.Initialize: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sess, err := GetOrCreateWebSession(database)
 	if err != nil {
-		database.Close()
+		_ = database.Close()
 		t.Fatalf("GetOrCreateWebSession: %v", err)
 	}
 
@@ -2392,7 +2746,7 @@ func TestIntegration_SSE_Ping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("db.Initialize: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// The ping ticker is hardcoded at 30s inside run(), which is too long
 	// for a test. Instead, verify the hub correctly registers/unregisters clients.

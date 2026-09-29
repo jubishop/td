@@ -20,7 +20,7 @@ func TestBrowserLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	database.Close()
+	_ = database.Close()
 	previousOverride := baseDirOverride
 	baseDirOverride = &dir
 	t.Cleanup(func() { baseDirOverride = previousOverride })
@@ -51,7 +51,7 @@ func TestBrowserLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	page, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 || !strings.Contains(string(page), "/assets/app.js") {
 		t.Fatalf("browser page: %d %s", resp.StatusCode, page)
 	}
@@ -59,7 +59,7 @@ func TestBrowserLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stream.Body.Close()
+	defer func() { _ = stream.Body.Close() }()
 	cancel()
 	select {
 	case err := <-done:

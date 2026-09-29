@@ -4,8 +4,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+
+	"github.com/charmbracelet/x/ansi"
+	"github.com/marcus/td/pkg/monitor/ansifill"
 
 	"github.com/marcus/td/pkg/monitor/mouse"
 )
@@ -49,6 +53,205 @@ func TestNewWithOptions(t *testing.T) {
 	}
 	if m.closeOnBackdrop {
 		t.Errorf("expected closeOnBackdrop false, got %v", m.closeOnBackdrop)
+	}
+}
+
+func TestDefaultThemePreservesStandaloneStyles(t *testing.T) {
+	m := New("Default")
+	wantBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("212")).
+		Background(lipgloss.Color("235")).
+		Padding(1, 2).
+		Width(DefaultWidth)
+	if got, want := m.modalStyle(DefaultWidth).Render("body"), wantBox.Render("body"); got != want {
+		t.Fatalf("default modal box appearance changed:\n got %q\nwant %q", got, want)
+	}
+	if got, want := m.renderTitleLine("Default"), lipgloss.NewStyle().Bold(true).Render("Default"); got != want {
+		t.Fatalf("default modal title appearance changed: got %q, want %q", got, want)
+	}
+	if got, want := m.styles.body.Render("body"), "body"; got != want {
+		t.Fatalf("default body appearance changed: got %q, want %q", got, want)
+	}
+}
+
+func TestInstanceThemeCoversVariantsAndBuiltInSections(t *testing.T) {
+	theme := Theme{
+		Primary: "#110001", Warning: "#220002", Error: "#330003", Info: "#440004",
+		TextPrimary: "#550005", TextSecondary: "#660006", TextMuted: "#770007",
+		TextSelection: "#880008", OnPrimary: "#990009", OnError: "#aa000a",
+		Surface: "#bb000b", SurfaceRaised: "#cc000c", Selection: "#dd000d",
+		Border: "#ee000e", BorderMuted: "#ff000f",
+	}
+	variants := []struct {
+		name    string
+		variant Variant
+		color   string
+	}{
+		{"default", VariantDefault, theme.Primary},
+		{"warning", VariantWarning, theme.Warning},
+		{"danger", VariantDanger, theme.Error},
+		{"info", VariantInfo, theme.Info},
+	}
+	for _, tt := range variants {
+		t.Run(tt.name, func(t *testing.T) {
+			cursor := 0
+			m := New("Themed", WithTheme(theme), WithVariant(tt.variant)).
+				AddSection(Text("body")).
+				AddSection(List("items", []ListItem{{ID: "one", Label: "selected"}}, &cursor)).
+				AddSection(Buttons(Btn(" Delete ", "delete", BtnDanger())))
+			// The renderer paints the surface behind every cell; strip it so the
+			// themed fragments below can be matched verbatim.
+			got := strings.ReplaceAll(m.Render(80, 24, nil), ansifill.Code(theme.Surface), "")
+			for name, want := range map[string]string{
+				"variant": lipgloss.NewStyle().Foreground(lipgloss.Color(tt.color)).Render("X"),
+				"body":    m.styles.body.Render("body"),
+				"list":    m.styles.listItemFocused.Render("selected"),
+			} {
+				prefix := strings.Split(want, "X")[0]
+				if name != "variant" {
+					prefix = want
+				}
+				if !strings.Contains(got, prefix) {
+					t.Errorf("render missing themed %s sequence %q: %q", name, prefix, got)
+				}
+			}
+			buttonCore := lipgloss.NewStyle().
+				Foreground(lipgloss.Color(theme.TextSecondary)).
+				Background(lipgloss.Color(theme.SurfaceRaised)).
+				Render(" Delete ")
+			if !strings.Contains(got, buttonCore) {
+				t.Errorf("render missing themed danger button core %q: %q", buttonCore, got)
+			}
+		})
+	}
+}
+
+func TestModalThemesAreIsolatedAndRethemePreservesState(t *testing.T) {
+	input := textinput.New()
+	input.SetValue("draft")
+	first := New("First", WithTheme(Theme{Primary: "#120001", Surface: "#120002"}), WithHints(false)).
+		AddSection(Input("name", &input)).
+		AddSection(Buttons(Btn(" Save ", "save")))
+	first.Render(60, 16, nil)
+	first.SetFocus("save")
+	first.Scroll(4)
+	beforeFocus := first.FocusedID()
+
+	second := New("Second", WithTheme(Theme{Primary: "#210001", Surface: "#210002"}), WithHints(false)).
+		AddSection(Text("body"))
+	firstBefore := first.Render(60, 16, nil)
+	first.Scroll(4)
+	beforeScroll := first.ScrollOffset()
+	secondOutput := second.Render(60, 16, nil)
+	if firstBefore == secondOutput {
+		t.Fatal("two modal instances with different themes rendered identically")
+	}
+
+	first.SetTheme(Theme{Primary: "#310001", Surface: "#310002", TextPrimary: "#310003"})
+	if got := first.InputValue("name"); got != "draft" {
+		t.Fatalf("retheme changed input value: %q", got)
+	}
+	if first.FocusedID() != beforeFocus || first.ScrollOffset() != beforeScroll {
+		t.Fatalf("retheme changed modal state: focus %q->%q scroll %d->%d", beforeFocus, first.FocusedID(), beforeScroll, first.ScrollOffset())
+	}
+	firstAfter := first.Render(60, 16, nil)
+	if firstAfter == firstBefore {
+		t.Fatal("SetTheme did not repaint the existing modal")
+	}
+	if got := second.Render(60, 16, nil); got != secondOutput {
+		t.Fatal("retheming first modal contaminated second modal")
+	}
+}
+
+func TestHostChromeContractMatchesSidecarGeometryAndHitRegions(t *testing.T) {
+	theme := Theme{Primary: "#110001", TextPrimary: "#220002", Surface: "#330003"}
+	var gotWidth, gotHeight, gotContentWidth, gotContentHeight int
+	renderer := func(content string, width, height int) string {
+		gotWidth, gotHeight = width, height
+		gotContentWidth, gotContentHeight = lipgloss.Width(content), lipgloss.Height(content)
+		// Sidecar-equivalent geometry: outer dimensions include one border cell
+		// and the host adds padding=1 around the supplied content.
+		lines := strings.Split(content, "\n")
+		innerHeight := height - 2
+		contentWidth := width - 4
+		var out strings.Builder
+		out.WriteString("+" + strings.Repeat("-", width-2) + "+\n")
+		for i := 0; i < innerHeight; i++ {
+			line := ""
+			if i < len(lines) {
+				line = lines[i]
+			}
+			lineWidth := lipgloss.Width(line)
+			if lineWidth < contentWidth {
+				line += strings.Repeat(" ", contentWidth-lineWidth)
+			}
+			out.WriteString("| " + line + " |")
+			if i < innerHeight-1 {
+				out.WriteByte('\n')
+			}
+		}
+		out.WriteString("\n+" + strings.Repeat("-", width-2) + "+")
+		return out.String()
+	}
+
+	input := textinput.New()
+	m := New("Hosted", WithWidth(50), WithHints(false), WithTheme(theme), WithChromeRenderer(renderer)).
+		AddSection(Custom(func(contentWidth int, focusID, hoverID string) RenderedSection {
+			return RenderedSection{Content: "RAW CUSTOM"}
+		}, nil)).
+		AddSection(Input("name", &input))
+	handler := mouse.NewHandler()
+	got := m.Render(100, 30, handler)
+	if lipgloss.Width(got) != 50 || gotWidth != 50 {
+		t.Fatalf("hosted WithWidth geometry = output %d callback %d, want 50", lipgloss.Width(got), gotWidth)
+	}
+	if lipgloss.Height(got) != gotHeight || gotContentWidth != 46 || gotContentHeight != gotHeight-2 {
+		t.Fatalf("host geometry mismatch: output h=%d callback=%dx%d content=%dx%d", lipgloss.Height(got), gotWidth, gotHeight, gotContentWidth, gotContentHeight)
+	}
+	surfaceFragment := "48;2;51;0;3"
+	if !strings.Contains(got, surfaceFragment) || !strings.Contains(got, "RAW CUSTOM") {
+		t.Fatalf("host lost td-owned Surface/custom content styling: %q", got)
+	}
+	for _, line := range strings.Split(ansi.Strip(got), "\n") {
+		if strings.Contains(line, "RAW CUSTOM") && strings.Index(line, "RAW CUSTOM") != 3 {
+			t.Fatalf("custom content starts at column %d, want 3 (border + host padding + td padding): %q", strings.Index(line, "RAW CUSTOM"), line)
+		}
+	}
+
+	modalX := (100 - 50) / 2
+	var body, field *mouse.Region
+	for _, region := range handler.HitMap.Regions() {
+		switch region.ID {
+		case "modal-body":
+			copy := region
+			body = &copy
+		case "name":
+			copy := region
+			field = &copy
+		}
+	}
+	if body == nil || body.Rect.X != modalX || body.Rect.W != 50 || body.Rect.H != gotHeight {
+		t.Fatalf("modal body region not aligned with host output: %#v", body)
+	}
+	if field == nil || field.Rect.X != modalX+3 || !body.Rect.Contains(field.Rect.X, field.Rect.Y) {
+		t.Fatalf("input region not aligned with content inset/body: body=%#v input=%#v", body, field)
+	}
+	if clicked := handler.HandleClick(field.Rect.X, field.Rect.Y).Region; clicked == nil || clicked.ID != "name" {
+		t.Fatalf("click at rendered input did not hit input region: %#v", clicked)
+	}
+}
+
+func TestThemedCustomReceivesLiveInstanceTheme(t *testing.T) {
+	m := New("Custom", WithTheme(Theme{Primary: "#110001"}), WithHints(false)).
+		AddSection(ThemedCustom(func(contentWidth int, focusID, hoverID string, theme Theme) RenderedSection {
+			return RenderedSection{Content: lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary)).Render("custom")}
+		}, nil))
+	before := m.Render(50, 16, nil)
+	m.SetTheme(Theme{Primary: "#220002"})
+	after := m.Render(50, 16, nil)
+	if before == after || !strings.Contains(after, "38;2;34;0;2") || strings.Contains(after, "38;2;17;0;1") {
+		t.Fatalf("themed custom section did not receive live theme:\n before %q\n after %q", before, after)
 	}
 }
 
@@ -129,7 +332,7 @@ func TestCheckboxSection(t *testing.T) {
 	}
 
 	// Toggle via Update
-	s.Update(tea.KeyMsg{Type: tea.KeyEnter}, "agree")
+	s.Update(tea.KeyPressMsg{Code: tea.KeyEnter}, "agree")
 	if !checked {
 		t.Errorf("expected checked to be true after Enter")
 	}
@@ -217,7 +420,7 @@ func TestHandleKeyEsc(t *testing.T) {
 	handler := mouse.NewHandler()
 	m.Render(80, 24, handler)
 
-	action, _ := m.HandleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	action, _ := m.HandleKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 	if action != "cancel" {
 		t.Errorf("expected 'cancel' on Esc, got %q", action)
 	}
@@ -240,25 +443,25 @@ func TestHandleKeyTab(t *testing.T) {
 	}
 
 	// Tab to next
-	m.HandleKey(tea.KeyMsg{Type: tea.KeyTab})
+	m.HandleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	if m.FocusedID() != "b" {
 		t.Errorf("expected focus on 'b' after Tab, got %q", m.FocusedID())
 	}
 
 	// Tab again
-	m.HandleKey(tea.KeyMsg{Type: tea.KeyTab})
+	m.HandleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	if m.FocusedID() != "c" {
 		t.Errorf("expected focus on 'c' after second Tab, got %q", m.FocusedID())
 	}
 
 	// Tab wraps around
-	m.HandleKey(tea.KeyMsg{Type: tea.KeyTab})
+	m.HandleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	if m.FocusedID() != "a" {
 		t.Errorf("expected focus to wrap to 'a', got %q", m.FocusedID())
 	}
 
 	// Shift+Tab goes backward
-	m.HandleKey(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m.HandleKey(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
 	if m.FocusedID() != "c" {
 		t.Errorf("expected focus on 'c' after Shift+Tab, got %q", m.FocusedID())
 	}
@@ -275,14 +478,14 @@ func TestHandleKeyEnter(t *testing.T) {
 	m.Render(80, 24, handler)
 
 	// Enter on focused button returns its ID
-	action, _ := m.HandleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	action, _ := m.HandleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if action != "ok" {
 		t.Errorf("expected 'ok' on Enter, got %q", action)
 	}
 
 	// Focus cancel and enter
 	m.SetFocus("cancel")
-	action, _ = m.HandleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	action, _ = m.HandleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if action != "cancel" {
 		t.Errorf("expected 'cancel' on Enter, got %q", action)
 	}
@@ -317,12 +520,7 @@ func TestHandleMouseClick(t *testing.T) {
 	// Click on the OK button
 	clickX := okRegion.Rect.X + okRegion.Rect.W/2
 	clickY := okRegion.Rect.Y
-	action := m.HandleMouse(tea.MouseMsg{
-		X:      clickX,
-		Y:      clickY,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-	}, handler)
+	action := m.HandleMouse(tea.MouseClickMsg{X: clickX, Y: clickY, Button: tea.MouseLeft}, handler)
 
 	if action != "ok" {
 		t.Errorf("expected 'ok' on click, got %q", action)
@@ -336,12 +534,7 @@ func TestHandleMouseBackdropClick(t *testing.T) {
 	handler := mouse.NewHandler()
 	m.Render(80, 24, handler)
 
-	action := m.HandleMouse(tea.MouseMsg{
-		X:      0,
-		Y:      0,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-	}, handler)
+	action := m.HandleMouse(tea.MouseClickMsg{X: 0, Y: 0, Button: tea.MouseLeft}, handler)
 	if action != "cancel" {
 		t.Errorf("expected 'cancel' on backdrop click, got %q", action)
 	}
@@ -351,12 +544,7 @@ func TestHandleMouseBackdropClick(t *testing.T) {
 	handler = mouse.NewHandler()
 	m.Render(80, 24, handler)
 
-	action = m.HandleMouse(tea.MouseMsg{
-		X:      0,
-		Y:      0,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-	}, handler)
+	action = m.HandleMouse(tea.MouseClickMsg{X: 0, Y: 0, Button: tea.MouseLeft}, handler)
 	if action != "" {
 		t.Errorf("expected no action on backdrop click when disabled, got %q", action)
 	}
@@ -384,22 +572,14 @@ func TestHandleMouseHover(t *testing.T) {
 	}
 
 	// Hover over button
-	m.HandleMouse(tea.MouseMsg{
-		X:      okRegion.Rect.X,
-		Y:      okRegion.Rect.Y,
-		Action: tea.MouseActionMotion,
-	}, handler)
+	m.HandleMouse(tea.MouseMotionMsg{X: okRegion.Rect.X, Y: okRegion.Rect.Y}, handler)
 
 	if m.HoveredID() != "ok" {
 		t.Errorf("expected hoverID 'ok', got %q", m.HoveredID())
 	}
 
 	// Move away
-	m.HandleMouse(tea.MouseMsg{
-		X:      0,
-		Y:      0,
-		Action: tea.MouseActionMotion,
-	}, handler)
+	m.HandleMouse(tea.MouseMotionMsg{X: 0, Y: 0}, handler)
 
 	if m.HoveredID() != "" {
 		t.Errorf("expected empty hoverID, got %q", m.HoveredID())
@@ -418,24 +598,14 @@ func TestMouseScrollModal(t *testing.T) {
 	m.Render(80, 10, handler) // Small height to enable scrolling
 
 	// Scroll on backdrop should do nothing
-	m.HandleMouse(tea.MouseMsg{
-		X:      0,
-		Y:      0,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-	}, handler)
+	m.HandleMouse(tea.MouseWheelMsg{X: 0, Y: 0, Button: tea.MouseWheelDown}, handler)
 
 	initialOffset := m.scrollOffset
 
 	// Scroll on modal body should work
 	bodyRegion := handler.HitMap.Test(40, 5) // Should hit modal-body
 	if bodyRegion != nil && bodyRegion.ID == "modal-body" {
-		m.HandleMouse(tea.MouseMsg{
-			X:      40,
-			Y:      5,
-			Action: tea.MouseActionPress,
-			Button: tea.MouseButtonWheelDown,
-		}, handler)
+		m.HandleMouse(tea.MouseWheelMsg{X: 40, Y: 5, Button: tea.MouseWheelDown}, handler)
 		// Scroll offset should increase (if content is scrollable)
 		_ = initialOffset // May not change if content fits
 	}
@@ -456,6 +626,35 @@ func TestInputSection(t *testing.T) {
 	}
 	if res.Focusables[0].ID != "name" {
 		t.Errorf("expected focusable ID 'name', got %q", res.Focusables[0].ID)
+	}
+}
+
+func TestModalFirstRenderFocusesInputBeforeFirstKey(t *testing.T) {
+	ti := textinput.New()
+	m := New("Input").AddSection(Input("name", &ti))
+	handler := mouse.NewHandler()
+
+	// One render is the runtime boundary between opening a modal and receiving
+	// its first key. It must both discover and focus the input.
+	m.Render(80, 24, handler)
+	if m.FocusedID() != "name" {
+		t.Fatalf("focused ID = %q, want name", m.FocusedID())
+	}
+
+	_, _ = m.HandleKey(tea.KeyPressMsg{Code: 'b', Text: "b"})
+	if got := ti.Value(); got != "b" {
+		t.Fatalf("first key was discarded: input = %q, want b", got)
+	}
+}
+
+func TestModalRoutesPasteToFocusedInput(t *testing.T) {
+	ti := textinput.New()
+	m := New("Input").AddSection(Input("name", &ti))
+	m.Render(80, 24, mouse.NewHandler())
+
+	_, _ = m.HandleMsg(tea.PasteMsg{Content: "pasted value"})
+	if got := ti.Value(); got != "pasted value" {
+		t.Fatalf("pasted input = %q, want pasted value", got)
 	}
 }
 
@@ -483,13 +682,13 @@ func TestListSection(t *testing.T) {
 	}
 
 	// Test navigation - pass the list's ID, not item ID
-	s.Update(tea.KeyMsg{Type: tea.KeyDown}, "my-list")
+	s.Update(tea.KeyPressMsg{Code: tea.KeyDown}, "my-list")
 	if selectedIdx != 1 {
 		t.Errorf("expected selectedIdx 1 after down, got %d", selectedIdx)
 	}
 
 	// Test enter returns selected item ID
-	action, _ := s.Update(tea.KeyMsg{Type: tea.KeyEnter}, "my-list")
+	action, _ := s.Update(tea.KeyPressMsg{Code: tea.KeyEnter}, "my-list")
 	if action != "item2" {
 		t.Errorf("expected action 'item2' on enter, got %q", action)
 	}
@@ -654,12 +853,7 @@ func TestMouseHandler(t *testing.T) {
 	handler.HitMap.AddRect("button2", 40, 10, 20, 5, "data2")
 
 	// Test click detection
-	action := handler.HandleMouse(tea.MouseMsg{
-		X:      15,
-		Y:      12,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-	})
+	action := handler.HandleMouse(tea.MouseClickMsg{X: 15, Y: 12, Button: tea.MouseLeft})
 
 	if action.Type != mouse.ActionClick {
 		t.Errorf("expected ActionClick, got %v", action.Type)
@@ -669,11 +863,7 @@ func TestMouseHandler(t *testing.T) {
 	}
 
 	// Test hover detection
-	action = handler.HandleMouse(tea.MouseMsg{
-		X:      45,
-		Y:      12,
-		Action: tea.MouseActionMotion,
-	})
+	action = handler.HandleMouse(tea.MouseMotionMsg{X: 45, Y: 12})
 
 	if action.Type != mouse.ActionHover {
 		t.Errorf("expected ActionHover, got %v", action.Type)
@@ -683,12 +873,7 @@ func TestMouseHandler(t *testing.T) {
 	}
 
 	// Test scroll
-	action = handler.HandleMouse(tea.MouseMsg{
-		X:      15,
-		Y:      12,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-	})
+	action = handler.HandleMouse(tea.MouseWheelMsg{X: 15, Y: 12, Button: tea.MouseWheelDown})
 
 	if action.Type != mouse.ActionScrollDown {
 		t.Errorf("expected ActionScrollDown, got %v", action.Type)
@@ -697,19 +882,21 @@ func TestMouseHandler(t *testing.T) {
 
 func TestGettingStartedModalButtonClick(t *testing.T) {
 	// Simulate the Getting Started modal structure (must fit on 80x24)
-	m := New("Welcome to td!", WithWidth(60), WithHints(false)).
-		AddSection(Text("Task management for AI agents.")).
+	m := New("", WithWidth(60), WithHints(false)).
+		AddSection(CenteredTitle("Welcome to td!")).
+		AddSection(CenteredMuted("Task management for AI agents.")).
 		AddSection(Spacer()).
-		AddSection(Text("Press I to install td instructions to AGENTS.md")).
+		AddSection(Text("To use td, just prompt your agent:")).
+		AddSection(Text(`"Use td to plan my feature and implement it."`)).
 		AddSection(Spacer()).
-		AddSection(Text("PROMPT: \"Use td to plan my feature and implement it.\"")).
-		AddSection(Spacer()).
-		AddSection(Text("Press ? for help · H to reopen this modal")).
+		AddSection(Text("Press I to add compact td guidance to AGENTS.md")).
 		AddSection(Spacer()).
 		AddSection(Buttons(
 			Btn(" [I]nstall ", "install"),
 			Btn(" Close ", "close"),
-		))
+		)).
+		AddSection(Spacer()).
+		AddSection(CenteredMuted("Press ? for help · H to reopen this modal"))
 
 	handler := mouse.NewHandler()
 	m.Render(80, 24, handler)
@@ -742,24 +929,14 @@ func TestGettingStartedModalButtonClick(t *testing.T) {
 	t.Logf("Close button at (%d, %d) size %dx%d", closeRegion.Rect.X, closeRegion.Rect.Y, closeRegion.Rect.W, closeRegion.Rect.H)
 
 	// Click the Install button
-	action := m.HandleMouse(tea.MouseMsg{
-		X:      installRegion.Rect.X + 1,
-		Y:      installRegion.Rect.Y,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-	}, handler)
+	action := m.HandleMouse(tea.MouseClickMsg{X: installRegion.Rect.X + 1, Y: installRegion.Rect.Y, Button: tea.MouseLeft}, handler)
 
 	if action != "install" {
 		t.Errorf("expected 'install' on click, got %q", action)
 	}
 
 	// Click the Close button
-	action = m.HandleMouse(tea.MouseMsg{
-		X:      closeRegion.Rect.X + 1,
-		Y:      closeRegion.Rect.Y,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-	}, handler)
+	action = m.HandleMouse(tea.MouseClickMsg{X: closeRegion.Rect.X + 1, Y: closeRegion.Rect.Y, Button: tea.MouseLeft}, handler)
 
 	if action != "close" {
 		t.Errorf("expected 'close' on click, got %q", action)

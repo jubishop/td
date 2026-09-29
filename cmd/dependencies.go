@@ -26,7 +26,7 @@ var blockedByCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		issueID := args[0]
 		issue, err := database.GetIssue(issueID)
@@ -36,7 +36,7 @@ var blockedByCmd = &cobra.Command{
 		}
 
 		directOnly, _ := cmd.Flags().GetBool("direct")
-		jsonOutput, _ := cmd.Flags().GetBool("json")
+		jsonOutput := jsonMode(cmd)
 
 		// Get direct blocked issues
 		blocked, err := database.GetBlockedBy(issueID)
@@ -47,7 +47,7 @@ var blockedByCmd = &cobra.Command{
 
 		result := map[string]interface{}{
 			"issue":        issue,
-			"direct":       blocked,
+			"direct":       jsonList(blocked),
 			"direct_count": len(blocked),
 		}
 
@@ -56,7 +56,7 @@ var blockedByCmd = &cobra.Command{
 			allBlocked := getTransitiveBlocked(database, issueID, make(map[string]bool))
 			transitiveCount := len(allBlocked) - len(blocked)
 			result["transitive_count"] = transitiveCount
-			result["all"] = allBlocked
+			result["all"] = jsonList(allBlocked)
 		}
 
 		if jsonOutput {
@@ -146,7 +146,7 @@ var dependsOnCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		issueID := args[0]
 		issue, err := database.GetIssue(issueID)
@@ -161,12 +161,12 @@ var dependsOnCmd = &cobra.Command{
 			return err
 		}
 
-		jsonOutput, _ := cmd.Flags().GetBool("json")
+		jsonOutput := jsonMode(cmd)
 
 		if jsonOutput {
 			result := map[string]interface{}{
 				"issue":        issue,
-				"dependencies": deps,
+				"dependencies": jsonList(deps),
 			}
 			return output.JSON(result)
 		}
@@ -215,13 +215,13 @@ var criticalPathCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		limit, _ := cmd.Flags().GetInt("limit")
 		if limit == 0 {
 			limit = 10
 		}
-		jsonOutput, _ := cmd.Flags().GetBool("json")
+		jsonOutput := jsonMode(cmd)
 
 		// Get all open/in_progress issues (excluding epics - they're containers, not blocking work)
 		allIssues, err := database.ListIssues(db.ListIssuesOptions{
@@ -294,9 +294,9 @@ var criticalPathCmd = &cobra.Command{
 
 		if jsonOutput {
 			result := map[string]interface{}{
-				"critical_path":      criticalPath,
-				"ready_to_start":     readyIssues,
-				"bottleneck_ranking": scores,
+				"critical_path":      jsonList(criticalPath),
+				"ready_to_start":     jsonList(readyIssues),
+				"bottleneck_ranking": jsonList(scores),
 			}
 			return output.JSON(result)
 		}
@@ -454,10 +454,10 @@ Examples:
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		blocking, _ := cmd.Flags().GetBool("blocking")
-		jsonOutput, _ := cmd.Flags().GetBool("json")
+		jsonOutput := jsonMode(cmd)
 
 		// Single arg: show dependencies (or blocking issues with --blocking)
 		if len(args) == 1 {
@@ -504,7 +504,7 @@ var depAddCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
@@ -559,7 +559,7 @@ var depRmCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
@@ -639,7 +639,7 @@ func showDependencies(database *db.DB, issue *models.Issue, jsonOutput bool) err
 	if jsonOutput {
 		result := map[string]interface{}{
 			"issue":        issue,
-			"dependencies": deps,
+			"dependencies": jsonList(deps),
 		}
 		return output.JSON(result)
 	}
@@ -685,7 +685,7 @@ func showBlocking(database *db.DB, issue *models.Issue, jsonOutput bool) error {
 	if jsonOutput {
 		result := map[string]interface{}{
 			"issue":   issue,
-			"blocked": blocked,
+			"blocked": jsonList(blocked),
 		}
 		return output.JSON(result)
 	}
@@ -724,13 +724,8 @@ func init() {
 	depAddCmd.Flags().String("depends-on", "", "Dependency ID(s) to add (comma-separated)")
 
 	blockedByCmd.Flags().Bool("direct", false, "Only show direct dependencies")
-	blockedByCmd.Flags().Bool("json", false, "JSON output")
-
-	dependsOnCmd.Flags().Bool("json", false, "JSON output")
 
 	depCmd.Flags().Bool("blocking", false, "Show what depends on this issue (reverse)")
-	depCmd.Flags().Bool("json", false, "JSON output")
 
 	criticalPathCmd.Flags().Int("limit", 10, "Max issues to show")
-	criticalPathCmd.Flags().Bool("json", false, "JSON output")
 }

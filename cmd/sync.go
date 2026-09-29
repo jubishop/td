@@ -21,6 +21,13 @@ import (
 )
 
 // baseSyncableEntities are always eligible for sync.
+//
+// issue_reviews is registered at the same time the table is introduced so
+// that recorded approvals (and supersede events, delivered as UPDATE events
+// that carry superseded_at) cross machines from the first release. The sync
+// engine applies UPDATEs for any registered table via the partial-update
+// path (see internal/sync/events.go), so the superseded_at stamp propagates
+// without a dedicated sync mechanism.
 var baseSyncableEntities = map[string]bool{
 	"issues":                true,
 	"logs":                  true,
@@ -32,6 +39,7 @@ var baseSyncableEntities = map[string]bool{
 	"issue_dependencies":    true,
 	"issue_files":           true,
 	"work_session_issues":   true,
+	"issue_reviews":         true,
 }
 
 const syncNotesEntity = "notes"
@@ -71,7 +79,7 @@ var syncCmd = &cobra.Command{
 			output.Error("open database: %v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		syncState, err := database.GetSyncState()
 		if err != nil {
@@ -95,6 +103,14 @@ var syncCmd = &cobra.Command{
 
 		if statusOnly {
 			return runSyncStatus(database, client, syncState)
+		}
+
+		// Never push or apply events from a damaged database. In particular,
+		// orphan backfill interprets corrupt table pages as real entities and can
+		// otherwise upload that garbage before the first write reports SQLITE_CORRUPT.
+		if err := database.QuickCheck(); err != nil {
+			output.Error("local database is corrupt; sync aborted before making changes: %v", err)
+			return err
 		}
 
 		// Try snapshot bootstrap on first sync
@@ -208,56 +224,155 @@ func runBootstrap(database *db.DB, client *syncclient.Client, state *db.SyncStat
 	backupPath := dbPath + ".pre-snapshot-backup"
 	baseDir := database.BaseDir()
 
-	// Close current DB before overwriting
-	database.Close()
-
-	// Backup existing DB
-	if err := copyFile(dbPath, backupPath); err != nil {
-		reopened, reopenErr := db.Open(baseDir)
-		if reopenErr != nil {
-			return nil, fmt.Errorf("backup failed (%w) and reopen failed: %v", err, reopenErr)
-		}
-		return reopened, fmt.Errorf("backup db: %w", err)
+	// Stage and fully validate the replacement before touching the live DB.
+	// A header check alone accepts snapshots with damaged b-trees or indexes.
+	staged, err := os.CreateTemp(filepath.Dir(dbPath), ".issues.snapshot-*.db")
+	if err != nil {
+		return nil, fmt.Errorf("stage snapshot: %w", err)
+	}
+	stagedPath := staged.Name()
+	defer func() { _ = os.Remove(stagedPath) }()
+	if _, err := staged.Write(snapshot.Data); err != nil {
+		_ = staged.Close()
+		return nil, fmt.Errorf("stage snapshot: %w", err)
+	}
+	if err := staged.Sync(); err != nil {
+		_ = staged.Close()
+		return nil, fmt.Errorf("flush staged snapshot: %w", err)
+	}
+	if err := staged.Close(); err != nil {
+		return nil, fmt.Errorf("close staged snapshot: %w", err)
+	}
+	if err := os.Chmod(stagedPath, 0o644); err != nil {
+		return nil, fmt.Errorf("set staged snapshot permissions: %w", err)
+	}
+	if err := validateSQLiteFile(stagedPath); err != nil {
+		return nil, fmt.Errorf("invalid snapshot: %w", err)
 	}
 
-	// Write snapshot
-	if err := os.WriteFile(dbPath, snapshot.Data, 0644); err != nil {
-		os.Rename(backupPath, dbPath)
+	err = db.WithMaintenanceLock(baseDir, func() error {
+		// Merge every committed WAL frame while no other cooperating td writer
+		// can enter. A busy result means another connection still has SQLite
+		// pinned; abort without touching the live generation.
+		if err := checkpointSQLiteForReplacement(database); err != nil {
+			return fmt.Errorf("prepare database replacement: %w", err)
+		}
+		if err := database.Close(); err != nil {
+			return fmt.Errorf("close database for replacement: %w", err)
+		}
+
+		if err := copyFile(dbPath, backupPath); err != nil {
+			return fmt.Errorf("backup db: %w", err)
+		}
+
+		// The last SQLite connection removes clean WAL/SHM sidecars on close. If
+		// either still exists, another connection may still reference the old
+		// inode/generation. Do not delete them and rename underneath that process;
+		// fail closed and let the user stop it before retrying.
+		if err := requireSQLiteSidecarsAbsent(dbPath); err != nil {
+			return err
+		}
+
+		if err := os.Rename(stagedPath, dbPath); err != nil {
+			return fmt.Errorf("install snapshot: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		// The original file remains installed for every failure before Rename.
 		reopened, reopenErr := db.Open(baseDir)
 		if reopenErr != nil {
-			return nil, fmt.Errorf("write failed (%w) and reopen failed: %v", err, reopenErr)
+			return nil, fmt.Errorf("replacement failed (%w) and reopen failed: %v", err, reopenErr)
 		}
-		return reopened, fmt.Errorf("write snapshot: %w", err)
+		return reopened, err
 	}
 
-	// Reopen and update sync_state
+	// Open only after releasing the maintenance lock: db.Open runs migrations,
+	// which acquire the same non-reentrant cross-process lock.
 	reopened, err := db.Open(baseDir)
 	if err != nil {
-		os.Rename(backupPath, dbPath)
-		reopened2, reopenErr := db.Open(baseDir)
-		if reopenErr != nil {
-			return nil, fmt.Errorf("reopen failed (%w) and restore reopen failed: %v", err, reopenErr)
+		restored, restoreErr := restoreBootstrapBackup(baseDir, dbPath, backupPath)
+		if restoreErr != nil {
+			return nil, fmt.Errorf("reopen failed (%w) and restore failed: %v", err, restoreErr)
 		}
-		return reopened2, fmt.Errorf("reopen after bootstrap: %w", err)
+		return restored, fmt.Errorf("reopen after bootstrap: %w", err)
 	}
 
-	// Use INSERT OR REPLACE since the snapshot DB may not have a sync_state row
+	// Use INSERT OR REPLACE since the snapshot may not contain sync_state.
 	_, err = reopened.Conn().Exec(
 		`INSERT OR REPLACE INTO sync_state (project_id, last_pulled_server_seq, last_pushed_action_id, last_sync_at, sync_disabled)
 		 VALUES (?, ?, 0, CURRENT_TIMESTAMP, 0)`,
 		state.ProjectID, snapshot.SnapshotSeq,
 	)
 	if err != nil {
-		reopened.Close()
-		os.Rename(backupPath, dbPath)
-		reopened2, reopenErr := db.Open(baseDir)
-		if reopenErr != nil {
-			return nil, fmt.Errorf("sync_state update failed (%w) and restore reopen failed: %v", err, reopenErr)
+		_ = reopened.Close()
+		restored, restoreErr := restoreBootstrapBackup(baseDir, dbPath, backupPath)
+		if restoreErr != nil {
+			return nil, fmt.Errorf("sync_state update failed (%w) and restore failed: %v", err, restoreErr)
 		}
-		return reopened2, fmt.Errorf("update sync_state: %w", err)
+		return restored, fmt.Errorf("update sync_state: %w", err)
 	}
 
 	fmt.Printf("Bootstrap complete (seq %d).\n", snapshot.SnapshotSeq)
+	return reopened, nil
+}
+
+func validateSQLiteFile(path string) error {
+	conn, err := db.OpenSQLite(path, db.OpenOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	database := db.NewWithConn(conn, filepath.Dir(path))
+	defer func() { _ = database.Close() }()
+	return database.QuickCheck()
+}
+
+func checkpointSQLiteForReplacement(database *db.DB) error {
+	var busy, logFrames, checkpointedFrames int
+	if err := database.Conn().QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(
+		&busy, &logFrames, &checkpointedFrames,
+	); err != nil {
+		return fmt.Errorf("checkpoint WAL: %w", err)
+	}
+	if busy != 0 || checkpointedFrames < logFrames {
+		return fmt.Errorf("database is busy (WAL frames=%d, checkpointed=%d); retry after other td processes exit",
+			logFrames, checkpointedFrames)
+	}
+	return nil
+}
+
+func requireSQLiteSidecarsAbsent(dbPath string) error {
+	for _, suffix := range []string{"-wal", "-shm"} {
+		path := dbPath + suffix
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("refusing database replacement while %s exists; stop other td processes and retry", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func restoreBootstrapBackup(baseDir, dbPath, backupPath string) (*db.DB, error) {
+	if err := db.WithMaintenanceLock(baseDir, func() error {
+		// Do not restore underneath a process that opened the new generation
+		// during the unlocked db.Open/update window. Preserve both files and
+		// surface the error for manual recovery instead.
+		if err := requireSQLiteSidecarsAbsent(dbPath); err != nil {
+			return err
+		}
+		if err := os.Rename(backupPath, dbPath); err != nil {
+			return fmt.Errorf("restore backup: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	// As in installation, open after releasing the non-reentrant lock.
+	reopened, err := db.Open(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("reopen restored backup: %w", err)
+	}
 	return reopened, nil
 }
 
@@ -270,13 +385,13 @@ func copyFile(src, dst string) error {
 		}
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 
 	if _, err = io.Copy(out, in); err != nil {
 		return err
@@ -304,7 +419,7 @@ func filterEventsForSync(events []tdsync.Event, validator tdsync.EntityValidator
 }
 
 func runPush(database *db.DB, client *syncclient.Client, state *db.SyncState, deviceID string) error {
-	sess, err := session.Get(database)
+	sess, err := session.GetOrCreate(database)
 	if err != nil {
 		output.Error("get session: %v", err)
 		return err
@@ -316,7 +431,7 @@ func runPush(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 		output.Error("begin tx: %v", err)
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	events, err := tdsync.GetPendingEvents(tx, deviceID, sess.ID)
 	if err != nil {
@@ -443,6 +558,7 @@ func runPull(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 	totalPulled := 0
 	totalApplied := 0
 	totalOverwrites := 0
+	totalSkipped := 0
 	var allConflicts []tdsync.ConflictRecord
 
 	for {
@@ -492,21 +608,36 @@ func runPull(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 
 		result, err := tdsync.ApplyRemoteEvents(tx, events, deviceID, syncEntityValidator, state.LastSyncAt)
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
+			output.Error("apply events: %v", err)
+			return err
+		}
+		if err := failedRemoteEventsError(result); err != nil {
+			_ = tx.Rollback()
 			output.Error("apply events: %v", err)
 			return err
 		}
 
 		// Store conflict records
 		if err := storeConflicts(tx, result.Conflicts); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			output.Error("store conflicts: %v", err)
 			return err
 		}
 
+		// Record deliberate drops and quarantined events with the same commit
+		// that advances the cursor past them.
+		skipped := resolveApplyOutcome(result)
+		if err := db.RecordSkippedEventsTx(tx, skipped); err != nil {
+			_ = tx.Rollback()
+			output.Error("record skipped events: %v", err)
+			return err
+		}
+		totalSkipped += len(skipped)
+
 		// Update sync_state within the same transaction to avoid race
 		if _, err := tx.Exec(`UPDATE sync_state SET last_pulled_server_seq = ?, last_sync_at = CURRENT_TIMESTAMP`, pullResp.LastServerSeq); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			output.Error("update sync state: %v", err)
 			return err
 		}
@@ -548,6 +679,9 @@ func runPull(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 		fmt.Println("Nothing to pull.")
 	} else {
 		fmt.Printf("Pulled %d events (%d applied).\n", totalPulled, totalApplied)
+		if totalSkipped > 0 {
+			output.Warning("%d remote event(s) skipped and recorded; see `td sync status`", totalSkipped)
+		}
 		if totalOverwrites > 0 {
 			output.Warning("%d local records overwritten by remote changes:", totalOverwrites)
 			maxShow := 10
@@ -563,6 +697,41 @@ func runPull(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 	return nil
 }
 
+// failedRemoteEventsError reports the failures that must abort a pull batch.
+// Thin wrapper over tdsync.ResolvePullOutcome, which owns the rule.
+func failedRemoteEventsError(result tdsync.ApplyResult) error {
+	return tdsync.ResolvePullOutcome(result).Abort
+}
+
+// resolveApplyOutcome returns the events to durably record as skipped: the
+// deliberate drops plus any permanently-failed events being quarantined.
+//
+// Quarantining advances the cursor past an event that can never apply, which is
+// what keeps the rest of the stream flowing. Nothing is discarded — every entry
+// lands in sync_skipped_events with its error and server_seq and shows up in
+// `td sync status`.
+func resolveApplyOutcome(result tdsync.ApplyResult) []db.SkippedSyncEvent {
+	outcome := tdsync.ResolvePullOutcome(result)
+	var out []db.SkippedSyncEvent
+	for _, s := range outcome.Record {
+		if s.Reason == tdsync.SkipReasonQuarantined {
+			slog.Warn("sync: quarantined unappliable remote event",
+				"seq", s.ServerSeq, "entity", s.EntityType+"/"+s.EntityID, "err", s.Detail)
+		}
+		out = append(out, db.SkippedSyncEvent{
+			ServerSeq:  s.ServerSeq,
+			DeviceID:   s.DeviceID,
+			ActionType: s.ActionType,
+			EntityType: s.EntityType,
+			EntityID:   s.EntityID,
+			Reason:     s.Reason,
+			Error:      s.Detail,
+			Payload:    string(s.Payload),
+		})
+	}
+	return out
+}
+
 // storeConflicts inserts conflict records into the sync_conflicts table.
 func storeConflicts(tx *sql.Tx, conflicts []tdsync.ConflictRecord) error {
 	if len(conflicts) == 0 {
@@ -573,7 +742,7 @@ func storeConflicts(tx *sql.Tx, conflicts []tdsync.ConflictRecord) error {
 	if err != nil {
 		return fmt.Errorf("prepare conflict insert: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	for _, c := range conflicts {
 		localJSON := "null"
@@ -591,9 +760,104 @@ func storeConflicts(tx *sql.Tx, conflicts []tdsync.ConflictRecord) error {
 	return nil
 }
 
+// syncEnableCmd / syncDisableCmd flip the GLOBAL autosync master switch in
+// ~/.config/td/config.json (sync.autosync). They are registered UNGATED (as
+// subcommands of syncCmd) so a user can always turn sync back on even when the
+// SyncCLI feature is otherwise off — the parent `td sync` being feature-gated
+// would otherwise strand a user who had disabled sync.
+var syncEnableCmd = &cobra.Command{
+	Use:   "enable",
+	Short: "Clear the global autosync kill-switch (sync.autosync=true in config.json)",
+	Long: `Sets the global autosync master switch to true in ~/.config/td/config.json.
+
+This clears any global kill-switch so per-project sync configuration decides
+whether autosync runs. It does NOT force-enable sync on an unconfigured
+project. Works regardless of shell-init semantics (unlike TD_* env vars).`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := syncconfig.SetGlobalAutosyncOverride(true); err != nil {
+			output.Error("write config: %v", err)
+			return err
+		}
+		output.Success("global autosync enabled (sync.autosync=true)")
+		if v := syncconfig.GetGlobalAutosyncOverride(); v == nil || !*v {
+			output.Warning("a TD_* env var is overriding config.json; unset it to take effect")
+		}
+		return nil
+	},
+}
+
+var syncDisableCmd = &cobra.Command{
+	Use:   "disable",
+	Short: "Engage the global autosync kill-switch (sync.autosync=false in config.json)",
+	Long: `Sets the global autosync master switch to false in ~/.config/td/config.json.
+
+This is a shell-independent kill-switch: every td process reads config.json, so
+autosync is suppressed everywhere regardless of which shell-init files are
+sourced. Re-enable with: td sync enable.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := syncconfig.SetGlobalAutosyncOverride(false); err != nil {
+			output.Error("write config: %v", err)
+			return err
+		}
+		output.Success("global autosync disabled (sync.autosync=false)")
+		if v := syncconfig.GetGlobalAutosyncOverride(); v == nil || *v {
+			output.Warning("a TD_* env var is overriding config.json; unset it to take effect")
+		}
+		return nil
+	},
+}
+
+// syncAlwaysOnCmd is a minimal `td sync` parent used ONLY when the full,
+// feature-gated syncCmd is not registered (SyncCLI off). It exists so the
+// global kill-switch subcommands `enable`/`disable` remain reachable — a user
+// who disabled sync must always be able to turn it back on without hand-editing
+// config.json. (td-78b482 will ungate status/doctor separately under the same
+// always-on surface.)
+var syncAlwaysOnCmd = &cobra.Command{
+	Use:     "sync",
+	Short:   "Sync local data with remote server",
+	GroupID: "system",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return cmd.Help()
+	},
+}
+
+// wireSyncCommands attaches the always-reachable sync subcommands (enable,
+// disable and the read-only status diagnostic) to exactly one `td sync` parent
+// and returns that parent for registration on the root command.
+//
+// enable/disable and status must be reachable regardless of the SyncCLI gate:
+// a user who disabled sync has to be able to turn it back on, and `status` is
+// the first diagnostic to reach for when sync looks stuck. They go on the full
+// syncCmd when SyncCLI is on, else on the minimal always-on parent — exactly
+// one, never both, since double-registration would leave a command with the
+// wrong parent. (td-78b482)
+//
+// The gate is a parameter rather than a call to features.IsEnabledForProcess so
+// that both branches are testable in a single process. init() runs against the
+// ambient env before any test does, so a test that only inspects the resulting
+// command tree can only ever observe whichever branch the developer's shell
+// happened to select. (td-6fda71)
+func wireSyncCommands(syncCLIEnabled bool, full, alwaysOn *cobra.Command, subs ...*cobra.Command) *cobra.Command {
+	parent := alwaysOn
+	if syncCLIEnabled {
+		parent = full
+	}
+	for _, sub := range subs {
+		parent.AddCommand(sub)
+	}
+	return parent
+}
+
 func init() {
 	syncCmd.Flags().Bool("push", false, "Push only")
 	syncCmd.Flags().Bool("pull", false, "Pull only")
 	syncCmd.Flags().Bool("status", false, "Show sync status only")
-	AddFeatureGatedCommand(features.SyncCLI.Name, syncCmd)
+
+	parent := wireSyncCommands(
+		features.IsEnabledForProcess(features.SyncCLI.Name),
+		syncCmd, syncAlwaysOnCmd,
+		syncEnableCmd, syncDisableCmd, syncStatusCmd,
+	)
+	rootCmd.AddCommand(parent)
 }

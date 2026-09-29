@@ -9,7 +9,6 @@ import (
 
 	"regexp"
 
-	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/output"
@@ -41,19 +40,30 @@ Supports stdin input for multi-line messages or piped input:
 	Args:    cobra.MaximumNArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		baseDir := getBaseDir()
+		isJSON := jsonMode(cmd)
+
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
 
 		database, err := db.Open(baseDir)
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
+			// Uncoded on purpose: db.Open's failures carry
+			// db.ErrDatabaseUnavailable, which topLevelErrorCode maps to
+			// database_error for every command at once.
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
+		scope := currentStateScope(baseDir, sess)
 
 		// Parse args to determine issue ID and message
 		var issueID string
@@ -84,7 +94,7 @@ Supports stdin input for multi-line messages or piped input:
 					reader := bufio.NewReader(os.Stdin)
 					data, err := io.ReadAll(reader)
 					if err != nil {
-						output.Error("failed to read stdin: %v", err)
+						emitErr("failed to read stdin: %v", err)
 						return err
 					}
 					message = strings.TrimSpace(string(data))
@@ -103,10 +113,12 @@ Supports stdin input for multi-line messages or piped input:
 				issueID, _ = cmd.Flags().GetString("task")
 			}
 			if issueID == "" {
-				issueID, err = config.GetFocus(baseDir)
+				issueID, err = database.GetFocus(scope)
 				if err != nil || issueID == "" {
-					output.Error("no issue specified and no focused issue")
-					fmt.Fprintln(os.Stderr, "  Use: td log <id> \"message\"  OR  td start <id> first")
+					emitErr("no issue specified and no focused issue")
+					if !isJSON {
+						fmt.Fprintln(os.Stderr, "  Use: td log <id> \"message\"  OR  td start <id> first")
+					}
 					return fmt.Errorf("no issue specified")
 				}
 			}
@@ -119,7 +131,7 @@ Supports stdin input for multi-line messages or piped input:
 				reader := bufio.NewReader(os.Stdin)
 				data, err := io.ReadAll(reader)
 				if err != nil {
-					output.Error("failed to read stdin: %v", err)
+					emitErr("failed to read stdin: %v", err)
 					return err
 				}
 				message = strings.TrimSpace(string(data))
@@ -127,14 +139,16 @@ Supports stdin input for multi-line messages or piped input:
 		}
 
 		if message == "" {
-			output.Error("no message provided. Use: td log \"message\" or pipe input")
+			emitErr("no message provided. Use: td log \"message\" or pipe input")
 			return fmt.Errorf("no message provided")
 		}
 
 		// Verify issue exists
 		_, err = database.GetIssue(issueID)
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
+			// Uncoded on purpose: GetIssue's miss carries db.ErrIssueNotFound,
+			// which topLevelErrorCode maps to not_found.
 			return err
 		}
 
@@ -163,7 +177,7 @@ Supports stdin input for multi-line messages or piped input:
 		}
 
 		// Get active work session if any
-		wsID, _ := config.GetActiveWorkSession(baseDir)
+		wsID, _ := database.GetActiveWorkSession(scope)
 
 		log := &models.Log{
 			IssueID:       issueID,
@@ -174,8 +188,15 @@ Supports stdin input for multi-line messages or piped input:
 		}
 
 		if err := database.AddLog(log); err != nil {
-			output.Error("failed to add log: %v", err)
+			emitErr("failed to add log: %v", err)
 			return err
+		}
+
+		if isJSON {
+			return output.EmitResult("logged", map[string]any{
+				"id":  issueID,
+				"log": log,
+			})
 		}
 
 		fmt.Printf("LOGGED %s%s\n", issueID, typeLabel)

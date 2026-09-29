@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/git"
 	"github.com/marcus/td/internal/input"
@@ -39,16 +38,17 @@ var wsStartCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
 			output.Error("%v", err)
 			return err
 		}
+		scope := currentStateScope(baseDir, sess)
 
 		// Check for existing active work session
-		activeWS, _ := config.GetActiveWorkSession(baseDir)
+		activeWS, _ := database.GetActiveWorkSession(scope)
 		if activeWS != "" {
 			output.Error("work session already active: %s", activeWS)
 			return fmt.Errorf("work session already active")
@@ -75,7 +75,7 @@ var wsStartCmd = &cobra.Command{
 		}
 
 		// Set as active
-		config.SetActiveWorkSession(baseDir, ws.ID)
+		_ = database.SetActiveWorkSession(scope, ws.ID)
 
 		fmt.Printf("WORK SESSION STARTED: %s\n", ws.ID)
 		fmt.Printf("Name: %s\n", name)
@@ -100,15 +100,16 @@ var wsTagCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
 			output.Error("%v", err)
 			return err
 		}
+		scope := currentStateScope(baseDir, sess)
 
-		wsID, _ := config.GetActiveWorkSession(baseDir)
+		wsID, _ := database.GetActiveWorkSession(scope)
 		if wsID == "" {
 			output.Error("no active work session. Run 'td ws start <name>' first")
 			return fmt.Errorf("no active work session")
@@ -141,13 +142,13 @@ var wsTagCmd = &cobra.Command{
 				}
 				issue.Status = models.StatusInProgress
 				issue.ImplementerSession = sess.ID
-				database.UpdateIssueLogged(issue, sess.ID, models.ActionStart)
+				_ = database.UpdateIssueLogged(issue, sess.ID, models.ActionStart)
 
 				// Record session action for bypass prevention
-				database.RecordSessionAction(issueID, sess.ID, models.ActionSessionStarted)
+				_ = database.RecordSessionAction(issueID, sess.ID, models.ActionSessionStarted)
 
 				// Log the start
-				database.AddLog(&models.Log{
+				_ = database.AddLog(&models.Log{
 					IssueID:       issueID,
 					SessionID:     sess.ID,
 					WorkSessionID: wsID,
@@ -158,7 +159,7 @@ var wsTagCmd = &cobra.Command{
 				// Capture git state
 				gitState, _ := git.GetState()
 				if gitState != nil {
-					database.AddGitSnapshot(&models.GitSnapshot{
+					_ = database.AddGitSnapshot(&models.GitSnapshot{
 						IssueID:    issueID,
 						Event:      "start",
 						CommitSHA:  gitState.CommitSHA,
@@ -187,15 +188,16 @@ var wsUntagCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
 			output.Error("%v", err)
 			return err
 		}
+		scope := currentStateScope(baseDir, sess)
 
-		wsID, _ := config.GetActiveWorkSession(baseDir)
+		wsID, _ := database.GetActiveWorkSession(scope)
 		if wsID == "" {
 			output.Error("no active work session")
 			return fmt.Errorf("no active work session")
@@ -227,15 +229,16 @@ var wsLogCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
 			output.Error("%v", err)
 			return err
 		}
+		scope := currentStateScope(baseDir, sess)
 
-		wsID, _ := config.GetActiveWorkSession(baseDir)
+		wsID, _ := database.GetActiveWorkSession(scope)
 		if wsID == "" {
 			output.Error("no active work session")
 			return fmt.Errorf("no active work session")
@@ -266,7 +269,7 @@ var wsLogCmd = &cobra.Command{
 		only, _ := cmd.Flags().GetString("only")
 		if only != "" {
 			// Log to specific issue only
-			database.AddLog(&models.Log{
+			_ = database.AddLog(&models.Log{
 				IssueID:       only,
 				SessionID:     sess.ID,
 				WorkSessionID: wsID,
@@ -276,7 +279,7 @@ var wsLogCmd = &cobra.Command{
 			fmt.Printf("LOGGED %s%s → %s\n", wsID, typeLabel, only)
 		} else {
 			// Store single log entry with work_session_id, no issue_id
-			database.AddLog(&models.Log{
+			_ = database.AddLog(&models.Log{
 				IssueID:       "",
 				SessionID:     sess.ID,
 				WorkSessionID: wsID,
@@ -308,9 +311,15 @@ var wsCurrentCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
-		wsID, _ := config.GetActiveWorkSession(baseDir)
+		_, scope, err := getCurrentStateSession(database, baseDir)
+		if err != nil {
+			output.Error("%v", err)
+			return err
+		}
+
+		wsID, _ := database.GetActiveWorkSession(scope)
 		if wsID == "" {
 			fmt.Println("No active work session")
 			return nil
@@ -322,7 +331,7 @@ var wsCurrentCmd = &cobra.Command{
 			return err
 		}
 
-		jsonOutput, _ := cmd.Flags().GetBool("json")
+		jsonOutput := jsonMode(cmd)
 
 		// Get tagged issues
 		issueIDs, _ := database.GetWorkSessionIssues(wsID)
@@ -330,7 +339,7 @@ var wsCurrentCmd = &cobra.Command{
 		if jsonOutput {
 			result := map[string]interface{}{
 				"work_session": ws,
-				"issues":       issueIDs,
+				"issues":       jsonList(issueIDs),
 			}
 			return output.JSON(result)
 		}
@@ -413,15 +422,16 @@ Flags support values, stdin (-), or file (@path):
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
 			output.Error("%v", err)
 			return err
 		}
+		scope := currentStateScope(baseDir, sess)
 
-		wsID, _ := config.GetActiveWorkSession(baseDir)
+		wsID, _ := database.GetActiveWorkSession(scope)
 		if wsID == "" {
 			output.Error("no active work session")
 			return fmt.Errorf("no active work session")
@@ -489,12 +499,12 @@ Flags support values, stdin (-), or file (@path):
 				Uncertain: handoff.Uncertain,
 			}
 
-			database.AddHandoff(issueHandoff)
+			_ = database.AddHandoff(issueHandoff)
 
 			// Capture git state
 			gitState, _ := git.GetState()
 			if gitState != nil {
-				database.AddGitSnapshot(&models.GitSnapshot{
+				_ = database.AddGitSnapshot(&models.GitSnapshot{
 					IssueID:    issueID,
 					Event:      "handoff",
 					CommitSHA:  gitState.CommitSHA,
@@ -517,8 +527,8 @@ Flags support values, stdin (-), or file (@path):
 				ws.EndSHA = gitState.CommitSHA
 			}
 
-			database.UpdateWorkSession(ws)
-			config.ClearActiveWorkSession(baseDir)
+			_ = database.UpdateWorkSession(ws)
+			_ = database.ClearActiveWorkSession(scope)
 		}
 
 		fmt.Printf("HANDOFF RECORDED %s\n", wsID)
@@ -568,9 +578,15 @@ var wsEndCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
-		wsID, _ := config.GetActiveWorkSession(baseDir)
+		_, scope, err := getCurrentStateSession(database, baseDir)
+		if err != nil {
+			output.Error("%v", err)
+			return err
+		}
+
+		wsID, _ := database.GetActiveWorkSession(scope)
 		if wsID == "" {
 			output.Error("no active work session")
 			return fmt.Errorf("no active work session")
@@ -588,8 +604,8 @@ var wsEndCmd = &cobra.Command{
 		// End session
 		now := time.Now()
 		ws.EndedAt = &now
-		database.UpdateWorkSession(ws)
-		config.ClearActiveWorkSession(baseDir)
+		_ = database.UpdateWorkSession(ws)
+		_ = database.ClearActiveWorkSession(scope)
 
 		output.Warning("No handoff recorded for %s", wsID)
 		if len(issueIDs) > 0 {
@@ -599,6 +615,16 @@ var wsEndCmd = &cobra.Command{
 
 		return nil
 	},
+}
+
+// wsListEntry is one row of `td ws list`. It embeds models.WorkSession so the
+// session's own fields are inlined unchanged — a session from `ws list --json`
+// is field-for-field the one `ws current --json` returns — and adds the two
+// derived facts the human line shows.
+type wsListEntry struct {
+	models.WorkSession
+	Issues []string `json:"issues"`
+	Status string   `json:"status"` // active | completed | abandoned
 }
 
 var wsListCmd = &cobra.Command{
@@ -612,9 +638,15 @@ var wsListCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
-		activeWS, _ := config.GetActiveWorkSession(baseDir)
+		_, scope, err := getCurrentStateSession(database, baseDir)
+		if err != nil {
+			output.Error("%v", err)
+			return err
+		}
+
+		activeWS, _ := database.GetActiveWorkSession(scope)
 
 		sessions, err := database.ListWorkSessions(20)
 		if err != nil {
@@ -622,24 +654,41 @@ var wsListCmd = &cobra.Command{
 			return err
 		}
 
+		var entries []wsListEntry
 		for _, ws := range sessions {
 			issues, _ := database.GetWorkSessionIssues(ws.ID)
-			issueStr := strings.Join(issues, ",")
 
-			status := "[completed]"
+			status := "completed"
 			if ws.EndedAt == nil {
 				if ws.ID == activeWS {
-					status = "[active]"
+					status = "active"
 				} else {
-					status = "[abandoned]"
+					status = "abandoned"
 				}
 			}
 
-			fmt.Printf("%s  \"%s\"  %s  %s  %s\n",
-				ws.ID, ws.Name, output.FormatTimeAgo(ws.StartedAt), issueStr, status)
+			entries = append(entries, wsListEntry{
+				WorkSession: ws,
+				Issues:      jsonList(issues),
+				Status:      status,
+			})
 		}
 
-		if len(sessions) == 0 {
+		// Bare array of work sessions, each carrying the two facts the human
+		// line derives but the model does not store: the tagged issue ids
+		// (named "issues" as in `td ws current --json`) and the resolved
+		// active/completed/abandoned status.
+		if jsonMode(cmd) {
+			return output.JSON(jsonList(entries))
+		}
+
+		for _, entry := range entries {
+			fmt.Printf("%s  \"%s\"  %s  %s  [%s]\n",
+				entry.ID, entry.Name, output.FormatTimeAgo(entry.StartedAt),
+				strings.Join(entry.Issues, ","), entry.Status)
+		}
+
+		if len(entries) == 0 {
 			fmt.Println("No work sessions")
 		}
 
@@ -659,7 +708,7 @@ var wsShowCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		wsID := args[0]
 		ws, err := database.GetWorkSession(wsID)
@@ -863,8 +912,6 @@ func init() {
 	wsLogCmd.Flags().Bool("tried", false, "Mark as attempted approach")
 	wsLogCmd.Flags().Bool("result", false, "Mark as result")
 	wsLogCmd.Flags().String("only", "", "Log to specific issue only")
-
-	wsCurrentCmd.Flags().Bool("json", false, "JSON output")
 
 	wsTagCmd.Flags().Bool("no-start", false, "Tag without starting (don't change status to in_progress)")
 

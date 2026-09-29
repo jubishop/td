@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/marcus/td/internal/db"
 )
@@ -16,7 +17,7 @@ func setupTestDB(t *testing.T) *db.DB {
 	if err != nil {
 		t.Fatalf("init db: %v", err)
 	}
-	t.Cleanup(func() { database.Close() })
+	t.Cleanup(func() { _ = database.Close() })
 	return database
 }
 
@@ -95,13 +96,184 @@ func TestForceNewSessionAlwaysCreatesNew(t *testing.T) {
 	}
 }
 
+// TestContextIDKeysDistinctSessions verifies that two execution contexts that
+// share the same branch + agent fingerprint but differ only in TD_CONTEXT_ID
+// resolve to DISTINCT sessions (Failure Mode #6). TD_SESSION_ID is held fixed
+// so the agent fingerprint is identical across both calls.
+func TestContextIDKeysDistinctSessions(t *testing.T) {
+	database := setupTestDB(t)
+
+	t.Setenv("TD_SESSION_ID", "shared-agent")
+
+	t.Setenv("TD_CONTEXT_ID", "ctx-a")
+	sa, err := GetOrCreate(database)
+	if err != nil {
+		t.Fatalf("GetOrCreate ctx-a: %v", err)
+	}
+
+	t.Setenv("TD_CONTEXT_ID", "ctx-b")
+	sb, err := GetOrCreate(database)
+	if err != nil {
+		t.Fatalf("GetOrCreate ctx-b: %v", err)
+	}
+
+	if sa.ID == sb.ID {
+		t.Fatalf("expected distinct sessions for different TD_CONTEXT_ID, both got %q", sa.ID)
+	}
+	if !sb.IsNew {
+		t.Fatalf("expected IsNew=true for the second context's session")
+	}
+	if sa.MatchContextID != "ctx-a" || sb.MatchContextID != "ctx-b" {
+		t.Fatalf("match context not stored: a=%q b=%q", sa.MatchContextID, sb.MatchContextID)
+	}
+}
+
+// TestEmptyContextIDPreservesBehavior verifies that with TD_CONTEXT_ID unset the
+// behavior is identical to before: repeated GetOrCreate reuses one session.
+func TestEmptyContextIDPreservesBehavior(t *testing.T) {
+	database := setupTestDB(t)
+
+	t.Setenv("TD_SESSION_ID", "interactive-agent")
+	_ = os.Unsetenv("TD_CONTEXT_ID") // ensure empty match context
+
+	s1, err := GetOrCreate(database)
+	if err != nil {
+		t.Fatalf("GetOrCreate (1): %v", err)
+	}
+	if !s1.IsNew {
+		t.Fatalf("expected IsNew=true on first create")
+	}
+	if s1.MatchContextID != "" {
+		t.Fatalf("expected empty match context, got %q", s1.MatchContextID)
+	}
+
+	s2, err := GetOrCreate(database)
+	if err != nil {
+		t.Fatalf("GetOrCreate (2): %v", err)
+	}
+	if s1.ID != s2.ID {
+		t.Fatalf("expected same session reused, got %q vs %q", s1.ID, s2.ID)
+	}
+	if s2.IsNew {
+		t.Fatalf("expected IsNew=false when reusing session")
+	}
+}
+
+// TestContextIDSessionRefound verifies that a session created under a given
+// TD_CONTEXT_ID is re-found (not recreated) on a later GetOrCreate with the
+// same TD_CONTEXT_ID — i.e. the stored and lookup context use the same
+// normalization.
+func TestContextIDSessionRefound(t *testing.T) {
+	database := setupTestDB(t)
+
+	t.Setenv("TD_SESSION_ID", "refound-agent")
+	t.Setenv("TD_CONTEXT_ID", "foo")
+
+	s1, err := GetOrCreate(database)
+	if err != nil {
+		t.Fatalf("GetOrCreate (create): %v", err)
+	}
+	if !s1.IsNew {
+		t.Fatalf("expected IsNew=true on first create")
+	}
+
+	s2, err := GetOrCreate(database)
+	if err != nil {
+		t.Fatalf("GetOrCreate (refind): %v", err)
+	}
+	if s2.IsNew {
+		t.Fatalf("expected existing session to be re-found, not recreated")
+	}
+	if s1.ID != s2.ID {
+		t.Fatalf("expected same session ID for same context, got %q vs %q", s1.ID, s2.ID)
+	}
+}
+
+func TestGetOrCreateDifferentWorktreesDifferentSessions(t *testing.T) {
+	database := setupTestDB(t)
+
+	wtA := t.TempDir()
+	wtB := t.TempDir()
+
+	t.Setenv("TD_SESSION_ID", "same-agent")
+	t.Setenv("TD_CONTEXT_ID", "same-context")
+
+	chdir(t, wtA)
+	sa, err := GetOrCreate(database)
+	if err != nil {
+		t.Fatalf("GetOrCreate wtA: %v", err)
+	}
+
+	chdir(t, wtB)
+	sb, err := GetOrCreate(database)
+	if err != nil {
+		t.Fatalf("GetOrCreate wtB: %v", err)
+	}
+
+	if sa.ID == sb.ID {
+		t.Fatalf("same branch/fingerprint/context in different worktrees should create distinct sessions, both got %q", sa.ID)
+	}
+	if sa.WorktreeID == "" || sb.WorktreeID == "" {
+		t.Fatalf("expected worktree ids, got a=%q b=%q", sa.WorktreeID, sb.WorktreeID)
+	}
+	if sa.WorktreeID == sb.WorktreeID {
+		t.Fatalf("expected distinct worktree ids, both got %q", sa.WorktreeID)
+	}
+}
+
+func TestGetOrCreateFindsLegacyEmptyWorktreeSession(t *testing.T) {
+	database := setupTestDB(t)
+
+	wt := t.TempDir()
+	chdir(t, wt)
+
+	t.Setenv("TD_SESSION_ID", "legacy-agent")
+	t.Setenv("TD_CONTEXT_ID", "legacy-context")
+
+	now := time.Now().Truncate(time.Second)
+	legacy := &db.SessionRow{
+		ID:             "ses_legacywt",
+		Branch:         defaultBranch,
+		AgentType:      "explicit_legacy-agent",
+		AgentPID:       0,
+		MatchContextID: "legacy-context",
+		StartedAt:      now,
+		LastActivity:   now,
+	}
+	if err := database.UpsertSession(legacy); err != nil {
+		t.Fatalf("upsert legacy session: %v", err)
+	}
+
+	sess, err := GetOrCreate(database)
+	if err != nil {
+		t.Fatalf("GetOrCreate: %v", err)
+	}
+	if sess.ID != legacy.ID {
+		t.Fatalf("expected legacy session to be re-found, got %q want %q", sess.ID, legacy.ID)
+	}
+	if sess.IsNew {
+		t.Fatalf("legacy fallback should reuse the old row")
+	}
+	if sess.WorktreeID == "" {
+		t.Fatalf("legacy fallback should backfill worktree_id")
+	}
+
+	row, err := database.GetSessionByID(legacy.ID)
+	if err != nil {
+		t.Fatalf("GetSessionByID: %v", err)
+	}
+	if row.WorktreeID != sess.WorktreeID {
+		t.Fatalf("database worktree_id not backfilled: got %q want %q", row.WorktreeID, sess.WorktreeID)
+	}
+}
+
 func TestMigrateLegacySessionCleanupOldFile(t *testing.T) {
 	baseDir := t.TempDir()
 	database, err := db.Initialize(baseDir)
 	if err != nil {
 		t.Fatalf("init db: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	t.Setenv("TD_SESSION_ID", "agent-1")
 
@@ -133,13 +305,27 @@ func TestMigrateLegacySessionCleanupOldFile(t *testing.T) {
 	}
 }
 
+func chdir(t *testing.T, dir string) {
+	t.Helper()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get cwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir %s: %v", dir, err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(old)
+	})
+}
+
 func TestMigrateBranchSessionCleanupOldFile(t *testing.T) {
 	baseDir := t.TempDir()
 	database, err := db.Initialize(baseDir)
 	if err != nil {
 		t.Fatalf("init db: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	t.Setenv("TD_SESSION_ID", "agent-1")
 
@@ -232,7 +418,7 @@ func TestMigrationStatePreservation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("init db: %v", err)
 			}
-			defer database.Close()
+			defer func() { _ = database.Close() }()
 
 			t.Setenv("TD_SESSION_ID", "agent-preserve-test")
 
@@ -274,14 +460,14 @@ func TestSessionPersistsThroughDBReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreate: %v", err)
 	}
-	database.Close()
+	_ = database.Close()
 
 	// Reopen and verify
 	database2, err := db.Open(baseDir)
 	if err != nil {
 		t.Fatalf("reopen db: %v", err)
 	}
-	defer database2.Close()
+	defer func() { _ = database2.Close() }()
 
 	sess2, err := GetOrCreate(database2)
 	if err != nil {
@@ -365,7 +551,7 @@ func TestEdgeCasesSessionMigration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("init db: %v", err)
 			}
-			defer database.Close()
+			defer func() { _ = database.Close() }()
 
 			t.Setenv("TD_SESSION_ID", "agent-edge-case")
 
@@ -381,5 +567,27 @@ func TestEdgeCasesSessionMigration(t *testing.T) {
 				t.Fatalf("session should be valid")
 			}
 		})
+	}
+}
+
+// TestParseDurationRejectsOutOfRangeDays: `days * 24 * time.Hour` overflows
+// int64 nanoseconds past ~106751 days, and the wrapped value can land back in
+// positive territory — `213504d` became 25m26s. A duration that gates a
+// destructive sweep must never silently mean the opposite of what was typed.
+func TestParseDurationRejectsOutOfRangeDays(t *testing.T) {
+	for _, s := range []string{"213504d", "106752d", "9223372036854775807d"} {
+		if d, err := ParseDuration(s); err == nil {
+			t.Errorf("ParseDuration(%q) = %v, want an out-of-range error", s, d)
+		}
+	}
+	// The boundary still parses, and ordinary values are untouched.
+	if d, err := ParseDuration("106751d"); err != nil || d <= 0 {
+		t.Errorf("ParseDuration(106751d) = %v, %v", d, err)
+	}
+	if d, err := ParseDuration("30d"); err != nil || d != 30*24*time.Hour {
+		t.Errorf("ParseDuration(30d) = %v, %v", d, err)
+	}
+	if _, err := ParseDuration("banana"); err == nil {
+		t.Error("ParseDuration(banana) must fail")
 	}
 }

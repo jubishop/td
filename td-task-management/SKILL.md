@@ -13,13 +13,14 @@ description: Task management for AI agents across context windows. Use when agen
 
 ## Quick Start
 
-### Session Start (Every Time)
+### Starting a New Agent Context
 
 ```bash
-td usage --new-session  # Auto-rotation + see current state
+td usage --new-session -q  # Auto-rotate and show compact current state
 ```
 
-Output tells you:
+Use `td usage` without `-q` when workflow guidance would be useful. Status
+output includes:
 - Active work sessions and recent decisions
 - What issues are pending review (you can review these)
 - Highest priority open issues
@@ -37,7 +38,7 @@ td handoff <id> --done "..." --remaining "..."  # Capture state
 td review <id>                         # Submit for review
 ```
 
-### Multi-Issue Workflow (Recommended for Agents)
+### Multi-Issue Workflow
 
 For agents handling related issues:
 
@@ -68,7 +69,7 @@ td log "Started implementation"
 
 ### Workflow 2: Handing Off Work
 
-This is **critical** for agent-to-agent handoffs:
+Use a structured handoff when work will continue in another context:
 
 ```bash
 td handoff <id> \
@@ -79,8 +80,8 @@ td handoff <id> \
 ```
 
 Keys:
-- `--done` - What's actually complete (be honest)
-- `--remaining` - What's left (be specific)
+- `--done` - What is complete
+- `--remaining` - What remains
 - `--decision` - Why you chose approach X
 - `--uncertain` - What you're unsure about
 
@@ -97,12 +98,24 @@ td show <id>
 td context <id>
 
 # 3. Approve or reject
-td approve <id>
+# Independent review:
+td approve <id> --reason "Reviewed diff, looks good"
+# Or, in trusted mode, when you implemented it yourself:
+#   a sub-agent reviewed it — name them (no --reason needed):
+td approve <id> --reviewed-by "code-reviewer sub-agent"
+#   you reviewed it yourself — say so:
+td approve <id> --self-review --reason "Reviewed own diff, tests pass"
 # Or:
 td reject <id> --reason "Missing error handling"
 ```
 
-**Important:** You cannot approve work you implemented. Session isolation enforces this.
+Independent review is preferred when practical. The default `trusted` mode also
+lets an involved session approve by saying who reviewed the work: `--reviewed-by
+"<who>"` credits someone else, `--self-review --reason` owns it. Both are
+recorded and neither is verifiable by td, so never name a reviewer who did not
+review — that reads as independent in the audit trail, which is worse than an
+honest self-review. In `delegated` and `strict` an involved session cannot
+approve at all.
 
 ### Workflow 4: Handling Blockers
 
@@ -122,7 +135,7 @@ td context td-a1b2  # Refresh context when blocker resolves
 
 ### Checking Status
 - `td usage` - Current state, reviews, next steps
-- `td usage -q` - Compact view (after first read)
+- `td usage -q` - Compact current state
 - `td current` - What you're working on
 - `td ws current` - Current work session state
 - `td next` - Highest priority open
@@ -144,7 +157,10 @@ td context td-a1b2  # Refresh context when blocker resolves
 ### Reviews
 - `td review <id>` - Submit for review
 - `td reviewable` - Issues you can review
-- `td approve <id>` - Approve (different session only)
+- `td approve <id> --reason "..."` - Approve an independent review
+- `td approve <id> --reviewed-by "<who>"` - Record who reviewed it when that is not you (trusted mode)
+- `td approve <id> --self-review --reason "..."` - Acknowledge and record a trusted-mode self-review
+- `td approve <id> --record-only --reason "..."` - Attest without closing; any session closes after
 - `td reject <id> --reason "..."` - Reject
 
 ### Creating/Managing Issues
@@ -192,26 +208,30 @@ open → in_progress → in_review → closed
 
 ## Key Principles
 
-**Session Isolation:** Every terminal/context gets a unique session ID. The session that implements code cannot approve it. Different session must review. This forces actual handoffs and prevents "works on my context" bugs.
+**Session Isolation:** Every terminal/context gets a session ID for continuity
+and audit. Independent review is preferred; trusted mode also lets an involved
+session approve by recording who actually reviewed the work.
 
-**Structured Handoffs:** Don't just say "here's what I did"—structure it with done/remaining/decisions/uncertain so next agent has clear context.
+**Structured Handoffs:** Record done/remaining/decisions/uncertain when another
+context will need to continue the work.
 
 **Minimal:** Does one thing. Single binary, SQLite local storage (`.todos/`), no server, works with any AI tool.
 
 ## For AI Agents
 
-Always start conversation with:
+At the start of a new agent context:
 ```bash
-td usage --new-session
+td usage --new-session -q
 ```
 
-This auto-rotates sessions and gives you current state. Then:
+This auto-rotates sessions and gives you compact current state. Use judgment
+about how much tracking detail each task needs:
 
 1. **Single focused issue** → Use single-issue workflow
 2. **Multiple related issues** → Use `td ws start` for work sessions
-3. **Before context ends** → Always `td handoff` or `td ws handoff`
-4. **Log decisions** → Use `--decision` flag to explain reasoning
-5. **Log uncertainty** → Use `--uncertain` flag to mark unknowns
+3. **Work will continue elsewhere** → Use `td handoff` or `td ws handoff`
+4. **A decision aids continuity** → Log it with `--decision`
+5. **An uncertainty matters** → Record it with `--uncertain`
 6. **Track files** → Use `td link` so future sessions know what changed
 
 See [ai_agent_workflows.md](references/ai_agent_workflows.md) for detailed examples.

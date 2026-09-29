@@ -3,10 +3,13 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/models"
+	"github.com/spf13/pflag"
 )
 
 // TestParseHandoffInputEmpty tests parsing empty input
@@ -28,10 +31,12 @@ func TestHandoffRecordsData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{Title: "Test Issue", Status: models.StatusInProgress}
-	database.CreateIssue(issue)
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 
 	handoff := &models.Handoff{
 		IssueID:   issue.ID,
@@ -58,10 +63,12 @@ func TestHandoffRecordsGitSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{Title: "Test Issue", Status: models.StatusInProgress}
-	database.CreateIssue(issue)
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 
 	// Add handoff
 	handoff := &models.Handoff{
@@ -69,7 +76,9 @@ func TestHandoffRecordsGitSnapshot(t *testing.T) {
 		SessionID: "ses_test",
 		Done:      []string{"Work done"},
 	}
-	database.AddHandoff(handoff)
+	if err := database.AddHandoff(handoff); err != nil {
+		t.Fatal(err)
+	}
 
 	// Record git snapshot
 	snapshot := &models.GitSnapshot{
@@ -114,7 +123,7 @@ func TestHandoffRequiresIssueID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Try to get non-existent issue
 	_, err = database.GetIssue("td-nonexistent")
@@ -130,14 +139,18 @@ func TestHandoffUpdatesIssueTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{Title: "Test Issue", Status: models.StatusInProgress}
-	database.CreateIssue(issue)
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 	originalUpdatedAt := issue.UpdatedAt
 
 	// Update issue (as handoff command would)
-	database.UpdateIssue(issue)
+	if err := database.UpdateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 
 	retrieved, _ := database.GetIssue(issue.ID)
 	if retrieved.UpdatedAt.Before(originalUpdatedAt) {
@@ -293,10 +306,12 @@ func TestMultipleHandoffsForSameIssue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{Title: "Test Issue", Status: models.StatusInProgress}
-	database.CreateIssue(issue)
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 
 	// First handoff
 	handoff1 := &models.Handoff{
@@ -304,7 +319,9 @@ func TestMultipleHandoffsForSameIssue(t *testing.T) {
 		SessionID: "ses_1",
 		Done:      []string{"First work"},
 	}
-	database.AddHandoff(handoff1)
+	if err := database.AddHandoff(handoff1); err != nil {
+		t.Fatal(err)
+	}
 
 	// Second handoff
 	handoff2 := &models.Handoff{
@@ -312,7 +329,9 @@ func TestMultipleHandoffsForSameIssue(t *testing.T) {
 		SessionID: "ses_2",
 		Done:      []string{"Second work"},
 	}
-	database.AddHandoff(handoff2)
+	if err := database.AddHandoff(handoff2); err != nil {
+		t.Fatal(err)
+	}
 
 	if handoff1.ID == handoff2.ID {
 		t.Error("Handoffs should have different IDs")
@@ -345,7 +364,9 @@ func TestHandoffNoteFlag(t *testing.T) {
 	}
 
 	// Reset
-	handoffCmd.Flags().Set("note", "")
+	if err := handoffCmd.Flags().Set("note", ""); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestGetLatestHandoff tests retrieving the most recent handoff
@@ -355,23 +376,29 @@ func TestGetLatestHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{Title: "Test Issue", Status: models.StatusInProgress}
-	database.CreateIssue(issue)
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 
 	// Add handoffs
-	database.AddHandoff(&models.Handoff{
+	if err := database.AddHandoff(&models.Handoff{
 		IssueID:   issue.ID,
 		SessionID: "ses_old",
 		Done:      []string{"Old work"},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	database.AddHandoff(&models.Handoff{
+	if err := database.AddHandoff(&models.Handoff{
 		IssueID:   issue.ID,
 		SessionID: "ses_new",
 		Done:      []string{"New work"},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Get latest
 	latest, err := database.GetLatestHandoff(issue.ID)
@@ -415,6 +442,76 @@ func TestHandoffPositionalMessage(t *testing.T) {
 	}
 }
 
+func TestHandoffFlagsDoNotReadImplicitPipeStdin(t *testing.T) {
+	saveAndRestoreGlobals(t)
+
+	dir := t.TempDir()
+	baseDir := dir
+	baseDirOverride = &baseDir
+
+	database, err := db.Initialize(dir)
+	if err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	issue := &models.Issue{Title: "Flag handoff", Status: models.StatusInProgress}
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = reader
+	doneFlag := handoffCmd.Flags().Lookup("done")
+	doneValues, ok := doneFlag.Value.(pflag.SliceValue)
+	if !ok {
+		t.Fatal("done flag does not implement pflag.SliceValue")
+	}
+	if err := doneValues.Replace([]string{}); err != nil {
+		t.Fatalf("reset done flag: %v", err)
+	}
+	doneFlag.Changed = false
+	t.Cleanup(func() {
+		os.Stdin = oldStdin
+		_ = reader.Close()
+		_ = writer.Close()
+		_ = doneValues.Replace([]string{})
+		doneFlag.Changed = false
+	})
+
+	if err := handoffCmd.Flags().Set("done", "completed work"); err != nil {
+		t.Fatalf("set done flag: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- handoffCmd.RunE(handoffCmd, []string{issue.ID})
+	}()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("handoffCmd.RunE failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		_ = writer.Close() // release the old buggy stdin read before failing
+		<-result
+		t.Fatal("flag-based handoff blocked reading implicit pipe stdin")
+	}
+
+	recorded, err := database.GetLatestHandoff(issue.ID)
+	if err != nil {
+		t.Fatalf("GetLatestHandoff failed: %v", err)
+	}
+	if recorded == nil || len(recorded.Done) != 1 || recorded.Done[0] != "completed work" {
+		t.Fatalf("unexpected handoff: %+v", recorded)
+	}
+}
+
 // TestHandoffMessageFlag tests that --message/-m flag exists (agent-friendly alias)
 func TestHandoffMessageFlag(t *testing.T) {
 	// Test that --message flag exists
@@ -441,7 +538,9 @@ func TestHandoffMessageFlag(t *testing.T) {
 	}
 
 	// Reset
-	handoffCmd.Flags().Set("message", "")
+	if err := handoffCmd.Flags().Set("message", ""); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestCascadeHandoffBasic tests that handoff cascades to children
@@ -451,7 +550,7 @@ func TestCascadeHandoffBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create parent issue
 	parent := &models.Issue{Title: "Parent Task", Status: models.StatusInProgress}
@@ -497,7 +596,7 @@ func TestCascadeHandoffMultipleChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create parent
 	parent := &models.Issue{Title: "Parent Task", Status: models.StatusInProgress}
@@ -539,7 +638,7 @@ func TestCascadeHandoffNestedHierarchy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create grandparent
 	grandparent := &models.Issue{Title: "Grandparent Task", Status: models.StatusInProgress}
@@ -602,7 +701,7 @@ func TestCascadeHandoffSkipsCompletedChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create parent
 	parent := &models.Issue{Title: "Parent Task", Status: models.StatusInProgress}
@@ -655,7 +754,7 @@ func TestCascadeHandoffSkipsExistingHandoffs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create parent and children
 	parent := &models.Issue{Title: "Parent", Status: models.StatusInProgress}
@@ -717,7 +816,7 @@ func TestUndoHandoffDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create issue and handoff
 	issue := &models.Issue{Title: "Test Issue", Status: models.StatusInProgress}
@@ -767,7 +866,7 @@ func TestCascadeAndUndoInteraction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create parent and children
 	parent := &models.Issue{Title: "Parent", Status: models.StatusInProgress}
@@ -838,7 +937,7 @@ func TestMultipleCascadeLevels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create 4-level hierarchy: Level0 -> Level1 -> Level2 -> Level3
 	levels := make([]*models.Issue, 4)
@@ -893,7 +992,7 @@ func TestHandoffLoggingForUndo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create issue
 	issue := &models.Issue{Title: "Test Issue", Status: models.StatusInProgress}
@@ -982,7 +1081,7 @@ func TestCascadeHandoffStatusFiltering(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Initialize failed: %v", err)
 			}
-			defer database.Close()
+			defer func() { _ = database.Close() }()
 
 			// Create parent
 			parent := &models.Issue{Title: "Parent", Status: models.StatusInProgress}
@@ -1020,7 +1119,7 @@ func TestCascadePreservesHandoffContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create parent and child
 	parent := &models.Issue{Title: "Parent", Status: models.StatusInProgress}

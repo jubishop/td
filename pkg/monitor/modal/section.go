@@ -3,8 +3,8 @@ package modal
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -19,6 +19,16 @@ type Section interface {
 	// Update handles input when this section contains the focused element.
 	// Returns action string if the input triggers an action, plus any tea.Cmd.
 	Update(msg tea.Msg, focusID string) (action string, cmd tea.Cmd)
+}
+
+type styledSection interface {
+	setStyles(styles)
+}
+
+func applySectionStyles(section Section, value styles) {
+	if section, ok := section.(styledSection); ok {
+		section.setStyles(value)
+	}
 }
 
 // RenderedSection is the result of rendering a section.
@@ -40,21 +50,101 @@ type FocusableInfo struct {
 
 // textSection is a static text section.
 type textSection struct {
-	text string
+	text   string
+	styles styles
 }
 
 // Text creates a static text section.
 func Text(s string) Section {
-	return &textSection{text: s}
+	return &textSection{text: s, styles: newStyles(DefaultTheme())}
 }
+
+func (t *textSection) setStyles(value styles) { t.styles = value }
 
 func (t *textSection) Render(contentWidth int, focusID, hoverID string) RenderedSection {
 	// Wrap text to content width
 	wrapped := wrapText(t.text, contentWidth)
-	return RenderedSection{Content: wrapped}
+	return RenderedSection{Content: t.styles.body.Render(wrapped)}
 }
 
 func (t *textSection) Update(msg tea.Msg, focusID string) (string, tea.Cmd) {
+	return "", nil
+}
+
+// --- Centered Text Section ---
+
+// centeredTextSection is a static centered text section.
+type centeredTextSection struct {
+	text   string
+	styles styles
+}
+
+// CenteredText creates a static centered text section.
+func CenteredText(s string) Section {
+	return &centeredTextSection{text: s, styles: newStyles(DefaultTheme())}
+}
+
+func (c *centeredTextSection) setStyles(value styles) { c.styles = value }
+
+func (c *centeredTextSection) Render(contentWidth int, focusID, hoverID string) RenderedSection {
+	wrapped := wrapText(c.text, contentWidth)
+	rendered := c.styles.body.Render(wrapped)
+	return RenderedSection{Content: lipgloss.PlaceHorizontal(contentWidth, lipgloss.Center, rendered)}
+}
+
+func (c *centeredTextSection) Update(msg tea.Msg, focusID string) (string, tea.Cmd) {
+	return "", nil
+}
+
+// --- Centered Title Section ---
+
+// centeredTitleSection is a static centered bold title section.
+type centeredTitleSection struct {
+	text   string
+	styles styles
+}
+
+// CenteredTitle creates a centered bold title section styled with theme primary color.
+func CenteredTitle(s string) Section {
+	return &centeredTitleSection{text: s, styles: newStyles(DefaultTheme())}
+}
+
+func (c *centeredTitleSection) setStyles(value styles) { c.styles = value }
+
+func (c *centeredTitleSection) Render(contentWidth int, focusID, hoverID string) RenderedSection {
+	titleStyle := c.styles.modalTitle
+	if !c.styles.isDefault {
+		titleStyle = titleStyle.Foreground(lipgloss.Color(c.styles.theme.Primary))
+	}
+	rendered := titleStyle.Render(c.text)
+	return RenderedSection{Content: lipgloss.PlaceHorizontal(contentWidth, lipgloss.Center, rendered)}
+}
+
+func (c *centeredTitleSection) Update(msg tea.Msg, focusID string) (string, tea.Cmd) {
+	return "", nil
+}
+
+// --- Centered Muted Section ---
+
+// centeredMutedSection is a static centered muted text section.
+type centeredMutedSection struct {
+	text   string
+	styles styles
+}
+
+// CenteredMuted creates a centered muted text section.
+func CenteredMuted(s string) Section {
+	return &centeredMutedSection{text: s, styles: newStyles(DefaultTheme())}
+}
+
+func (c *centeredMutedSection) setStyles(value styles) { c.styles = value }
+
+func (c *centeredMutedSection) Render(contentWidth int, focusID, hoverID string) RenderedSection {
+	rendered := c.styles.mutedText.Render(c.text)
+	return RenderedSection{Content: lipgloss.PlaceHorizontal(contentWidth, lipgloss.Center, rendered)}
+}
+
+func (c *centeredMutedSection) Update(msg tea.Msg, focusID string) (string, tea.Cmd) {
 	return "", nil
 }
 
@@ -85,6 +175,8 @@ type whenSection struct {
 	inner     Section
 }
 
+func (w *whenSection) setStyles(value styles) { applySectionStyles(w.inner, value) }
+
 // When creates a conditional section that only renders when condition() returns true.
 func When(condition func() bool, section Section) Section {
 	return &whenSection{condition: condition, inner: section}
@@ -108,12 +200,19 @@ func (w *whenSection) Update(msg tea.Msg, focusID string) (string, tea.Cmd) {
 
 // customSection allows escape-hatch for complex custom content.
 type customSection struct {
-	renderFn func(contentWidth int, focusID, hoverID string) RenderedSection
-	updateFn func(msg tea.Msg, focusID string) (string, tea.Cmd)
+	renderFn       func(contentWidth int, focusID, hoverID string) RenderedSection
+	themedRenderFn func(contentWidth int, focusID, hoverID string, theme Theme) RenderedSection
+	updateFn       func(msg tea.Msg, focusID string) (string, tea.Cmd)
+	styles         styles
 }
 
 // CustomRenderFunc is the signature for custom section render functions.
 type CustomRenderFunc func(contentWidth int, focusID, hoverID string) RenderedSection
+
+// ThemedCustomRenderFunc receives the modal's current instance theme on every
+// render, including after SetTheme. It is the escape hatch for complex content
+// that needs semantic styling without capturing a parent model's stale styles.
+type ThemedCustomRenderFunc func(contentWidth int, focusID, hoverID string, theme Theme) RenderedSection
 
 // CustomUpdateFunc is the signature for custom section update functions.
 type CustomUpdateFunc func(msg tea.Msg, focusID string) (action string, cmd tea.Cmd)
@@ -124,10 +223,26 @@ func Custom(renderFn CustomRenderFunc, updateFn CustomUpdateFunc) Section {
 	return &customSection{
 		renderFn: renderFn,
 		updateFn: updateFn,
+		styles:   newStyles(DefaultTheme()),
 	}
 }
 
+// ThemedCustom creates a custom section whose render callback receives the
+// modal's current instance theme.
+func ThemedCustom(renderFn ThemedCustomRenderFunc, updateFn CustomUpdateFunc) Section {
+	return &customSection{
+		themedRenderFn: renderFn,
+		updateFn:       updateFn,
+		styles:         newStyles(DefaultTheme()),
+	}
+}
+
+func (c *customSection) setStyles(value styles) { c.styles = value }
+
 func (c *customSection) Render(contentWidth int, focusID, hoverID string) RenderedSection {
+	if c.themedRenderFn != nil {
+		return c.themedRenderFn(contentWidth, focusID, hoverID, c.styles.theme)
+	}
 	if c.renderFn == nil {
 		return RenderedSection{}
 	}
@@ -177,12 +292,15 @@ func BtnPrimary() BtnOption {
 // buttonsSection renders a row of buttons.
 type buttonsSection struct {
 	buttons []ButtonDef
+	styles  styles
 }
 
 // Buttons creates a button row section.
 func Buttons(btns ...ButtonDef) Section {
-	return &buttonsSection{buttons: btns}
+	return &buttonsSection{buttons: btns, styles: newStyles(DefaultTheme())}
 }
+
+func (b *buttonsSection) setStyles(value styles) { b.styles = value }
 
 func (b *buttonsSection) Render(contentWidth int, focusID, hoverID string) RenderedSection {
 	if len(b.buttons) == 0 {
@@ -230,21 +348,21 @@ func (b *buttonsSection) resolveStyle(btn ButtonDef, focusID, hoverID string) li
 
 	if btn.IsDanger {
 		if isFocused {
-			return ButtonDangerFocused
+			return b.styles.buttonDangerFocused
 		}
 		if isHovered {
-			return ButtonDangerHover
+			return b.styles.buttonDangerHover
 		}
-		return ButtonDanger
+		return b.styles.buttonDanger
 	}
 
 	if isFocused {
-		return ButtonFocused
+		return b.styles.buttonFocused
 	}
 	if isHovered {
-		return ButtonHover
+		return b.styles.buttonHover
 	}
-	return Button
+	return b.styles.button
 }
 
 func (b *buttonsSection) Update(msg tea.Msg, focusID string) (string, tea.Cmd) {
@@ -271,12 +389,15 @@ type checkboxSection struct {
 	id      string
 	label   string
 	checked *bool
+	styles  styles
 }
 
 // Checkbox creates a checkbox section.
 func Checkbox(id, label string, checked *bool) Section {
-	return &checkboxSection{id: id, label: label, checked: checked}
+	return &checkboxSection{id: id, label: label, checked: checked, styles: newStyles(DefaultTheme())}
 }
+
+func (c *checkboxSection) setStyles(value styles) { c.styles = value }
 
 func (c *checkboxSection) Render(contentWidth int, focusID, hoverID string) RenderedSection {
 	box := "[ ]"
@@ -289,11 +410,11 @@ func (c *checkboxSection) Render(contentWidth int, focusID, hoverID string) Rend
 
 	var style lipgloss.Style
 	if isFocused {
-		style = ButtonFocused
+		style = c.styles.buttonFocused
 	} else if isHovered {
-		style = ButtonHover
+		style = c.styles.buttonHover
 	} else {
-		style = Button
+		style = c.styles.button
 	}
 
 	content := style.Render(box + " " + c.label)

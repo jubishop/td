@@ -126,10 +126,27 @@ func TestReviewableByOptions_UsesBalancedReviewPolicyFlag(t *testing.T) {
 	baseDir := t.TempDir()
 	sessionID := "ses_test"
 
-	// Default is ON.
+	// trusted-review-mode default: trusted mode, so the legacy
+	// BalancedReviewPolicy flag in the ListIssuesOptions struct is OFF for a
+	// fresh project.
 	opts := reviewableByOptions(baseDir, sessionID)
+	if opts.BalancedReviewPolicy {
+		t.Fatalf("BalancedReviewPolicy should default to false (trusted is the default mode)")
+	}
+	if opts.ReviewPolicyMode != "trusted" {
+		t.Fatalf("ReviewPolicyMode should default to trusted, got %q", opts.ReviewPolicyMode)
+	}
+
+	// Explicit legacy balanced_review_policy=true opts into balanced mode.
+	if err := config.SetFeatureFlag(baseDir, features.BalancedReviewPolicy.Name, true); err != nil {
+		t.Fatalf("SetFeatureFlag failed: %v", err)
+	}
+	opts = reviewableByOptions(baseDir, sessionID)
 	if !opts.BalancedReviewPolicy {
-		t.Fatalf("BalancedReviewPolicy should default to true")
+		t.Fatalf("BalancedReviewPolicy should be true when legacy flag explicitly opts in")
+	}
+	if opts.ReviewPolicyMode != "balanced" {
+		t.Fatalf("ReviewPolicyMode should be balanced when legacy flag opts in, got %q", opts.ReviewPolicyMode)
 	}
 
 	// Local config override OFF.
@@ -140,12 +157,18 @@ func TestReviewableByOptions_UsesBalancedReviewPolicyFlag(t *testing.T) {
 	if opts.BalancedReviewPolicy {
 		t.Fatalf("BalancedReviewPolicy should be false when overridden in config")
 	}
+	if opts.ReviewPolicyMode != "strict" {
+		t.Fatalf("ReviewPolicyMode should be strict when legacy flag is explicitly false, got %q", opts.ReviewPolicyMode)
+	}
 
 	// Env override ON should win over config OFF.
 	t.Setenv("TD_FEATURE_BALANCED_REVIEW_POLICY", "true")
 	opts = reviewableByOptions(baseDir, sessionID)
 	if !opts.BalancedReviewPolicy {
 		t.Fatalf("BalancedReviewPolicy should be true when env override is set")
+	}
+	if opts.ReviewPolicyMode != "balanced" {
+		t.Fatalf("ReviewPolicyMode should be balanced when env override is set, got %q", opts.ReviewPolicyMode)
 	}
 }
 
@@ -424,7 +447,7 @@ func TestDescribeStaleTransitionUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:  "Closed elsewhere",
@@ -459,7 +482,7 @@ func TestDescribeStaleTransitionUpdateIncludesRecentContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:  "Reopened elsewhere",
@@ -508,7 +531,7 @@ func TestDescribeStaleTransitionUpdatePrefersNewestWorkflowContext(t *testing.T)
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:  "Newest transition wins",

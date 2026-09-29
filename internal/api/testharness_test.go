@@ -73,7 +73,10 @@ func newTestHarness(t *testing.T, opts ...func(*Config)) *TestHarness {
 	t.Cleanup(func() {
 		httpSrv.Close()
 		srv.dbPool.CloseAll()
-		store.Close()
+		if srv.projectLivePool != nil {
+			_ = srv.projectLivePool.Close()
+		}
+		_ = store.Close()
 	})
 
 	return h
@@ -120,6 +123,47 @@ func (h *TestHarness) Do(method, path, token string, body any) *http.Response {
 	return resp
 }
 
+func (h *TestHarness) DoWithHeaders(method, path, token string, body any, headers map[string]string) *http.Response {
+	h.t.Helper()
+
+	url := h.BaseURL + path
+
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			h.t.Fatalf("marshal request body: %v", err)
+		}
+	}
+
+	var req *http.Request
+	var err error
+	if body != nil {
+		req, err = http.NewRequest(method, url, &buf)
+	} else {
+		req, err = http.NewRequest(method, url, nil)
+	}
+	if err != nil {
+		h.t.Fatalf("create request: %v", err)
+	}
+
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		h.t.Fatalf("do request %s %s: %v", method, path, err)
+	}
+
+	return resp
+}
+
 // DoJSON sends an HTTP request and decodes the JSON response into out.
 // Fatals if the response status is >= 400 or if JSON decoding fails.
 func (h *TestHarness) DoJSON(method, path, token string, body any, out any) *http.Response {
@@ -129,7 +173,7 @@ func (h *TestHarness) DoJSON(method, path, token string, body any, out any) *htt
 
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		h.t.Fatalf("DoJSON %s %s: expected success, got %d: %s", method, path, resp.StatusCode, respBody)
 	}
 
@@ -203,7 +247,7 @@ func (h *TestHarness) PushEvents(token, projectID string, events []EventInput) {
 		SessionID: "test-session",
 		Events:    events,
 	})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		h.t.Fatalf("push events: expected 200, got %d", resp.StatusCode)
@@ -215,7 +259,7 @@ func (h *TestHarness) BuildSnapshot(token, projectID string) {
 	h.t.Helper()
 
 	resp := h.Do("GET", fmt.Sprintf("/v1/projects/%s/sync/snapshot", projectID), token, nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		h.t.Fatalf("build snapshot: expected 200, got %d", resp.StatusCode)
@@ -229,7 +273,7 @@ func AssertStatus(t *testing.T, resp *http.Response, expected int) {
 	t.Helper()
 	if resp.StatusCode != expected {
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		t.Fatalf("expected status %d, got %d: %s", expected, resp.StatusCode, string(body))
 	}
 }
@@ -238,7 +282,7 @@ func AssertStatus(t *testing.T, resp *http.Response, expected int) {
 func AssertErrorResponse(t *testing.T, resp *http.Response, expectedStatus int, expectedCode string) {
 	t.Helper()
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != expectedStatus {
 		t.Fatalf("expected status %d, got %d: %s", expectedStatus, resp.StatusCode, string(body))
 	}
@@ -254,7 +298,7 @@ func AssertErrorResponse(t *testing.T, resp *http.Response, expectedStatus int, 
 // ReadJSON decodes a JSON response body into the given type.
 func ReadJSON[T any](t *testing.T, resp *http.Response) T {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var out T
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode json response: %v", err)
@@ -272,7 +316,7 @@ type PaginatedResponse[T any] struct {
 // AssertPaginated checks the response is a valid paginated response with expected count and has_more.
 func AssertPaginated[T any](t *testing.T, resp *http.Response, expectedCount int, expectHasMore bool) PaginatedResponse[T] {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
@@ -449,7 +493,7 @@ func (b *StateBuilder) WithMember(projectName, email, role string) *StateBuilder
 		}
 		resp := b.h.Do("POST", fmt.Sprintf("/v1/projects/%s/members", p.id), owner.token,
 			AddMemberRequest{UserID: u.id, Role: role})
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusCreated {
 			b.h.t.Fatalf("WithMember: expected 201, got %d", resp.StatusCode)
 		}
@@ -493,7 +537,7 @@ func (b *StateBuilder) WithEvents(projectName, userEmail string, count int) *Sta
 			SessionID: sessionID,
 			Events:    events,
 		})
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
 			b.h.t.Fatalf("WithEvents: expected 200, got %d", resp.StatusCode)
 		}

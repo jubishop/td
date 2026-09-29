@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/marcus/td/internal/config"
+	"github.com/marcus/td/internal/reviewpolicy"
 )
 
 func TestKnownFeatureDefaults(t *testing.T) {
@@ -59,6 +60,57 @@ func TestIsEnabled_ProjectConfigAndEnvPrecedence(t *testing.T) {
 	}
 }
 
+func TestResolveExplicit_Default(t *testing.T) {
+	dir := t.TempDir()
+	// Unset flag: source=default, so explicit must be false.
+	value, explicit := ResolveExplicit(dir, SyncAutosync.Name)
+	if explicit {
+		t.Fatalf("unset flag should not be explicit, got explicit=%v", explicit)
+	}
+	if value != SyncAutosync.Default {
+		t.Fatalf("unset flag should resolve to default %v, got %v", SyncAutosync.Default, value)
+	}
+}
+
+func TestResolveExplicit_Env(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Setenv("TD_FEATURE_SYNC_AUTOSYNC", "true")
+	value, explicit := ResolveExplicit(dir, SyncAutosync.Name)
+	if !explicit || !value {
+		t.Fatalf("env true should be explicit=true value=true, got explicit=%v value=%v", explicit, value)
+	}
+
+	t.Setenv("TD_FEATURE_SYNC_AUTOSYNC", "false")
+	value, explicit = ResolveExplicit(dir, SyncAutosync.Name)
+	if !explicit || value {
+		t.Fatalf("env false should be explicit=true value=false, got explicit=%v value=%v", explicit, value)
+	}
+}
+
+func TestResolveExplicit_Config(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := config.SetFeatureFlag(dir, SyncAutosync.Name, false); err != nil {
+		t.Fatalf("SetFeatureFlag: %v", err)
+	}
+	value, explicit := ResolveExplicit(dir, SyncAutosync.Name)
+	if !explicit {
+		t.Fatalf("config-set flag should be explicit, got explicit=%v", explicit)
+	}
+	if value {
+		t.Fatalf("config false should resolve to false, got %v", value)
+	}
+
+	if err := config.SetFeatureFlag(dir, SyncAutosync.Name, true); err != nil {
+		t.Fatalf("SetFeatureFlag: %v", err)
+	}
+	value, explicit = ResolveExplicit(dir, SyncAutosync.Name)
+	if !explicit || !value {
+		t.Fatalf("config true should be explicit=true value=true, got explicit=%v value=%v", explicit, value)
+	}
+}
+
 func TestDisableExperimentalKillSwitch(t *testing.T) {
 	t.Setenv("TD_ENABLE_FEATURE", "sync_cli")
 	if !IsEnabledForProcess(SyncCLI.Name) {
@@ -71,6 +123,119 @@ func TestDisableExperimentalKillSwitch(t *testing.T) {
 	}
 	if IsEnabledForProcess(SyncAutosync.Name) {
 		t.Fatal("kill-switch should disable sync_autosync")
+	}
+}
+
+func TestResolveReviewPolicyMode_DefaultsToTrusted(t *testing.T) {
+	// trusted-review-mode final stage: with no explicit config (neither
+	// review_policy_mode nor balanced_review_policy set), the resolver
+	// returns ModeTrusted. BalancedReviewPolicy.Default stays false and the
+	// legacy flag is only honored when explicitly opted into.
+	t.Setenv("TD_FEATURE_REVIEW_POLICY_MODE", "")
+	ResetDeprecationWarningsForTests()
+	dir := t.TempDir()
+	mode, err := ResolveReviewPolicyMode(dir)
+	if err != nil {
+		t.Fatalf("ResolveReviewPolicyMode: %v", err)
+	}
+	if mode != reviewpolicy.ModeTrusted {
+		t.Fatalf("default mode: got %q, want %q", mode, reviewpolicy.ModeTrusted)
+	}
+}
+
+func TestResolveReviewPolicyMode_EnvOverride(t *testing.T) {
+	ResetDeprecationWarningsForTests()
+	dir := t.TempDir()
+
+	t.Setenv("TD_FEATURE_REVIEW_POLICY_MODE", "delegated")
+	mode, err := ResolveReviewPolicyMode(dir)
+	if err != nil {
+		t.Fatalf("ResolveReviewPolicyMode: %v", err)
+	}
+	if mode != reviewpolicy.ModeDelegated {
+		t.Fatalf("env mode: got %q, want %q", mode, reviewpolicy.ModeDelegated)
+	}
+
+	t.Setenv("TD_FEATURE_REVIEW_POLICY_MODE", "bogus")
+	if _, err := ResolveReviewPolicyMode(dir); err == nil {
+		t.Fatal("invalid env value should error")
+	}
+}
+
+func TestResolveReviewPolicyMode_ConfigValue(t *testing.T) {
+	ResetDeprecationWarningsForTests()
+	dir := t.TempDir()
+
+	if err := config.SetFeatureStringFlag(dir, ReviewPolicyMode, "balanced"); err != nil {
+		t.Fatalf("SetFeatureStringFlag: %v", err)
+	}
+
+	mode, err := ResolveReviewPolicyMode(dir)
+	if err != nil {
+		t.Fatalf("ResolveReviewPolicyMode: %v", err)
+	}
+	if mode != reviewpolicy.ModeBalanced {
+		t.Fatalf("config mode: got %q, want %q", mode, reviewpolicy.ModeBalanced)
+	}
+}
+
+func TestResolveReviewPolicyMode_LegacyBalancedMapping(t *testing.T) {
+	ResetDeprecationWarningsForTests()
+	dir := t.TempDir()
+
+	// balanced_review_policy explicitly set to true, no review_policy_mode set.
+	if err := config.SetFeatureFlag(dir, BalancedReviewPolicy.Name, true); err != nil {
+		t.Fatalf("SetFeatureFlag: %v", err)
+	}
+
+	mode, err := ResolveReviewPolicyMode(dir)
+	if err != nil {
+		t.Fatalf("ResolveReviewPolicyMode: %v", err)
+	}
+	if mode != reviewpolicy.ModeBalanced {
+		t.Fatalf("legacy true mapping: got %q, want %q", mode, reviewpolicy.ModeBalanced)
+	}
+
+	// Now flip it false — should map to strict.
+	if err := config.SetFeatureFlag(dir, BalancedReviewPolicy.Name, false); err != nil {
+		t.Fatalf("SetFeatureFlag: %v", err)
+	}
+	mode, err = ResolveReviewPolicyMode(dir)
+	if err != nil {
+		t.Fatalf("ResolveReviewPolicyMode: %v", err)
+	}
+	if mode != reviewpolicy.ModeStrict {
+		t.Fatalf("legacy false mapping: got %q, want %q", mode, reviewpolicy.ModeStrict)
+	}
+}
+
+func TestResolveReviewPolicyMode_ConflictingFlags(t *testing.T) {
+	ResetDeprecationWarningsForTests()
+	dir := t.TempDir()
+
+	// Explicit conflict: review_policy_mode=delegated but balanced_review_policy=true.
+	if err := config.SetFeatureStringFlag(dir, ReviewPolicyMode, "delegated"); err != nil {
+		t.Fatalf("SetFeatureStringFlag: %v", err)
+	}
+	if err := config.SetFeatureFlag(dir, BalancedReviewPolicy.Name, true); err != nil {
+		t.Fatalf("SetFeatureFlag: %v", err)
+	}
+
+	if _, err := ResolveReviewPolicyMode(dir); err == nil {
+		t.Fatal("conflicting review_policy_mode=delegated vs balanced_review_policy=true should error")
+	}
+
+	// Non-conflict: balanced_review_policy=true and review_policy_mode=balanced.
+	// Both point at balanced so resolution should succeed.
+	if err := config.SetFeatureStringFlag(dir, ReviewPolicyMode, "balanced"); err != nil {
+		t.Fatalf("SetFeatureStringFlag: %v", err)
+	}
+	mode, err := ResolveReviewPolicyMode(dir)
+	if err != nil {
+		t.Fatalf("agreeing flags should not error: %v", err)
+	}
+	if mode != reviewpolicy.ModeBalanced {
+		t.Fatalf("agreeing flags: got %q, want %q", mode, reviewpolicy.ModeBalanced)
 	}
 }
 

@@ -57,7 +57,7 @@ var taskListCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		showAll, _ := cmd.Flags().GetBool("all")
 
@@ -79,6 +79,13 @@ var taskListCmd = &cobra.Command{
 		if err != nil {
 			output.Error("%v", err)
 			return err
+		}
+
+		// Bare issue array, identical in shape to `td list --json` — this
+		// command is a shorthand for `td list --type task`, so its machine
+		// output must be interchangeable with that one's.
+		if jsonMode(cmd) {
+			return output.JSON(jsonList(issues))
 		}
 
 		if len(issues) == 0 {
@@ -111,7 +118,7 @@ func init() {
 	taskCreateCmd.Flags().Bool("minor", false, "Mark as minor task (allows self-review)")
 	// Hidden type flag - set programmatically to "task"
 	taskCreateCmd.Flags().StringP("type", "t", "", "")
-	taskCreateCmd.Flags().MarkHidden("type")
+	_ = taskCreateCmd.Flags().MarkHidden("type")
 
 	// taskListCmd flags
 	taskListCmd.Flags().BoolP("all", "a", false, "Show all tasks including closed")

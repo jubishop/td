@@ -14,7 +14,7 @@ func TestCreateIssueLogged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:       "Logged create test",
@@ -80,7 +80,7 @@ func TestUpdateIssueLogged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create issue first (unlogged)
 	issue := &models.Issue{
@@ -159,7 +159,7 @@ func TestUpdateIssueLoggedIfStatusDetectsStaleTransition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:    "Concurrent review target",
@@ -220,13 +220,178 @@ func TestUpdateIssueLoggedIfStatusDetectsStaleTransition(t *testing.T) {
 	}
 }
 
+// TestUpdateIssueLoggedRejectsConcurrentWrite reproduces the scenario from
+// the td-e38551 report: two sessions load the same issue, one writes first,
+// and the second's stale full-row write must not silently revert it.
+func TestUpdateIssueLoggedRejectsConcurrentWrite(t *testing.T) {
+	dir := t.TempDir()
+	database, err := Initialize(dir)
+	if err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	issue := &models.Issue{
+		Title:    "Original title",
+		Status:   models.StatusOpen,
+		Type:     models.TypeTask,
+		Priority: models.PriorityP2,
+	}
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	staleCopy, err := database.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue failed: %v", err)
+	}
+
+	current, err := database.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue current failed: %v", err)
+	}
+	current.Title = "Updated by session A"
+	if err := database.UpdateIssueLogged(current, "sess-a", models.ActionUpdate); err != nil {
+		t.Fatalf("UpdateIssueLogged (session A) failed: %v", err)
+	}
+
+	// staleCopy still carries the pre-session-A UpdatedAt: this mirrors a
+	// sweep or background writer that loaded the issue before session A's
+	// write landed, then tries to write its own (unrelated) field change.
+	staleCopy.Labels = []string{"swept"}
+	err = database.UpdateIssueLogged(staleCopy, "sess-sweep", models.ActionUpdate)
+	if err == nil {
+		t.Fatal("expected stale update to be rejected")
+	}
+	var staleErr *StaleIssueUpdateError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("expected StaleIssueUpdateError, got %T: %v", err, err)
+	}
+
+	// Session A's write must survive: the rejected sweep must not have
+	// reverted the title.
+	got, err := database.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue after rejected update failed: %v", err)
+	}
+	if got.Title != "Updated by session A" {
+		t.Fatalf("title = %q, want %q (session A's write was reverted)", got.Title, "Updated by session A")
+	}
+
+	var actions int
+	if err := database.conn.QueryRow(`SELECT COUNT(*) FROM action_log WHERE entity_id = ?`, issue.ID).Scan(&actions); err != nil {
+		t.Fatalf("count action_log failed: %v", err)
+	}
+	if actions != 1 {
+		t.Fatalf("expected only session A's action logged, got %d", actions)
+	}
+}
+
+// TestUpdateIssueLoggedAllowsUnloadedSnapshot pins the intentional exemption
+// in the staleness guard: an issue that was never loaded from the DB carries a
+// zero UpdatedAt and is written unguarded. `td system import --force`
+// (cmd/system.go) depends on this — it builds an Issue from parsed markdown
+// and overwrites the existing row by ID.
+func TestUpdateIssueLoggedAllowsUnloadedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	database, err := Initialize(dir)
+	if err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	issue := &models.Issue{
+		Title:    "Original title",
+		Status:   models.StatusOpen,
+		Type:     models.TypeTask,
+		Priority: models.PriorityP2,
+	}
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// A freshly constructed Issue carrying only an ID: no UpdatedAt, so
+	// there is no loaded snapshot for the guard to compare against.
+	imported := &models.Issue{
+		ID:       issue.ID,
+		Title:    "Imported title",
+		Status:   models.StatusOpen,
+		Type:     models.TypeTask,
+		Priority: models.PriorityP2,
+	}
+	if !imported.UpdatedAt.IsZero() {
+		t.Fatal("test premise broken: constructed issue should have a zero UpdatedAt")
+	}
+	if err := database.UpdateIssueLogged(imported, "sess-import", models.ActionUpdate); err != nil {
+		t.Fatalf("UpdateIssueLogged with an unloaded snapshot failed: %v", err)
+	}
+
+	got, err := database.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue failed: %v", err)
+	}
+	if got.Title != "Imported title" {
+		t.Fatalf("title = %q, want %q (unloaded-snapshot write did not apply)", got.Title, "Imported title")
+	}
+}
+
+// TestUpdateIssueLoggedUnconditionalBypassesStaleGuard verifies undo's write
+// path is unaffected by the staleness guard: it must be able to restore an
+// older snapshot even though the persisted updated_at has since moved on.
+func TestUpdateIssueLoggedUnconditionalBypassesStaleGuard(t *testing.T) {
+	dir := t.TempDir()
+	database, err := Initialize(dir)
+	if err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	issue := &models.Issue{
+		Title:    "Before update",
+		Status:   models.StatusOpen,
+		Type:     models.TypeTask,
+		Priority: models.PriorityP2,
+	}
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	preUpdate, err := database.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue failed: %v", err)
+	}
+
+	current, err := database.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue current failed: %v", err)
+	}
+	current.Title = "After update"
+	if err := database.UpdateIssueLogged(current, "sess-a", models.ActionUpdate); err != nil {
+		t.Fatalf("UpdateIssueLogged failed: %v", err)
+	}
+
+	// preUpdate still carries the pre-write UpdatedAt, exactly as undo's
+	// PreviousData snapshot would.
+	if err := database.UpdateIssueLoggedUnconditional(preUpdate, "sess-undo", models.ActionUpdate); err != nil {
+		t.Fatalf("UpdateIssueLoggedUnconditional failed: %v", err)
+	}
+
+	got, err := database.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue after undo failed: %v", err)
+	}
+	if got.Title != "Before update" {
+		t.Fatalf("title = %q, want %q (undo did not apply)", got.Title, "Before update")
+	}
+}
+
 func TestDeleteIssueLogged(t *testing.T) {
 	dir := t.TempDir()
 	database, err := Initialize(dir)
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:    "To be deleted",
@@ -287,7 +452,7 @@ func TestUpdateIssueLogged_NotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		ID:    "td-nonexistent",
@@ -305,7 +470,7 @@ func TestDeleteIssueLogged_NotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	err = database.DeleteIssueLogged("td-nonexistent", "sess-5")
 	if err == nil {
@@ -319,7 +484,7 @@ func TestUnloggedVariants_NoActionLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create issue with unlogged variant
 	issue := &models.Issue{
@@ -360,5 +525,83 @@ func TestUnloggedVariants_NoActionLog(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("UpdateIssue (unlogged) created %d action_log entries, want 0", count)
+	}
+}
+
+func TestReviewInvalidatingDiff_Reopen(t *testing.T) {
+	closed := &models.Issue{ID: "td-x", Status: models.StatusClosed, Title: "same"}
+	open := &models.Issue{ID: "td-x", Status: models.StatusOpen, Title: "same"}
+	inReview := &models.Issue{ID: "td-x", Status: models.StatusInReview, Title: "same"}
+
+	reopen := reviewInvalidatingDiff(closed, open, false)
+	if !reopen.Reopened {
+		t.Fatal("closed -> open should set Reopened")
+	}
+	if reopen.StatusChangedFromReviewNotClosing {
+		t.Fatal("reopen is not a leave-review transition")
+	}
+
+	// Approve / close-after-review must still keep the approval.
+	closeAfterReview := reviewInvalidatingDiff(inReview, closed, false)
+	if closeAfterReview.Reopened || closeAfterReview.StatusChangedFromReviewNotClosing {
+		t.Fatalf("in_review -> closed must not invalidate: %+v", closeAfterReview)
+	}
+
+	// Reject still uses the existing leave-review flag, not Reopened.
+	reject := reviewInvalidatingDiff(inReview, open, false)
+	if !reject.StatusChangedFromReviewNotClosing {
+		t.Fatal("in_review -> open should set StatusChangedFromReviewNotClosing")
+	}
+	if reject.Reopened {
+		t.Fatal("reject is not a reopen")
+	}
+}
+
+func TestUpdateIssueLogged_ReopenSupersedesActiveApproval(t *testing.T) {
+	database, err := Initialize(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+
+	issue := &models.Issue{
+		Title:  "approved then reopened",
+		Type:   models.TypeTask,
+		Status: models.StatusInReview,
+	}
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CreateIssueReview(NewReview{
+		IssueID:         issue.ID,
+		ReviewerSession: "ses-reviewer",
+		Decision:        "approved",
+		Summary:         "ship it",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close without superseding — the approval is what justified the close.
+	issue.Status = models.StatusClosed
+	if err := database.UpdateIssueLogged(issue, "ses-reviewer", models.ActionApprove); err != nil {
+		t.Fatal(err)
+	}
+	active, err := database.GetActiveApprovalReview(issue.ID)
+	if err != nil || active == nil {
+		t.Fatalf("close should keep the approval active: active=%+v err=%v", active, err)
+	}
+
+	issue.Status = models.StatusOpen
+	issue.ReviewerSession = ""
+	issue.ClosedAt = nil
+	if err := database.UpdateIssueLogged(issue, "ses-later", models.ActionReopen); err != nil {
+		t.Fatal(err)
+	}
+	active, err = database.GetActiveApprovalReview(issue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != nil {
+		t.Fatalf("reopen should supersede the leftover approval, still active: %+v", active)
 	}
 }

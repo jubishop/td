@@ -72,7 +72,7 @@ Skip this step if running locally — the default is `http://localhost:8080`.
 td auth login
 ```
 
-Enter your email. A verification URL and 6-character code are displayed. Open the URL in a browser, enter the code, and the CLI saves your credentials.
+Enter your email. The server emails you a one-time approval link — click it to approve the login from this device. No code is shown in the terminal; the login completes only after you click the emailed link. The CLI then saves your credentials to `~/.config/td/auth.json`.
 
 Check auth status anytime:
 ```bash
@@ -122,16 +122,18 @@ td sync
 
 Your local changes push to the server, and remote changes from teammates pull down.
 
-## For Project Owners: Inviting Teammates
+## For Project Owners: Adding Teammates
 
-After creating a project, invite others by email:
+After creating a project, add existing td accounts by email:
 
 ```bash
 td sync-project invite alice@example.com         # defaults to writer
 td sync-project invite bob@example.com reader     # read-only
 ```
 
-The invited user then authenticates (`td auth login`) and joins (`td sync-project join`).
+This CLI command creates direct project membership for an account that already exists on the sync server. In td-watch, web project invitations are pending email invites with an accept/decline flow.
+
+The added user then authenticates (`td auth login`) and joins (`td sync-project join`).
 
 See the [collaboration guide](collaboration.md) for roles, permissions, and member management.
 
@@ -193,7 +195,7 @@ Your credentials are missing or expired. Run `td auth login` again.
 Your local project isn't connected to a remote. Run `td sync-project join` or `td sync-project link <id>`.
 
 **"no projects found"**
-You haven't been invited to any remote projects yet. Ask the project owner to run `td sync-project invite your@email.com`.
+You do not have access to any remote projects yet. Ask an owner to add your existing td account with `td sync-project invite your@email.com`.
 
 **"unauthorized"**
 Your API key is expired or revoked. Run `td auth login` to get a new one.

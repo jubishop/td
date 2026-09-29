@@ -2,21 +2,24 @@ package monitor
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
 	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/session"
 	"github.com/marcus/td/internal/syncclient"
+	"github.com/marcus/td/internal/syncconfig"
 	"github.com/marcus/td/internal/version"
 	"github.com/marcus/td/pkg/monitor/keymap"
 	"github.com/marcus/td/pkg/monitor/modal"
 	"github.com/marcus/td/pkg/monitor/mouse"
+	"github.com/marcus/td/pkg/tdsync"
 )
 
 // Model is the main Bubble Tea model for the monitor TUI
@@ -36,6 +39,7 @@ type Model struct {
 	TaskList       TaskListData
 	RecentHandoffs []RecentHandoff // Handoffs since monitor started
 	ActiveSessions []string        // Sessions with recent activity
+	HasIssues      bool            // Any non-deleted issue exists (board empty-state copy)
 
 	// UI state
 	ActivePanel         Panel
@@ -95,6 +99,29 @@ type Model struct {
 	CloseConfirmModal        *modal.Modal   // Declarative modal instance
 	CloseConfirmMouseHandler *mouse.Handler // Mouse handler for close confirmation modal
 
+	// Self-review confirmation dialog (trusted mode). Shown when the current
+	// session implemented the in_review issue being approved. The operator may
+	// attribute the review to someone else, or leave attribution blank and
+	// provide the required self-review reason.
+	SelfReviewConfirmOpen         bool
+	SelfReviewConfirmIssueID      string
+	SelfReviewConfirmTitle        string
+	SelfReviewConfirmInput        textinput.Model
+	SelfReviewReasonInput         textinput.Model
+	SelfReviewConfirmModal        *modal.Modal
+	SelfReviewConfirmMouseHandler *mouse.Handler
+
+	// Record-review (delegated-mode) reason prompt. Reused pattern from
+	// CloseConfirm — a single-line text input with confirm/cancel buttons.
+	RecordReviewOpen          bool
+	RecordReviewIssueID       string
+	RecordReviewTitle         string
+	RecordReviewInput         textinput.Model
+	RecordReviewReviewerInput textinput.Model
+	RecordReviewDecision      string // "approved" | "changes_requested"
+	RecordReviewModal         *modal.Modal
+	RecordReviewMouseHandler  *mouse.Handler
+
 	// Stats modal state
 	StatsOpen         bool
 	StatsLoading      bool
@@ -116,7 +143,7 @@ type Model struct {
 
 	// Activity detail modal state
 	ActivityDetailOpen         bool
-	ActivityDetailItem         *ActivityItem  // The selected activity item
+	ActivityDetailItem         *ActivityItem // The selected activity item
 	ActivityDetailScroll       int
 	ActivityDetailModal        *modal.Modal   // Declarative modal instance
 	ActivityDetailMouseHandler *mouse.Handler // Mouse handler for activity detail modal
@@ -128,8 +155,8 @@ type Model struct {
 	NotesMouseHandler *mouse.Handler // Mouse handler for notes modal
 
 	// Form modal state
-	FormOpen        bool
-	FormState       *FormState
+	FormOpen         bool
+	FormState        *FormState
 	FormScrollOffset int // Scroll offset for form modal when content overflows
 
 	// Getting Started modal state
@@ -137,7 +164,8 @@ type Model struct {
 	GettingStartedModal        *modal.Modal   // Declarative modal instance
 	GettingStartedMouseHandler *mouse.Handler // Mouse handler for getting started modal
 	AgentFilePath              string         // Detected agent file path (may be empty)
-	AgentFileHasTD             bool           // Whether agent file already has td instructions
+	AgentFileHasTD             bool           // Whether an agent file already has td guidance
+	AgentFileTDNeedsUpdate     bool           // Whether marked td guidance has an older version
 	IsFirstRunInit             bool           // Whether we're in real first-run flow (not H-key reopen)
 
 	// Sync prompt modal state
@@ -180,10 +208,14 @@ type Model struct {
 	BoardMode         BoardMode          // Active board mode state
 	BoardStatusPreset StatusFilterPreset // Current status filter preset for cycling
 
-	// Auto-sync callback (set by caller for periodic background sync)
-	AutoSyncFunc     func() // Called periodically to push/pull in background
+	// Deprecated: setting AutoSyncFunc suppresses the built-in monitor sync
+	// runtime and retains the legacy periodic callback behavior.
+	AutoSyncFunc func()
+	// Deprecated: use EmbeddedOptions.Sync.Interval.
 	AutoSyncInterval time.Duration
-	LastAutoSync     time.Time
+	// Deprecated: retained for compatibility with legacy callback users.
+	LastAutoSync time.Time
+	syncRuntime  *syncRuntime
 
 	// Configuration
 	RefreshInterval time.Duration
@@ -224,6 +256,17 @@ type Model struct {
 
 	// Markdown theme (for embedding with shared theme)
 	MarkdownTheme *MarkdownThemeConfig // Custom markdown/syntax theme (nil = default td colors)
+
+	// Theme and all styles derived from it are model-owned so multiple monitors
+	// can render different palettes safely in the same process.
+	theme         Theme
+	styles        monitorStyles
+	themeRevision uint64 // rejects async ANSI rendered for an older palette
+
+	// modalRender memoizes the rendered issue-modal string behind a pointer so
+	// every value copy of the model shares one cache. Nil for models built by
+	// struct literal (tests), which renders without caching.
+	modalRender *modalRenderCache
 }
 
 // NewModel creates a new monitor model
@@ -238,11 +281,13 @@ func NewModel(database *db.DB, sessionID string, interval time.Duration, ver str
 	// Initialize search input
 	searchInput := textinput.New()
 	searchInput.Placeholder = "search"
-	searchInput.Prompt = "" // No prompt, we show triangle icon separately
-	searchInput.Width = 50  // Reasonable width for search queries
+	searchInput.Prompt = ""  // No prompt, we show triangle icon separately
+	searchInput.SetWidth(50) // Reasonable width for search queries
 	searchInput.CharLimit = 200
 
-	return Model{
+	theme := DefaultTheme()
+	searchInput.SetStyles(themedTextInputStyles(theme))
+	m := Model{
 		DB:                database,
 		SessionID:         sessionID,
 		RefreshInterval:   interval,
@@ -266,7 +311,23 @@ func NewModel(database *db.DB, sessionID string, interval time.Duration, ver str
 		DraggingDivider:   -1,
 		DividerHover:      -1,
 		BaseDir:           baseDir,
+		theme:             theme,
+		styles:            newMonitorStyles(theme),
+		modalRender:       &modalRenderCache{},
 	}
+	syncInterval := syncconfig.GetAutoSyncInterval()
+	syncOpts := SyncOptions{Interval: syncInterval}
+	// A construction failure must leave a monitor that still runs, just without
+	// background sync. Passing a nil *Syncer through the syncService interface
+	// would read as "configured" and panic on the sync goroutine instead.
+	syncer, err := tdsync.New(tdsync.Options{BaseDir: baseDir, DB: database, Interval: syncInterval})
+	if err != nil {
+		slog.Debug("monitor: background sync unavailable", "err", err)
+		m.syncRuntime = newSyncRuntime(nil, syncOpts, database.Close)
+		return m
+	}
+	m.syncRuntime = newSyncRuntime(syncer, syncOpts, database.Close)
+	return m
 }
 
 // NewEmbedded creates a monitor model for embedding in external applications.
@@ -290,28 +351,48 @@ func NewEmbedded(baseDir string, interval time.Duration, ver string) (*Model, er
 
 	m := NewModel(database, sess.ID, interval, ver, resolvedBaseDir)
 	m.Embedded = true
+	m.syncRuntime.release = func() error { return releaseSharedDB(resolvedBaseDir) }
 	return &m, nil
 }
 
-// EmbeddedOptions configures an embedded monitor model.
+// EmbeddedOptions configures an embedded monitor model. Theme supplies td's
+// content palette; PanelRenderer and ModalRenderer optionally retain
+// host-owned border chrome.
 type EmbeddedOptions struct {
 	BaseDir       string        // Base directory for database and config
 	Interval      time.Duration // Refresh interval
 	Version       string        // Version string for display
 	PanelRenderer PanelRenderer // Custom panel border renderer (nil = default lipgloss)
 	ModalRenderer ModalRenderer // Custom modal border renderer (nil = default lipgloss)
+	Theme         Theme         // Semantic monitor palette; empty fields inherit td defaults
 
 	// MarkdownTheme configures markdown rendering to share themes with embedder.
 	// Pass colors from your theme to get consistent syntax highlighting.
-	// If nil, uses td's default ANSI 256 color palette.
+	// If nil, uses td's default ANSI 256 color palette. Deprecated: Theme takes
+	// precedence when supplied and will become the sole theming contract.
 	MarkdownTheme *MarkdownThemeConfig
+
+	// Sync controls monitor-owned background sync. Its zero value enables sync
+	// whenever the project gate is open.
+	Sync SyncOptions
 }
 
-// NewEmbeddedWithOptions creates a monitor model with custom options.
+// NewEmbeddedWithOptions creates a monitor model with custom options. A
+// partial Theme inherits missing slots from DefaultTheme; any invalid explicit
+// color is rejected before the database is opened.
 // It uses a shared database connection pool to prevent connection leaks when
 // Model values are copied in Update().
 // The caller must call Close() when done to release resources.
 func NewEmbeddedWithOptions(opts EmbeddedOptions) (*Model, error) {
+	var normalized Theme
+	var err error
+	if !themeIsZero(opts.Theme) {
+		normalized, err = normalizedTheme(opts.Theme)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	resolvedBaseDir := db.ResolveBaseDir(opts.BaseDir)
 
 	// Use shared DB to prevent connection leaks on Model value copies
@@ -328,10 +409,83 @@ func NewEmbeddedWithOptions(opts EmbeddedOptions) (*Model, error) {
 
 	m := NewModel(database, sess.ID, opts.Interval, opts.Version, resolvedBaseDir)
 	m.Embedded = true
+	release := func() error { return releaseSharedDB(resolvedBaseDir) }
+	if opts.Sync.Disabled {
+		m.syncRuntime = newSyncRuntime(nil, opts.Sync, release)
+	} else {
+		if opts.Sync.Interval == 0 {
+			opts.Sync.Interval = syncconfig.GetAutoSyncInterval()
+		}
+		syncer, syncErr := tdsync.New(tdsync.Options{BaseDir: resolvedBaseDir, DB: database, Logger: opts.Sync.Logger, Interval: opts.Sync.Interval})
+		if syncErr != nil {
+			slog.Debug("monitor: background sync unavailable", "err", syncErr)
+			m.syncRuntime = newSyncRuntime(nil, opts.Sync, release)
+		} else {
+			m.syncRuntime = newSyncRuntime(syncer, opts.Sync, release)
+		}
+	}
 	m.PanelRenderer = opts.PanelRenderer
 	m.ModalRenderer = opts.ModalRenderer
-	m.MarkdownTheme = opts.MarkdownTheme
+	if themeIsZero(opts.Theme) {
+		m.MarkdownTheme = opts.MarkdownTheme
+	} else {
+		m.theme = normalized
+		m.styles = newMonitorStyles(normalized)
+		m.SearchInput.SetStyles(themedTextInputStyles(normalized))
+		m.MarkdownTheme = markdownThemeConfig(normalized)
+	}
 	return &m, nil
+}
+
+// SetTheme atomically validates and applies a semantic palette to the running
+// monitor. Invalid explicit colors return an error without changing the prior
+// theme or child presentation state. Valid changes repaint cached markdown and
+// open child views while preserving database, polling, navigation, selection,
+// modal, note, and form interaction state. Call SetTheme from the host's Bubble
+// Tea goroutine rather than concurrently with Update or View.
+func (m *Model) SetTheme(theme Theme) error {
+	normalized, err := normalizedTheme(theme)
+	if err != nil {
+		return err
+	}
+
+	styles := newMonitorStyles(normalized)
+	markdown := markdownThemeConfig(normalized)
+	m.theme = normalized
+	m.styles = styles
+	m.themeRevision++
+	m.SearchInput.SetStyles(themedTextInputStyles(normalized))
+	m.MarkdownTheme = markdown
+	if m.FormState != nil {
+		m.FormState.setTheme(normalized)
+	}
+	for i := range m.ModalStack {
+		entry := &m.ModalStack[i]
+		if entry.Issue == nil {
+			continue
+		}
+		entry.DescRender = preRenderMarkdown(entry.Issue.Description, m.modalContentWidth(), markdown)
+		entry.AcceptRender = preRenderMarkdown(entry.Issue.Acceptance, m.modalContentWidth(), markdown)
+		entry.ContentLines = m.estimateModalContentLines(entry)
+	}
+	if m.NotesState != nil && m.NotesState.DetailNote != nil {
+		m.NotesState.DetailRender = preRenderMarkdown(m.NotesState.DetailNote.Content, m.modalContentWidth(), markdown)
+	}
+	m.rethemeDeclarativeModals(normalized)
+	return nil
+}
+
+func markdownThemeConfig(theme Theme) *MarkdownThemeConfig {
+	return &MarkdownThemeConfig{
+		SyntaxTheme:   theme.SyntaxTheme,
+		MarkdownTheme: theme.MarkdownTheme,
+		Colors: &MarkdownColorPalette{
+			Primary: themeColorHex(theme.Primary), Secondary: themeColorHex(theme.Secondary), Accent: themeColorHex(theme.Accent),
+			Success: themeColorHex(theme.Success), Warning: themeColorHex(theme.Warning),
+			Error: themeColorHex(theme.Error), Muted: themeColorHex(theme.TextMuted),
+			Text: themeColorHex(theme.TextPrimary), BgCode: themeColorHex(theme.Surface), Link: themeColorHex(theme.Link),
+		},
+	}
 }
 
 // Close releases resources held by an embedded monitor.
@@ -339,6 +493,9 @@ func NewEmbeddedWithOptions(opts EmbeddedOptions) (*Model, error) {
 // For embedded monitors, this releases the reference to the shared database pool.
 // The actual connection is only closed when all references are released.
 func (m *Model) Close() error {
+	if m.syncRuntime != nil {
+		return m.syncRuntime.close()
+	}
 	if m.DB != nil && m.Embedded && m.BaseDir != "" {
 		return releaseSharedDB(m.BaseDir)
 	} else if m.DB != nil {
@@ -409,6 +566,13 @@ func (m Model) Init() tea.Cmd {
 		m.restoreFilterState(),
 		m.checkFirstRun(),
 	}
+	if m.AutoSyncFunc == nil {
+		if m.syncRuntime != nil && m.syncRuntime.service != nil {
+			// Defer starting the goroutine until Bubble Tea has rendered the
+			// initial model and delivered this message back through Update.
+			cmds = append(cmds, func() tea.Msg { return startMonitorSyncMsg{} })
+		}
+	}
 
 	// Start async version check (non-blocking)
 	if m.Version != "" && !version.IsDevelopmentVersion(m.Version) {
@@ -464,6 +628,22 @@ type RestoreFilterMsg struct {
 
 // Update implements tea.Model
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if _, ok := msg.(startMonitorSyncMsg); ok {
+		return m, m.syncWaitCmd()
+	}
+	if syncMsg, ok := msg.(monitorSyncResultMsg); ok {
+		cmds := []tea.Cmd{m.syncWaitCmd()}
+		if syncMsg.changed {
+			cmds = append(cmds, m.fetchData())
+			if m.TaskListMode == TaskListModeBoard && m.BoardMode.Board != nil {
+				cmds = append(cmds, m.fetchBoardIssues(m.BoardMode.Board.ID))
+			}
+			if modalCmd := m.fetchModalDataIfOpen(); modalCmd != nil {
+				cmds = append(cmds, modalCmd)
+			}
+		}
+		return m, tea.Batch(cmds...)
+	}
 	// Handle TickMsg before any UI-mode interceptions to keep the poll chain
 	// alive. Without this, opening a form (or other overlay that intercepts all
 	// messages) would swallow the TickMsg, preventing scheduleTick() from being
@@ -518,14 +698,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Close confirmation mode: forward non-key messages to textinput (cursor blink, etc.)
-	// Key messages are handled in handleKey() via the declarative modal
-	if m.CloseConfirmOpen {
+	// Route non-key messages through declarative modals, which own the input
+	// pointers that rendering and executors read. This intentionally does not
+	// inspect the concrete message type: bubbles/textinput uses private
+	// messages for Ctrl+V clipboard results in addition to tea.PasteMsg.
+	if m.CloseConfirmOpen && m.CloseConfirmModal != nil {
 		if _, isKey := msg.(tea.KeyMsg); !isKey {
-			var inputCmd tea.Cmd
-			m.CloseConfirmInput, inputCmd = m.CloseConfirmInput.Update(msg)
-			if inputCmd != nil {
-				return m, inputCmd
+			_, cmd := m.CloseConfirmModal.HandleMsg(msg)
+			if cmd != nil {
+				return m, cmd
+			}
+		}
+	}
+
+	// Attribution prompt: forward non-key messages to textinput (cursor blink).
+	// Key messages are handled in handleKey() via the declarative modal.
+	if m.SelfReviewConfirmOpen && m.SelfReviewConfirmModal != nil {
+		if _, isKey := msg.(tea.KeyMsg); !isKey {
+			_, cmd := m.SelfReviewConfirmModal.HandleMsg(msg)
+			if cmd != nil {
+				return m, cmd
+			}
+		}
+	}
+
+	// Record-review mode: forward non-key messages to textinput (cursor blink).
+	// Key messages are handled in handleKey() via the declarative modal.
+	if m.RecordReviewOpen && m.RecordReviewModal != nil {
+		if _, isKey := msg.(tea.KeyMsg); !isKey {
+			_, cmd := m.RecordReviewModal.HandleMsg(msg)
+			if cmd != nil {
+				return m, cmd
 			}
 		}
 	}
@@ -547,14 +750,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.WindowSizeMsg:
+		// Re-render markdown only when the width it was wrapped at actually
+		// moved. Panel bounds are recomputed either way: a host may set Width
+		// and Height directly and send this message to have them derived, so
+		// an unchanged size still has to reach updatePanelBounds.
+		//
+		// A host that announces its geometry every frame rather than on every
+		// resize (sidecar's pane frame did) makes this the top of a message
+		// loop otherwise: each render asks for a markdown pass, whose result
+		// message drives the next render. Idempotence here is what keeps that
+		// a host bug instead of a runaway monitor (td-fcb03a).
+		prevWidth := m.modalContentWidth()
 		m.Width = msg.Width
 		m.Height = msg.Height
 		m.updatePanelBounds()
-		// Re-render markdown if modal is open (width may have changed)
 		if modal := m.CurrentModal(); modal != nil && modal.Issue != nil {
 			if modal.Issue.Description != "" || modal.Issue.Acceptance != "" {
-				width := m.modalContentWidth()
-				return m, m.renderMarkdownAsync(modal.IssueID, modal.Issue.Description, modal.Issue.Acceptance, width)
+				if width := m.modalContentWidth(); width != prevWidth {
+					return m, m.renderMarkdownAsync(modal.IssueID, modal.Issue.Description, modal.Issue.Acceptance, width)
+				}
 			}
 		}
 		return m, nil
@@ -572,6 +786,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.TaskList = msg.TaskList
 		m.RecentHandoffs = msg.RecentHandoffs
 		m.ActiveSessions = msg.ActiveSessions
+		m.HasIssues = msg.HasIssues
 		m.LastRefresh = msg.Timestamp
 
 		// Build flattened rows for selection
@@ -598,6 +813,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			modal.Blocks = msg.Blocks
 			modal.EpicTasks = msg.EpicTasks
 			modal.ParentEpic = msg.ParentEpic
+			modal.HasActiveApproval = msg.HasActiveApproval
+			modal.Reviews = msg.Reviews
 			if isInitialLoad {
 				modal.ParentEpicFocused = false // Only reset focus on initial load
 			}
@@ -635,11 +852,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case MarkdownRenderedMsg:
 		// Only update if this is for the currently open modal
-		if modal := m.CurrentModal(); modal != nil && msg.IssueID == modal.IssueID {
+		if modal := m.CurrentModal(); modal != nil && msg.IssueID == modal.IssueID && msg.ThemeRevision == m.themeRevision {
 			modal.DescRender = msg.DescRender
 			modal.AcceptRender = msg.AcceptRender
 			// Recalculate content lines after markdown rendering
 			modal.ContentLines = m.estimateModalContentLines(modal)
+		}
+		return m, nil
+
+	case NoteMarkdownRenderedMsg:
+		if m.NotesState != nil && m.NotesState.DetailNote != nil &&
+			msg.NoteID == m.NotesState.DetailNote.ID && msg.ThemeRevision == m.themeRevision {
+			m.NotesState.DetailRender = msg.Render
 		}
 		return m, nil
 
@@ -679,12 +903,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case FirstRunCheckMsg:
 		m.AgentFilePath = msg.AgentFilePath
 		m.AgentFileHasTD = msg.HasInstructions
+		m.AgentFileTDNeedsUpdate = msg.NeedsInstructionsUpdate
 		if msg.IsFirstRun {
 			m.IsFirstRunInit = true
 			m.GettingStartedOpen = true
 			m.GettingStartedModal = m.createGettingStartedModal()
 			m.GettingStartedModal.Reset()
 			m.GettingStartedMouseHandler = mouse.NewHandler()
+			// Record that we've shown the modal so it isn't re-shown on every
+			// launch, even if the user declines to install instructions.
+			return m, m.markGettingStartedSeen()
 		}
 		return m, nil
 
@@ -693,6 +921,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.StatusMessage = msg.Message
 			m.StatusIsError = false
 			m.AgentFileHasTD = true
+			m.AgentFileTDNeedsUpdate = false
 			// Recreate modal to show updated state (checkmark)
 			if m.GettingStartedOpen {
 				m.GettingStartedModal = m.createGettingStartedModal()
@@ -798,6 +1027,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Clamp kanban cursor if the kanban view is open (data may have changed)
 			if m.KanbanOpen {
+				m.clampKanbanCol()
 				m.clampKanbanRow()
 				m.ensureKanbanCursorVisible()
 			}
@@ -898,9 +1128,17 @@ func (m Model) CurrentContextString() string {
 	return keymap.ContextToSidecar(m.currentContext())
 }
 
-// View implements tea.Model
-func (m Model) View() string {
+// ViewString returns the monitor as a plain rendered string for embedders.
+func (m Model) ViewString() string {
 	return m.renderView()
+}
+
+// View implements tea.Model.
+func (m Model) View() tea.View {
+	view := tea.NewView(m.ViewString())
+	view.AltScreen = true
+	view.MouseMode = tea.MouseModeAllMotion
+	return view
 }
 
 // scheduleTick returns a command that sends a TickMsg after the refresh interval
@@ -992,6 +1230,14 @@ func (m Model) fetchIssueDetails(issueID string) tea.Cmd {
 			epicTasks, _ := m.DB.ListIssues(db.ListIssuesOptions{ParentID: issueID})
 			msg.EpicTasks = epicTasks
 		}
+
+		// Review state for the "(fresh)" marker and "Recent reviews" section.
+		// Fetched here rather than in renderModal so a host application that
+		// repaints on every message never pays for database queries per frame.
+		if active, _ := m.DB.GetActiveApprovalReview(issueID); active != nil {
+			msg.HasActiveApproval = true
+		}
+		msg.Reviews, _ = m.DB.ListIssueReviews(issueID)
 
 		return msg
 	}

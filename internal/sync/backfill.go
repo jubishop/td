@@ -34,6 +34,7 @@ var syncableTables = []syncableTable{
 	{"issue_dependencies", "dependency", []string{"dependency", "issue_dependencies"}, []string{"add_dependency"}, false},
 	{"issue_files", "file_link", []string{"file_link", "issue_files"}, []string{"link_file"}, false},
 	{"work_session_issues", "work_session_issues", []string{"work_session_issue", "work_session_issues"}, []string{"work_session_tag"}, false},
+	{"issue_reviews", "issue_reviews", []string{"issue_review", "issue_reviews"}, []string{"create"}, false},
 	{"notes", "notes", []string{"note", "notes"}, []string{"create"}, true},
 }
 
@@ -115,7 +116,7 @@ func BackfillStaleIssues(tx *sql.Tx, sessionID string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("query issues for stale backfill: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -128,7 +129,7 @@ func BackfillStaleIssues(tx *sql.Tx, sessionID string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("prepare insert: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	const staleThreshold = time.Second
 	count := 0
@@ -291,7 +292,7 @@ func backfillTable(tx *sql.Tx, st syncableTable, sessionID string) (int, error) 
 	if err != nil {
 		return 0, fmt.Errorf("query orphans: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -305,7 +306,7 @@ func backfillTable(tx *sql.Tx, st syncableTable, sessionID string) (int, error) 
 	if err != nil {
 		return 0, fmt.Errorf("prepare insert: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	count := 0
 	for rows.Next() {
@@ -328,6 +329,7 @@ func backfillTable(tx *sql.Tx, st syncableTable, sessionID string) (int, error) 
 				entityID = fmt.Sprint(vals[i])
 			}
 		}
+		scrubLocalOnlySyncFields(st.Table, rowMap)
 		if entityID == "" {
 			continue
 		}
@@ -426,7 +428,7 @@ func anyEventSetsStatus(tx *sql.Tx, entityID, status string) bool {
 	if err != nil {
 		return false
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var newData, prevData sql.NullString
@@ -459,7 +461,7 @@ func checkCreateEventStatus(tx *sql.Tx, entityID, pattern, status string) bool {
 	if err != nil {
 		return false
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var newData sql.NullString

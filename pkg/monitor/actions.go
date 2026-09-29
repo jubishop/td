@@ -1,13 +1,169 @@
 package monitor
 
 import (
+	"errors"
+	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/marcus/td/internal/db"
+	"github.com/marcus/td/internal/features"
 	"github.com/marcus/td/internal/models"
+	"github.com/marcus/td/internal/reviewpolicy"
 	"github.com/marcus/td/internal/workflow"
 )
+
+// describeIssueWriteError renders an issue-write failure for the status bar.
+// A stale-snapshot rejection is the monitor's most likely write failure: a
+// pane row, or an open modal, holds an issue loaded on the last refresh tick,
+// and another session wrote the row in between. That is recoverable by
+// refreshing, so say so instead of surfacing the raw updated_at timestamps —
+// and above all do not fail silently, which leaves the user pressing a key
+// that appears to do nothing.
+func describeIssueWriteError(action string, err error) string {
+	var stale *db.StaleIssueUpdateError
+	if errors.As(err, &stale) {
+		return "Cannot " + action + ": issue changed in another session — refresh and retry"
+	}
+	return "Failed to " + action + ": " + err.Error()
+}
+
+// issueWriteFailure sets the status bar to an issue-write failure and returns
+// the usual auto-clear tick, so every write path reports failures the same way.
+func (m *Model) issueWriteFailure(action string, err error) tea.Cmd {
+	m.StatusMessage = describeIssueWriteError(action, err)
+	m.StatusIsError = true
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+		return ClearStatusMsg{}
+	})
+}
+
+// monitorApproveInputs bundles the facts the shared reviewpolicy package needs
+// to decide whether a monitor session may approve the selected issue. Exposed
+// (unexported symbol) so the parity test suite can construct the same input
+// the runtime does without invoking bubbletea.
+type monitorApproveInputs struct {
+	Mode                     reviewpolicy.Mode
+	Issue                    *models.Issue
+	SessionID                string
+	HasImplementationHistory bool
+	WasAnyInvolved           bool
+	HasActiveApproval        bool
+	// SelfReviewAcknowledged mirrors the CLI's --self-review flag. In the
+	// monitor it is set to true after the operator confirms the trusted-mode
+	// "you implemented this; approve as self-review?" prompt. It is threaded
+	// into the reviewpolicy decision so trusted-mode self-review becomes an
+	// audited allow (SelfReview=true) instead of a reject.
+	SelfReviewAcknowledged bool
+
+	// AttributedTo mirrors the CLI's --reviewed-by. The monitor's prompt asks
+	// "who reviewed this?"; a typed name lands here, and an empty submit falls
+	// through to SelfReviewAcknowledged.
+	AttributedTo string
+}
+
+// MonitorApproveDecisionForTest is the exported thin wrapper that the
+// cross-surface parity suite (see cmd/parity_surface_test.go) uses to drive
+// the monitor's decision path with synthetic inputs. Not intended for
+// runtime callers; runtime code should use monitorApproveDecision +
+// loadMonitorApproveInputs directly.
+func MonitorApproveDecisionForTest(mode reviewpolicy.Mode, issue *models.Issue, sessionID string, hasImplementationHistory, wasAnyInvolved, hasActiveApproval, selfReviewAcknowledged bool) reviewpolicy.ReviewerEligibility {
+	return monitorApproveDecision(monitorApproveInputs{
+		Mode:                     mode,
+		Issue:                    issue,
+		SessionID:                sessionID,
+		HasImplementationHistory: hasImplementationHistory,
+		WasAnyInvolved:           wasAnyInvolved,
+		HasActiveApproval:        hasActiveApproval,
+		SelfReviewAcknowledged:   selfReviewAcknowledged,
+	})
+}
+
+// MonitorApproveDecisionAttributedForTest is MonitorApproveDecisionForTest plus
+// the --reviewed-by attestation, so the cross-surface parity suite can pin that
+// the monitor treats attribution exactly as the CLI and API do.
+func MonitorApproveDecisionAttributedForTest(mode reviewpolicy.Mode, issue *models.Issue, sessionID string, hasImplementationHistory, wasAnyInvolved, hasActiveApproval, selfReviewAcknowledged bool, attributedTo string) reviewpolicy.ReviewerEligibility {
+	return monitorApproveDecision(monitorApproveInputs{
+		Mode:                     mode,
+		Issue:                    issue,
+		SessionID:                sessionID,
+		HasImplementationHistory: hasImplementationHistory,
+		WasAnyInvolved:           wasAnyInvolved,
+		HasActiveApproval:        hasActiveApproval,
+		SelfReviewAcknowledged:   selfReviewAcknowledged,
+		AttributedTo:             attributedTo,
+	})
+}
+
+// monitorApproveDecision returns the reviewpolicy decision for the monitor's
+// approval action. Batch 1c aligns the monitor's rule with CLI / serve /
+// snapshot-query-source: instead of the pre-batch "only block the current
+// implementer" check, the monitor now uses the same strict/balanced rule as
+// the other surfaces under the default (strict) mode. This may reject
+// approvals that the pre-batch monitor would have permitted; that's the
+// intentional parity alignment called out in the batch plan.
+func monitorApproveDecision(in monitorApproveInputs) reviewpolicy.ReviewerEligibility {
+	isCreator := in.Issue != nil && in.Issue.CreatorSession != "" && in.Issue.CreatorSession == in.SessionID
+	isImplementer := in.Issue != nil && in.Issue.ImplementerSession != "" && in.Issue.ImplementerSession == in.SessionID
+	return reviewpolicy.EvaluateReviewerEligibility(reviewpolicy.ReviewerEligibilityInput{
+		Mode:                     in.Mode,
+		Issue:                    in.Issue,
+		SessionID:                in.SessionID,
+		SessionIsImplementer:     isImplementer,
+		SessionIsCreator:         isCreator,
+		HasImplementationHistory: in.HasImplementationHistory,
+		HasActiveApproval:        in.HasActiveApproval,
+		WasAnyInvolved:           in.WasAnyInvolved,
+		SelfReviewAcknowledged:   in.SelfReviewAcknowledged,
+		AttributedTo:             in.AttributedTo,
+	})
+}
+
+// loadMonitorApproveInputs reads the DB facts the monitor needs to run the
+// shared reviewpolicy decision. Errors are handled conservatively — on any
+// DB failure the returned inputs flag involvement as true so the caller
+// rejects the approve rather than silently opening it. Used by both the
+// runtime (approveIssue) and the parity test.
+func loadMonitorApproveInputs(database *db.DB, baseDir, sessionID string, issue *models.Issue) monitorApproveInputs {
+	mode := reviewpolicy.ModeStrict
+	if baseDir != "" {
+		if m, err := features.ResolveReviewPolicyMode(baseDir); err == nil {
+			mode = m
+		}
+	}
+
+	in := monitorApproveInputs{
+		Mode:      mode,
+		Issue:     issue,
+		SessionID: sessionID,
+	}
+	if database == nil || issue == nil {
+		in.WasAnyInvolved = true
+		in.HasImplementationHistory = true
+		return in
+	}
+
+	was, err := database.WasSessionInvolved(issue.ID, sessionID)
+	if err != nil {
+		in.WasAnyInvolved = true
+	} else {
+		in.WasAnyInvolved = was
+	}
+	impl, err := database.WasSessionImplementationInvolved(issue.ID, sessionID)
+	if err != nil {
+		in.HasImplementationHistory = true
+	} else {
+		in.HasImplementationHistory = impl
+	}
+	// Active approval lookup is only meaningful for delegated mode; the
+	// strict/balanced paths ignore it. Query unconditionally so the parity
+	// suite sees the same inputs the runtime passes.
+	active, err := database.GetActiveApprovalReview(issue.ID)
+	if err == nil && active != nil {
+		in.HasActiveApproval = true
+	}
+	return in
+}
 
 // markForReview marks the selected issue for review
 // Works from modal view, CurrentWork panel, or TaskList panel
@@ -56,7 +212,7 @@ func (m Model) markForReview() (tea.Model, tea.Cmd) {
 		issue.ImplementerSession = m.SessionID
 	}
 	if err := m.DB.UpdateIssueLogged(issue, m.SessionID, models.ActionReview); err != nil {
-		return m, nil
+		return m, m.issueWriteFailure("move to review", err)
 	}
 
 	// Cascade DOWN to descendants if this is a parent issue (epic)
@@ -66,12 +222,18 @@ func (m Model) markForReview() (tea.Model, tea.Cmd) {
 			models.StatusInProgress,
 		})
 		if err == nil && len(descendants) > 0 {
+			var skipped []string
 			for _, child := range descendants {
 				child.Status = models.StatusInReview
 				if child.ImplementerSession == "" {
 					child.ImplementerSession = m.SessionID
 				}
-				_ = m.DB.UpdateIssueLogged(child, m.SessionID, models.ActionReview)
+				// A child whose write is rejected did not move, so it must
+				// not get a log entry claiming it did.
+				if err := m.DB.UpdateIssueLogged(child, m.SessionID, models.ActionReview); err != nil {
+					skipped = append(skipped, child.ID)
+					continue
+				}
 				_ = m.DB.AddLog(&models.Log{
 					IssueID:   child.ID,
 					SessionID: m.SessionID,
@@ -79,11 +241,16 @@ func (m Model) markForReview() (tea.Model, tea.Cmd) {
 					Type:      models.LogTypeProgress,
 				})
 			}
+			if len(skipped) > 0 {
+				m.StatusMessage = "Review cascade skipped " + strings.Join(skipped, ", ") + " (changed in another session)"
+				m.StatusIsError = true
+			}
 		}
 	}
 
 	// Cascade up to parent epic if all siblings are ready
 	m.DB.CascadeUpParentStatus(issueID, models.StatusInReview, m.SessionID)
+	m.wakeSync()
 
 	// If we're in a modal, refresh instead of closing to keep context
 	if modal := m.CurrentModal(); modal != nil {
@@ -143,6 +310,7 @@ func (m Model) executeDelete() (tea.Model, tea.Cmd) {
 		m.closeDeleteConfirmModal()
 		return m, nil
 	}
+	m.wakeSync()
 
 	// Close the delete confirmation modal
 	m.closeDeleteConfirmModal()
@@ -211,7 +379,10 @@ func (m Model) executeCloseWithReason() (tea.Model, tea.Cmd) {
 	}
 
 	issueID := m.CloseConfirmIssueID
-	reason := m.CloseConfirmInput.Value()
+	reason := ""
+	if m.CloseConfirmModal != nil {
+		reason = strings.TrimSpace(m.CloseConfirmModal.InputValue("reason"))
+	}
 
 	// Get the issue
 	issue, err := m.DB.GetIssue(issueID)
@@ -233,7 +404,7 @@ func (m Model) executeCloseWithReason() (tea.Model, tea.Cmd) {
 	issue.ClosedAt = &now
 	if err := m.DB.UpdateIssueLogged(issue, m.SessionID, models.ActionClose); err != nil {
 		m.closeCloseConfirmModal()
-		return m, nil
+		return m, m.issueWriteFailure("close", err)
 	}
 
 	// Add progress log with optional reason
@@ -248,7 +419,9 @@ func (m Model) executeCloseWithReason() (tea.Model, tea.Cmd) {
 		Type:      models.LogTypeProgress,
 	})
 
-	// Cascade DOWN to descendants if this is a parent issue (epic)
+	// Cascade DOWN to descendants if this is a parent issue (epic).
+	// Reuse the `now` timestamp captured above so the cascade shares one
+	// close_at across all descendants.
 	if hasChildren, _ := m.DB.HasChildren(issueID); hasChildren {
 		descendants, err := m.DB.GetDescendantIssues(issueID, []models.Status{
 			models.StatusOpen,
@@ -256,14 +429,20 @@ func (m Model) executeCloseWithReason() (tea.Model, tea.Cmd) {
 			models.StatusInReview,
 		})
 		if err == nil && len(descendants) > 0 {
-			now := time.Now()
+			var skipped []string
 			for _, child := range descendants {
 				child.Status = models.StatusClosed
 				child.ClosedAt = &now
 				if child.ImplementerSession == "" {
 					child.ImplementerSession = m.SessionID
 				}
-				_ = m.DB.UpdateIssueLogged(child, m.SessionID, models.ActionClose)
+				// A child whose write is rejected is still open: skip both
+				// the log entry and the dependent unblock that only make
+				// sense once it is actually closed.
+				if err := m.DB.UpdateIssueLogged(child, m.SessionID, models.ActionClose); err != nil {
+					skipped = append(skipped, child.ID)
+					continue
+				}
 				_ = m.DB.AddLog(&models.Log{
 					IssueID:   child.ID,
 					SessionID: m.SessionID,
@@ -271,6 +450,10 @@ func (m Model) executeCloseWithReason() (tea.Model, tea.Cmd) {
 					Type:      models.LogTypeProgress,
 				})
 				m.DB.CascadeUnblockDependents(child.ID, m.SessionID)
+			}
+			if len(skipped) > 0 {
+				m.StatusMessage = "Close cascade skipped " + strings.Join(skipped, ", ") + " (changed in another session)"
+				m.StatusIsError = true
 			}
 		}
 	}
@@ -280,6 +463,7 @@ func (m Model) executeCloseWithReason() (tea.Model, tea.Cmd) {
 
 	// Auto-unblock dependents whose dependencies are now all closed
 	m.DB.CascadeUnblockDependents(issueID, m.SessionID)
+	m.wakeSync()
 
 	// Close the confirmation modal
 	m.closeCloseConfirmModal()
@@ -300,7 +484,11 @@ func (m Model) executeCloseWithReason() (tea.Model, tea.Cmd) {
 	return m, m.fetchData()
 }
 
-// approveIssue approves/closes the selected reviewable issue
+// approveIssue approves/closes the selected reviewable issue.
+// Under delegated mode, if an active approval already exists and the session
+// closes, this acts as a close-after-review (Mode C) — the existing
+// reviewer_session / reviewed_at fields are preserved and closed_by_session is
+// stamped to the caller.
 func (m Model) approveIssue() (tea.Model, tea.Cmd) {
 	// Must be in Task List panel
 	if m.ActivePanel != PanelTaskList {
@@ -323,24 +511,118 @@ func (m Model) approveIssue() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Can't approve your own issues
-	if issue.ImplementerSession == m.SessionID {
+	// Run the same reviewer-eligibility decision the CLI/serve/snapshot use.
+	// This is an intentional alignment: the pre-batch monitor only blocked
+	// the current implementer, while the CLI strict rule also blocks prior
+	// involvement. Under default review_policy_mode=strict the monitor now
+	// rejects approvals the CLI would reject too.
+	inputs := loadMonitorApproveInputs(m.DB, m.BaseDir, m.SessionID, issue)
+
+	// Close-after-review (Mode C, delegated/trusted): if an active approval
+	// already exists, close preserving the prior reviewer_session/reviewed_at.
+	if (inputs.Mode == reviewpolicy.ModeDelegated || inputs.Mode == reviewpolicy.ModeTrusted) && inputs.HasActiveApproval {
+		closeIn := reviewpolicy.CloseEligibilityInput{
+			Mode:                      inputs.Mode,
+			Issue:                     issue,
+			SessionID:                 m.SessionID,
+			SessionIsImplementer:      issue.ImplementerSession != "" && issue.ImplementerSession == m.SessionID,
+			SessionIsCreator:          issue.CreatorSession != "" && issue.CreatorSession == m.SessionID,
+			SessionIsReviewerOfRecord: issue.ReviewerSession != "" && issue.ReviewerSession == m.SessionID,
+			SessionIsReviewRequester:  issue.ReviewRequestedBySession != "" && issue.ReviewRequestedBySession == m.SessionID,
+			HasImplementationHistory:  inputs.HasImplementationHistory,
+			WasAnyInvolved:            inputs.WasAnyInvolved,
+			HasActiveApproval:         true,
+		}
+		if reviewpolicy.EvaluateCloseEligibility(closeIn).Allowed {
+			now := time.Now()
+			issue.Status = models.StatusClosed
+			issue.ClosedBySession = m.SessionID
+			issue.ClosedAt = &now
+			// Preserve existing ReviewerSession / ReviewedAt
+			if err := m.DB.UpdateIssueLoggedWithReviewMeta(issue, models.StatusInReview, m.SessionID, models.ActionCloseAfterReview, "", ""); err != nil {
+				return m, nil
+			}
+			_ = m.DB.RecordSessionAction(issue.ID, m.SessionID, models.ActionSessionClosed)
+			m.DB.CascadeUpParentStatus(issue.ID, models.StatusClosed, m.SessionID)
+			m.DB.CascadeUnblockDependents(issue.ID, m.SessionID)
+			m.wakeSync()
+			m.SelectedID[PanelTaskList] = ""
+			if m.TaskListMode == TaskListModeBoard && m.BoardMode.Board != nil {
+				return m, tea.Batch(m.fetchData(), m.fetchBoardIssues(m.BoardMode.Board.ID))
+			}
+			return m, m.fetchData()
+		}
+	}
+
+	decision := monitorApproveDecision(inputs)
+	if !decision.Allowed {
+		// Trusted-mode self-review escape: the only reject the monitor can
+		// turn into an allow is the implementer/has-history self-review under
+		// trusted mode. Rather than silently blocking (the CLI requires the
+		// --self-review flag) or silently self-approving, prompt the operator
+		// for an explicit acknowledgement. Re-running with the ack set must
+		// then be allowed (decision.SelfReview=true) — otherwise the reject is
+		// for some other reason and we leave it blocked.
+		if inputs.Mode == reviewpolicy.ModeTrusted {
+			ackInputs := inputs
+			ackInputs.SelfReviewAcknowledged = true
+			if monitorApproveDecision(ackInputs).SelfReview {
+				m = m.openSelfReviewConfirmModal(issue.ID, issue.Title)
+				return m, nil
+			}
+		}
 		return m, nil
 	}
 
-	// Update status
+	return m.executeApproveClose(issue, decision.SelfReview)
+}
+
+// executeApproveClose performs the direct reviewer-close (Mode A) and any
+// epic cascade for an approved issue. selfReview records the trusted-mode
+// self-review audit bit on the issue_reviews row, identical to the CLI's
+// `td approve --self-review` path.
+func (m Model) executeApproveClose(issue *models.Issue, selfReview bool) (tea.Model, tea.Cmd) {
+	return m.executeApproveCloseAttributed(issue, selfReview, "", "")
+}
+
+// executeApproveCloseAttributed is executeApproveClose plus the --reviewed-by
+// attestation. Split so the many existing callers that never attribute keep
+// their signature.
+func (m Model) executeApproveCloseAttributed(issue *models.Issue, selfReview bool, attributedTo, reason string) (tea.Model, tea.Cmd) {
+	// Direct reviewer-close (Mode A)
 	now := time.Now()
 	issue.Status = models.StatusClosed
 	issue.ReviewerSession = m.SessionID
+	issue.ClosedBySession = m.SessionID
+	issue.ReviewedAt = &now
 	issue.ClosedAt = &now
-	if err := m.DB.UpdateIssueLogged(issue, m.SessionID, models.ActionApprove); err != nil {
-		return m, nil
+
+	// Also record an issue_reviews row so audit output distinguishes direct
+	// reviewer-close from cascaded close. It must succeed before the issue
+	// closes so an action_log failure cannot produce a closed-but-unsynced
+	// approval.
+	_, err := m.DB.CreateIssueReviewAndUpdateIssueLogged(db.NewReview{
+		IssueID:            issue.ID,
+		ReviewerSession:    m.SessionID,
+		Decision:           reviewpolicy.DecisionApproved,
+		Summary:            reason,
+		RequestedBySession: issue.ReviewRequestedBySession,
+		SelfReview:         selfReview,
+		ReviewedBy:         attributedTo,
+	}, issue, models.StatusInReview, m.SessionID, models.ActionApprove)
+	if err != nil {
+		m.StatusMessage = "failed to approve issue: " + err.Error()
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
 	}
 
 	// Record session action for bypass prevention
 	_ = m.DB.RecordSessionAction(issue.ID, m.SessionID, models.ActionSessionReviewed)
+	m.logReviewSecurityEvent(issue.ID, selfReview, attributedTo, reason, false)
 
-	// Cascade DOWN to descendants if this is a parent issue (epic)
+	// Cascade DOWN to descendants if this is a parent issue (epic).
+	// Reuse the `now` captured above so the whole cascade shares one
+	// timestamp (approved / closed_at / reviewed_at) across the epic.
 	if hasChildren, _ := m.DB.HasChildren(issue.ID); hasChildren {
 		descendants, err := m.DB.GetDescendantIssues(issue.ID, []models.Status{
 			models.StatusOpen,
@@ -348,15 +630,26 @@ func (m Model) approveIssue() (tea.Model, tea.Cmd) {
 			models.StatusInReview,
 		})
 		if err == nil && len(descendants) > 0 {
-			now := time.Now()
 			for _, child := range descendants {
+				previousStatus := child.Status
 				child.Status = models.StatusClosed
 				child.ClosedAt = &now
 				child.ReviewerSession = m.SessionID
+				child.ClosedBySession = m.SessionID
+				child.ReviewedAt = &now
 				if child.ImplementerSession == "" {
 					child.ImplementerSession = m.SessionID
 				}
-				_ = m.DB.UpdateIssueLogged(child, m.SessionID, models.ActionApprove)
+				_, err := m.DB.CreateIssueReviewAndUpdateIssueLogged(db.NewReview{
+					IssueID:            child.ID,
+					ReviewerSession:    m.SessionID,
+					Decision:           reviewpolicy.DecisionApprovedByParentCascade,
+					Summary:            "Cascaded approval from " + issue.ID,
+					RequestedBySession: child.ReviewRequestedBySession,
+				}, child, previousStatus, m.SessionID, models.ActionApprove)
+				if err != nil {
+					continue
+				}
 				_ = m.DB.AddLog(&models.Log{
 					IssueID:   child.ID,
 					SessionID: m.SessionID,
@@ -373,6 +666,7 @@ func (m Model) approveIssue() (tea.Model, tea.Cmd) {
 
 	// Auto-unblock dependents whose dependencies are now all closed
 	m.DB.CascadeUnblockDependents(issue.ID, m.SessionID)
+	m.wakeSync()
 
 	// Clear the saved ID so cursor stays at the same position after refresh
 	// The item will move to Closed, and we want cursor at same index for next item
@@ -382,6 +676,28 @@ func (m Model) approveIssue() (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchData(), m.fetchBoardIssues(m.BoardMode.Board.ID))
 	}
 	return m, m.fetchData()
+}
+
+// logReviewSecurityEvent mirrors the CLI/API audit-file contract. SelfReview
+// means the recording session was implementation-involved, including an
+// attributed review performed by someone else. Independent sessions are
+// deliberately omitted so routine approvals do not dilute the audit signal.
+func (m Model) logReviewSecurityEvent(issueID string, selfReview bool, attributedTo, reason string, recordOnly bool) {
+	if !selfReview || m.BaseDir == "" {
+		return
+	}
+	auditReason := "self_review: " + reason
+	if attributedTo != "" {
+		auditReason = "attributed_review by " + attributedTo + ": " + reason
+	}
+	if recordOnly {
+		auditReason = "record_only " + auditReason
+	}
+	_ = db.LogSecurityEvent(m.BaseDir, db.SecurityEvent{
+		IssueID:   issueID,
+		SessionID: m.SessionID,
+		Reason:    auditReason,
+	})
 }
 
 // reopenIssue reopens a closed issue
@@ -438,6 +754,7 @@ func (m Model) reopenIssue() (tea.Model, tea.Cmd) {
 			return ClearStatusMsg{}
 		})
 	}
+	m.wakeSync()
 
 	m.StatusMessage = "REOPENED " + issueID
 	m.StatusIsError = false
@@ -585,6 +902,248 @@ func (m Model) sendToWorktree() (tea.Model, tea.Cmd) {
 	return m, func() tea.Msg {
 		return SendTaskToWorktreeMsg{TaskID: issueID, TaskTitle: title}
 	}
+}
+
+// recordReviewAction opens the record-review reason prompt for the selected
+// issue. Gated on review_policy_mode=delegated and reviewer eligibility — if
+// either fails, the action is a no-op so the binding has no effect outside
+// the expected conditions. See docs/plans/orchestrator-review-closure-plan.md
+// under "Monitor / TUI Changes > Actions" for the split.
+func (m Model) recordReviewAction() (tea.Model, tea.Cmd) {
+	if m.ActivePanel != PanelTaskList {
+		return m, nil
+	}
+	issueID := m.SelectedIssueID(m.ActivePanel)
+	if issueID == "" {
+		return m, nil
+	}
+	issue, err := m.DB.GetIssue(issueID)
+	if err != nil || issue == nil {
+		return m, nil
+	}
+	if issue.Status != models.StatusInReview {
+		return m, nil
+	}
+
+	inputs := loadMonitorApproveInputs(m.DB, m.BaseDir, m.SessionID, issue)
+	if inputs.Mode != reviewpolicy.ModeDelegated && inputs.Mode != reviewpolicy.ModeTrusted {
+		m.StatusMessage = "record-review requires review_policy_mode=delegated or trusted"
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+	}
+	if inputs.HasActiveApproval {
+		m.StatusMessage = "review already recorded; press 'a' to close"
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+	}
+	decision := monitorApproveDecision(inputs)
+	if !decision.Allowed {
+		// Let an involved recorder reach the prompt when either a named
+		// attribution or trusted self-review acknowledgement would make the
+		// policy decision valid. The executor evaluates the real values before
+		// writing anything.
+		attributedInputs := inputs
+		attributedInputs.AttributedTo = "reviewer"
+		attributedDecision := monitorApproveDecision(attributedInputs)
+		selfReviewDecision := reviewpolicy.ReviewerEligibility{}
+		if inputs.Mode == reviewpolicy.ModeTrusted {
+			selfReviewInputs := inputs
+			selfReviewInputs.SelfReviewAcknowledged = true
+			selfReviewDecision = monitorApproveDecision(selfReviewInputs)
+		}
+		if !attributedDecision.Allowed && !selfReviewDecision.Allowed {
+			if decision.RejectionMessage != "" {
+				m.StatusMessage = decision.RejectionMessage
+			} else {
+				m.StatusMessage = "you are not eligible to review this issue"
+			}
+			m.StatusIsError = true
+			return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+		}
+	}
+
+	m = m.openRecordReviewModal(issue.ID, issue.Title)
+	return m, nil
+}
+
+// executeRecordReview writes the issue_reviews row (decision=approved by
+// default) and updates reviewer_session / reviewed_at. Status stays
+// in_review — this is the record-only path. Called from the confirm button
+// on the record-review modal.
+func (m Model) executeRecordReview() (tea.Model, tea.Cmd) {
+	if m.RecordReviewIssueID == "" {
+		m.closeRecordReviewModal()
+		return m, nil
+	}
+	issueID := m.RecordReviewIssueID
+	reason := ""
+	attributedTo := ""
+	if m.RecordReviewModal != nil {
+		reason = strings.TrimSpace(m.RecordReviewModal.InputValue("reason"))
+		attributedTo = strings.TrimSpace(m.RecordReviewModal.InputValue("reviewed_by"))
+	}
+	decision := m.RecordReviewDecision
+	if decision == "" {
+		decision = reviewpolicy.DecisionApproved
+	}
+
+	if reason == "" {
+		m.StatusMessage = "record-review requires a reason"
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+	}
+
+	issue, err := m.DB.GetIssue(issueID)
+	if err != nil || issue == nil {
+		m.closeRecordReviewModal()
+		return m, nil
+	}
+	if issue.Status != models.StatusInReview {
+		m.StatusMessage = "cannot record review: " + issueID + " is not in review"
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+	}
+
+	inputs := loadMonitorApproveInputs(m.DB, m.BaseDir, m.SessionID, issue)
+	if inputs.Mode != reviewpolicy.ModeDelegated && inputs.Mode != reviewpolicy.ModeTrusted {
+		m.StatusMessage = "record-review requires review_policy_mode=delegated or trusted"
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+	}
+	if inputs.HasActiveApproval {
+		m.StatusMessage = "review already recorded; press 'a' to close"
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+	}
+	if attributedTo != "" {
+		inputs.AttributedTo = attributedTo
+	} else if inputs.Mode == reviewpolicy.ModeTrusted {
+		inputs.SelfReviewAcknowledged = true
+	}
+	eligibility := monitorApproveDecision(inputs)
+	if !eligibility.Allowed {
+		if eligibility.RejectionMessage != "" {
+			m.StatusMessage = eligibility.RejectionMessage
+		} else {
+			m.StatusMessage = "you are not eligible to review this issue"
+		}
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+	}
+
+	actionType := models.ActionReviewApprove
+	if decision == reviewpolicy.DecisionChangesRequested {
+		actionType = models.ActionReviewChangesRequested
+	} else {
+		now := time.Now()
+		issue.ReviewerSession = m.SessionID
+		issue.ReviewedAt = &now
+	}
+
+	if _, err := m.DB.CreateIssueReviewAndUpdateIssueLogged(db.NewReview{
+		IssueID:            issueID,
+		ReviewerSession:    m.SessionID,
+		Decision:           decision,
+		Summary:            reason,
+		RequestedBySession: issue.ReviewRequestedBySession,
+		SelfReview:         eligibility.SelfReview,
+		ReviewedBy:         eligibility.AttributedTo,
+	}, issue, models.StatusInReview, m.SessionID, actionType); err != nil {
+		m.StatusMessage = "failed to record review: " + err.Error()
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+	}
+
+	sessionAction := models.ActionSessionReviewApproved
+	if decision == reviewpolicy.DecisionChangesRequested {
+		sessionAction = models.ActionSessionReviewChangesRequested
+	}
+	_ = m.DB.RecordSessionAction(issueID, m.SessionID, sessionAction)
+
+	_ = m.DB.AddLog(&models.Log{
+		IssueID:   issueID,
+		SessionID: m.SessionID,
+		Message:   "Review recorded (" + decision + "): " + reason,
+		Type:      models.LogTypeProgress,
+	})
+	if decision == reviewpolicy.DecisionApproved {
+		m.logReviewSecurityEvent(issueID, eligibility.SelfReview, eligibility.AttributedTo, reason, true)
+	}
+	m.wakeSync()
+
+	m.closeRecordReviewModal()
+	if decision == reviewpolicy.DecisionChangesRequested {
+		m.StatusMessage = "Recorded changes-requested review on " + issueID
+	} else {
+		m.StatusMessage = "REVIEW RECORDED " + issueID
+	}
+	m.StatusIsError = false
+
+	cmds := []tea.Cmd{
+		tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} }),
+		m.fetchData(),
+	}
+	if m.TaskListMode == TaskListModeBoard && m.BoardMode.Board != nil {
+		cmds = append(cmds, m.fetchBoardIssues(m.BoardMode.Board.ID))
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// executeSelfReviewApprove is the confirm handler for the trusted-mode review
+// attribution modal. It re-runs eligibility with either a named reviewer or an
+// explicit, reason-bearing self-review acknowledgement, then closes using the
+// policy decision's audit fields.
+func (m Model) executeSelfReviewApprove() (tea.Model, tea.Cmd) {
+	issueID := m.SelfReviewConfirmIssueID
+	// Read through the modal, not m.SelfReviewConfirmInput — see
+	// modal.Modal.InputValue for why the model's own field is always empty
+	// here. Reading the field silently discarded the operator's typed name and
+	// recorded a self-review instead, which is precisely the false record this
+	// feature exists to prevent.
+	attributedTo := ""
+	reason := ""
+	if m.SelfReviewConfirmModal != nil {
+		attributedTo = strings.TrimSpace(m.SelfReviewConfirmModal.InputValue("reviewed_by"))
+		reason = strings.TrimSpace(m.SelfReviewConfirmModal.InputValue("reason"))
+	}
+	if attributedTo == "" && reason == "" {
+		m.StatusMessage = "self-review requires a reason"
+		m.StatusIsError = true
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return ClearStatusMsg{} })
+	}
+	m.closeSelfReviewConfirmModal()
+	if issueID == "" {
+		return m, nil
+	}
+
+	issue, err := m.DB.GetIssue(issueID)
+	if err != nil || issue == nil {
+		return m, nil
+	}
+
+	// Validate transition with state machine
+	sm := workflow.DefaultMachine()
+	if !sm.IsValidTransition(issue.Status, models.StatusClosed) {
+		return m, nil
+	}
+
+	inputs := loadMonitorApproveInputs(m.DB, m.BaseDir, m.SessionID, issue)
+	// A typed name attributes the review; an empty submit is the operator
+	// saying they reviewed it themselves. Only one of the two is ever set, so
+	// the policy layer's ordering never has to arbitrate.
+	if attributedTo != "" {
+		inputs.AttributedTo = attributedTo
+	} else {
+		inputs.SelfReviewAcknowledged = true
+	}
+	decision := monitorApproveDecision(inputs)
+	// Only proceed on the audited allow. If the decision is not one (e.g. mode
+	// flipped, or the session is no longer the implementer) fall back to the
+	// normal allow check.
+	if !decision.Allowed {
+		return m, nil
+	}
+	return m.executeApproveCloseAttributed(issue, decision.SelfReview, decision.AttributedTo, reason)
 }
 
 // filterActiveBlockers returns only non-closed issues from a list of blockers

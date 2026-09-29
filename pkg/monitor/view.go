@@ -2,14 +2,16 @@ package monitor
 
 import (
 	"fmt"
+	"image/color"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/lipgloss/table"
+	"charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/table"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/cellbuf"
 	"github.com/marcus/td/internal/models"
+	"github.com/marcus/td/pkg/monitor/ansifill"
 )
 
 // renderView renders the complete TUI view
@@ -31,28 +33,28 @@ func (m Model) renderView() string {
 	if m.HelpOpen {
 		base := m.renderBaseView()
 		helpModal := m.renderHelp()
-		return OverlayModal(base, helpModal, m.Width, m.Height)
+		return m.overlayModal(base, helpModal)
 	}
 
 	// Render TDQ help modal if open (using declarative modal)
 	if m.ShowTDQHelp && m.TDQHelpModal != nil && m.TDQHelpMouseHandler != nil {
 		base := m.renderBaseView()
 		tdqHelpContent := m.TDQHelpModal.Render(m.Width, m.Height, m.TDQHelpMouseHandler)
-		return OverlayModal(base, tdqHelpContent, m.Width, m.Height)
+		return m.overlayModal(base, tdqHelpContent)
 	}
 
 	// Render getting started modal if open (using declarative modal)
 	if m.GettingStartedOpen && m.GettingStartedModal != nil && m.GettingStartedMouseHandler != nil {
 		base := m.renderBaseView()
 		gettingStartedContent := m.GettingStartedModal.Render(m.Width, m.Height, m.GettingStartedMouseHandler)
-		return OverlayModal(base, gettingStartedContent, m.Width, m.Height)
+		return m.overlayModal(base, gettingStartedContent)
 	}
 
 	// Render sync prompt modal if open (using declarative modal)
 	if m.SyncPromptOpen && m.SyncPromptModal != nil {
 		base := m.renderBaseView()
 		syncPromptContent := m.SyncPromptModal.Render(m.Width, m.Height, m.SyncPromptMouse)
-		return OverlayModal(base, syncPromptContent, m.Width, m.Height)
+		return m.overlayModal(base, syncPromptContent)
 	}
 
 	// Render base view (panels + footer)
@@ -61,55 +63,67 @@ func (m Model) renderView() string {
 	// Overlay form modal if open
 	if m.FormOpen && m.FormState != nil {
 		form := m.renderFormModal()
-		return OverlayModal(base, form, m.Width, m.Height)
+		return m.overlayModal(base, form)
 	}
 
 	// Overlay delete confirmation dialog if open
 	if m.ConfirmOpen {
 		confirm := m.renderDeleteConfirmation()
-		return OverlayModal(base, confirm, m.Width, m.Height)
+		return m.overlayModal(base, confirm)
 	}
 
 	// Overlay close confirmation dialog if open (declarative modal)
 	if m.CloseConfirmOpen && m.CloseConfirmModal != nil && m.CloseConfirmMouseHandler != nil {
 		confirm := m.CloseConfirmModal.Render(m.Width, m.Height, m.CloseConfirmMouseHandler)
-		return OverlayModal(base, confirm, m.Width, m.Height)
+		return m.overlayModal(base, confirm)
+	}
+
+	// Overlay self-review confirmation dialog if open (declarative modal)
+	if m.SelfReviewConfirmOpen && m.SelfReviewConfirmModal != nil && m.SelfReviewConfirmMouseHandler != nil {
+		sr := m.SelfReviewConfirmModal.Render(m.Width, m.Height, m.SelfReviewConfirmMouseHandler)
+		return m.overlayModal(base, sr)
+	}
+
+	// Overlay record-review dialog if open (declarative modal)
+	if m.RecordReviewOpen && m.RecordReviewModal != nil && m.RecordReviewMouseHandler != nil {
+		rr := m.RecordReviewModal.Render(m.Width, m.Height, m.RecordReviewMouseHandler)
+		return m.overlayModal(base, rr)
 	}
 
 	// Overlay activity detail modal if open
 	if m.ActivityDetailOpen && m.ActivityDetailModal != nil && m.ActivityDetailMouseHandler != nil {
 		detail := m.ActivityDetailModal.Render(m.Width, m.Height, m.ActivityDetailMouseHandler)
-		return OverlayModal(base, detail, m.Width, m.Height)
+		return m.overlayModal(base, detail)
 	}
 
 	// Overlay stats modal if open
 	if m.StatsOpen {
 		stats := m.renderStatsModal()
-		return OverlayModal(base, stats, m.Width, m.Height)
+		return m.overlayModal(base, stats)
 	}
 
 	// Overlay handoffs modal if open
 	if m.HandoffsOpen {
 		handoffs := m.renderHandoffsModal()
-		return OverlayModal(base, handoffs, m.Width, m.Height)
+		return m.overlayModal(base, handoffs)
 	}
 
 	// Overlay board editor if open (on top of board picker)
 	if m.BoardEditorOpen && m.BoardEditorModal != nil && m.BoardEditorMouseHandler != nil {
 		boardEditor := m.BoardEditorModal.Render(m.Width, m.Height, m.BoardEditorMouseHandler)
-		return OverlayModal(base, boardEditor, m.Width, m.Height)
+		return m.overlayModal(base, boardEditor)
 	}
 
 	// Overlay board picker if open
 	if m.BoardPickerOpen {
 		picker := m.renderBoardPicker()
-		return OverlayModal(base, picker, m.Width, m.Height)
+		return m.overlayModal(base, picker)
 	}
 
 	// Overlay modal if open (issue detail modals - can be opened on top of kanban)
 	if m.ModalOpen() {
 		modal := m.renderModal()
-		return OverlayModal(base, modal, m.Width, m.Height)
+		return m.overlayModal(base, modal)
 	}
 
 	// Kanban view if open (after modal check so modals render on top)
@@ -118,7 +132,7 @@ func (m Model) renderView() string {
 		if m.KanbanFullscreen {
 			return kanban
 		}
-		return OverlayModal(base, kanban, m.Width, m.Height)
+		return m.overlayModal(base, kanban)
 	}
 
 	return base
@@ -186,17 +200,19 @@ func (m Model) renderCompact() string {
 
 	// Show just focused issue and counts
 	if m.FocusedIssue != nil {
-		s.WriteString(fmt.Sprintf("Focus: %s\n", m.FocusedIssue.ID))
+		fmt.Fprintf(&s, "Focus: %s\n", m.FocusedIssue.ID)
 	}
 
-	s.WriteString(fmt.Sprintf("In Progress: %d\n", len(m.InProgress)))
-	s.WriteString(fmt.Sprintf("Ready: %d | WIP: %d | Review: %d | Rework: %d | PRev: %d | Blocked: %d\n",
+	fmt.Fprintf(&s, "In Progress: %d\n", len(m.InProgress))
+	fmt.Fprintf(&s, "Ready: %d | WIP: %d | Review: %d | Close: %d | Rework: %d | PRev: %d | Other: %d | Blocked: %d\n",
 		len(m.TaskList.Ready),
 		len(m.TaskList.InProgress),
 		len(m.TaskList.Reviewable),
+		len(m.TaskList.ReadyToClose),
 		len(m.TaskList.NeedsRework),
 		len(m.TaskList.PendingReview),
-		len(m.TaskList.Blocked)))
+		len(m.TaskList.PendingOther),
+		len(m.TaskList.Blocked))
 
 	s.WriteString("\nq:quit r:refresh ?:help")
 
@@ -211,12 +227,13 @@ func (m Model) renderError() string {
 // renderCurrentWorkPanel renders the current work panel (Panel 1)
 func (m Model) renderCurrentWorkPanel(height int) string {
 	var content strings.Builder
+	styles := m.renderStyles()
 
 	totalRows := len(m.CurrentWorkRows)
 	if totalRows == 0 {
-		content.WriteString(subtleStyle.Render("No current work"))
-		content.WriteString("\n")
-		return m.wrapPanel("CURRENT WORK", content.String(), height, PanelCurrentWork)
+		return m.wrapPanel("CURRENT WORK",
+			m.emptyStateBody(m.withEmbeddedNextStep([]string{emptyCurrentWorkMsg})),
+			height, PanelCurrentWork)
 	}
 
 	cursor := m.Cursor[PanelCurrentWork]
@@ -269,19 +286,30 @@ func (m Model) renderCurrentWorkPanel(height int) string {
 
 	// Show up indicator if scrolled down
 	if showUpIndicator {
-		content.WriteString(subtleStyle.Render("  ▲ more above"))
+		content.WriteString(styles.subtle.Render("  ▲ more above"))
 		content.WriteString("\n")
 	}
 
 	rowIdx := 0
 	linesWritten := 0
 
+	currentWorkIDs := make([]string, 0, len(m.InProgress)+1)
+	if m.FocusedIssue != nil {
+		currentWorkIDs = append(currentWorkIDs, m.FocusedIssue.ID)
+	}
+	for _, issue := range m.InProgress {
+		currentWorkIDs = append(currentWorkIDs, issue.ID)
+	}
+	keyWidth := issueKeyColumnWidth(currentWorkIDs)
+
 	// Focused issue (first row if present)
 	if m.FocusedIssue != nil {
 		if rowIdx >= offset && linesWritten < effectiveMaxLines {
-			line := titleStyle.Render("FOCUSED: ") + m.formatIssueCompact(m.FocusedIssue)
-			if isActive && cursor == rowIdx {
-				line = highlightRow(line, m.Width-4)
+			focusTag := styles.title.Render("FOCUSED")
+			selected := isActive && cursor == rowIdx
+			line := m.formatIssueRow(m.FocusedIssue, selected, keyWidth, m.Width-4, focusTag)
+			if selected {
+				line = m.highlightRow(line, m.Width-4)
 			}
 			content.WriteString(line)
 			content.WriteString("\n")
@@ -301,10 +329,13 @@ func (m Model) renderCurrentWorkPanel(height int) string {
 		// Only show header if in visible range
 		if rowIdx >= offset || (m.FocusedIssue != nil && offset == 0) {
 			if linesWritten < effectiveMaxLines {
+				// Two blank lines keep the row accounting in input.go's
+				// currentWorkRowAtLine stable (it expects 3 header lines).
+				content.WriteString("\n\n")
+				content.WriteString(m.formatSectionHeaderLine("IN PROGRESS", inProgressVisible,
+					styles.category[CategoryInProgress]))
 				content.WriteString("\n")
-				content.WriteString(sectionHeader.Render("IN PROGRESS:"))
-				content.WriteString("\n")
-				linesWritten += 3 // explicit \n + MarginTop(1) from sectionHeader + header text
+				linesWritten += 3
 			}
 		}
 
@@ -314,9 +345,14 @@ func (m Model) renderCurrentWorkPanel(height int) string {
 				continue
 			}
 			if rowIdx >= offset && linesWritten < effectiveMaxLines {
-				line := "  " + m.formatIssueCompact(&issue)
-				if isActive && cursor == rowIdx {
-					line = highlightRow(line, m.Width-4)
+				trailing := ""
+				if issue.ImplementerSession != "" {
+					trailing = styles.subtle.Render(truncateSession(issue.ImplementerSession))
+				}
+				selected := isActive && cursor == rowIdx
+				line := m.formatIssueRow(&issue, selected, keyWidth, m.Width-4, trailing)
+				if selected {
+					line = m.highlightRow(line, m.Width-4)
 				}
 				content.WriteString(line)
 				content.WriteString("\n")
@@ -328,7 +364,7 @@ func (m Model) renderCurrentWorkPanel(height int) string {
 
 	// Show down indicator if more content below
 	if hasMoreBelow {
-		content.WriteString(subtleStyle.Render("  ▼ more below"))
+		content.WriteString(styles.subtle.Render("  ▼ more below"))
 		content.WriteString("\n")
 	}
 
@@ -339,17 +375,18 @@ func (m Model) renderCurrentWorkPanel(height int) string {
 // that highlights the selected row when the panel is active.
 // visibleCursor is the cursor position relative to visible rows (cursor - offset).
 func (m Model) activityTableStyleFunc(visibleCursor int, isActive bool, colWidths []int) table.StyleFunc {
+	styles := m.renderStyles()
 	return func(row, col int) lipgloss.Style {
 		style := lipgloss.NewStyle()
 
 		// Header row (row == -1 in lipgloss/table)
 		if row == table.HeaderRow {
-			style = activityTableHeaderStyle
+			style = styles.activityTableHeader
 		}
 
 		// Selected row highlight (only when panel is active)
 		if isActive && row == visibleCursor && row != table.HeaderRow {
-			style = activityTableSelectedStyle
+			style = styles.activityTableSelected
 		}
 
 		if col >= 0 && col < len(colWidths) && colWidths[col] > 0 {
@@ -366,13 +403,14 @@ func (m Model) activityTableStyleFunc(visibleCursor int, isActive bool, colWidth
 // Note: Add trailing space to cells to ensure proper column separation
 // when ANSI codes affect width calculation.
 func (m Model) formatActivityRow(item ActivityItem, messageWidth int) []string {
+	styles := m.renderStyles()
 	// Pre-styled cells using existing style functions
-	timestamp := timestampStyle.Render(item.Timestamp.Format("15:04"))
-	session := subtleStyle.Render(truncateSession(item.SessionID))
-	badge := formatActivityBadge(item.Type) // existing function with styling
+	timestamp := styles.timestamp.Render(formatLocalTime(item.Timestamp, "15:04"))
+	session := styles.subtle.Render(truncateSession(item.SessionID))
+	badge := m.formatActivityBadge(item.Type)
 	issueID := ""
 	if item.IssueID != "" {
-		issueID = titleStyle.Render(truncateString(item.IssueID, activityColIssueWidth))
+		issueID = styles.title.Render(truncateString(item.IssueID, activityColIssueWidth))
 	}
 
 	// Build message with optional title suffix (use bullet instead of pipe)
@@ -380,12 +418,12 @@ func (m Model) formatActivityRow(item ActivityItem, messageWidth int) []string {
 	if item.IssueTitle != "" {
 		availableForTitle := messageWidth - len(message) - 3 // " • "
 		if availableForTitle > 10 {
-			message = message + " " + subtleStyle.Render("• "+truncateString(item.IssueTitle, availableForTitle))
+			message = message + " " + styles.subtle.Render("• "+truncateString(item.IssueTitle, availableForTitle))
 		} else {
 			// Truncate message to fit some title
 			msgWidth := messageWidth - 13 // " • " + 10 char title
 			if msgWidth > 0 {
-				message = truncateString(message, msgWidth) + " " + subtleStyle.Render("• "+truncateString(item.IssueTitle, 10))
+				message = truncateString(message, msgWidth) + " " + styles.subtle.Render("• "+truncateString(item.IssueTitle, 10))
 			}
 		}
 	}
@@ -396,10 +434,10 @@ func (m Model) formatActivityRow(item ActivityItem, messageWidth int) []string {
 
 // renderActivityPanel renders the activity log panel (Panel 2) using lipgloss/table
 func (m Model) renderActivityPanel(height int) string {
+	styles := m.renderStyles()
 	totalRows := len(m.Activity)
 	if totalRows == 0 {
-		content := subtleStyle.Render("No recent activity")
-		return m.wrapPanel("ACTIVITY LOG", content, height, PanelActivity)
+		return m.wrapPanel("ACTIVITY LOG", m.emptyStateBody([]string{emptyActivityMsg}), height, PanelActivity)
 	}
 
 	cursor := m.Cursor[PanelActivity]
@@ -496,7 +534,7 @@ func (m Model) renderActivityPanel(height int) string {
 	if hasMoreBelow {
 		moreCount := totalRows - endIdx
 		content.WriteString("\n")
-		content.WriteString(subtleStyle.Render(fmt.Sprintf("  ↓ %d more below", moreCount)))
+		content.WriteString(styles.subtle.Render(fmt.Sprintf("  ↓ %d more below", moreCount)))
 	}
 
 	return m.wrapPanel(panelTitle, content.String(), height, PanelActivity)
@@ -505,6 +543,7 @@ func (m Model) renderActivityPanel(height int) string {
 // renderTaskListPanel renders the task list panel (Panel 3)
 // Uses flattened TaskListRows for selection support
 func (m Model) renderTaskListPanel(height int) string {
+	styles := m.renderStyles()
 	// If in board mode, render board view in this panel
 	if m.TaskListMode == TaskListModeBoard && m.BoardMode.Board != nil {
 		if m.BoardMode.ViewMode == BoardViewSwimlanes {
@@ -531,7 +570,7 @@ func (m Model) renderTaskListPanel(height int) string {
 		if m.SearchQuery != "" || m.IncludeClosed {
 			panelTitle = "TASK LIST" + sortIndicator + " (no matches)"
 		}
-		content.WriteString(subtleStyle.Render("No tasks available"))
+		content.WriteString(styles.subtle.Render("No tasks available"))
 		return m.wrapPanel(panelTitle, content.String(), height, PanelTaskList)
 	}
 
@@ -587,13 +626,14 @@ func (m Model) renderTaskListPanel(height int) string {
 
 	// Show up indicator if scrolled down
 	if showUpIndicator {
-		content.WriteString(subtleStyle.Render("  ▲ more above"))
+		content.WriteString(styles.subtle.Render("  ▲ more above"))
 		content.WriteString("\n")
 	}
 
 	// Track current category for section headers
 	var currentCategory TaskListCategory
 	linesWritten := 0
+	keyWidth := m.taskListKeyWidth()
 
 	for i, row := range m.TaskListRows {
 		if linesWritten >= effectiveMaxLines {
@@ -625,13 +665,12 @@ func (m Model) renderTaskListPanel(height int) string {
 			}
 		}
 
-		// Format row with category tag and selection highlight
-		tag := m.formatCategoryTag(row.Category)
-		issueStr := m.formatIssueShort(&row.Issue)
-		line := fmt.Sprintf("%s %s", tag, issueStr)
+		// Column layout; the section header carries the status, so no tag.
+		selected := isActive && cursor == i
+		line := m.formatIssueRow(&row.Issue, selected, keyWidth, m.Width-4, "")
 
-		if isActive && cursor == i {
-			line = highlightRow(line, m.Width-4)
+		if selected {
+			line = m.highlightRow(line, m.Width-4)
 		}
 
 		content.WriteString(line)
@@ -641,7 +680,7 @@ func (m Model) renderTaskListPanel(height int) string {
 
 	// Show down indicator if more content below
 	if hasMoreBelow {
-		content.WriteString(subtleStyle.Render("  ▼ more below"))
+		content.WriteString(styles.subtle.Render("  ▼ more below"))
 		content.WriteString("\n")
 	}
 
@@ -651,6 +690,7 @@ func (m Model) renderTaskListPanel(height int) string {
 // renderTaskListBoardView renders board issues in the Task List panel
 func (m Model) renderTaskListBoardView(height int) string {
 	var content strings.Builder
+	styles := m.renderStyles()
 	contentWidth := m.Width - 4 // Account for border and padding
 
 	totalRows := len(m.BoardMode.Issues)
@@ -662,10 +702,7 @@ func (m Model) renderTaskListBoardView(height int) string {
 			boardName = m.BoardMode.Board.Name
 		}
 		panelTitle := fmt.Sprintf("BOARD: %s [backlog] (0)", boardName)
-		content.WriteString(subtleStyle.Render("No issues match the board query"))
-		content.WriteString("\n\n")
-		content.WriteString(subtleStyle.Render("Try adjusting the status filter with 'c' or 'F'"))
-		return m.wrapPanel(panelTitle, content.String(), height, PanelTaskList)
+		return m.wrapPanel(panelTitle, m.boardEmptyStateBody(), height, PanelTaskList)
 	}
 
 	cursor := m.BoardMode.Cursor
@@ -724,11 +761,17 @@ func (m Model) renderTaskListBoardView(height int) string {
 
 	// Show up indicator if scrolled down
 	if showUpIndicator {
-		content.WriteString(subtleStyle.Render(fmt.Sprintf("  ↑ %d more above", offset)))
+		content.WriteString(styles.subtle.Render(fmt.Sprintf("  ↑ %d more above", offset)))
 		content.WriteString("\n")
 	}
 
 	// Render visible issues
+	boardIDs := make([]string, 0, len(m.BoardMode.Issues))
+	for _, biv := range m.BoardMode.Issues {
+		boardIDs = append(boardIDs, biv.Issue.ID)
+	}
+	keyWidth := issueKeyColumnWidth(boardIDs)
+
 	endIdx := offset + effectiveMaxLines
 	if endIdx > totalRows {
 		endIdx = totalRows
@@ -741,40 +784,20 @@ func (m Model) renderTaskListBoardView(height int) string {
 		// Position indicator (muted color like timestamps)
 		var posIndicator string
 		if biv.HasPosition {
-			posIndicator = timestampStyle.Render(fmt.Sprintf("%3d", biv.Position)) + " "
+			posIndicator = styles.timestamp.Render(fmt.Sprintf("%3d", biv.Position)) + " "
 		} else {
-			posIndicator = timestampStyle.Render("  •") + " "
+			posIndicator = styles.timestamp.Render("  •") + " "
 		}
 
-		// Status tag, type, ID, priority (matching swimlanes format)
-		tag := m.formatCategoryTag(TaskListCategory(biv.Category))
-		typeStr := formatTypeIcon(issue.Type)
-		idStr := subtleStyle.Render(issue.ID)
-		priStr := formatPriority(issue.Priority)
-
-		// Title (truncated)
-		title := issue.Title
-		maxTitleLen := contentWidth - 38 // Leave room for indicators + ID
-		if maxTitleLen < 10 {
-			maxTitleLen = 10
-		}
-		if len(title) > maxTitleLen {
-			title = title[:maxTitleLen-3] + "..."
-		}
-
-		// Build line: position + tag + type + id + priority + title
-		line := fmt.Sprintf("%s%s %s %s %s %s",
-			posIndicator,
-			tag,
-			typeStr,
-			idStr,
-			priStr,
-			title,
-		)
+		// Column layout after the position indicator; the board's status
+		// filter is shown in the panel title, so no inline status tag.
+		selected := isActive && i == cursor
+		line := posIndicator + m.formatIssueRow(&issue, selected, keyWidth,
+			contentWidth-lipgloss.Width(posIndicator), "")
 
 		// Highlight if cursor is on this row
-		if isActive && i == cursor {
-			line = highlightRow(line, m.Width-4)
+		if selected {
+			line = m.highlightRow(line, m.Width-4)
 		}
 
 		content.WriteString(line)
@@ -783,7 +806,7 @@ func (m Model) renderTaskListBoardView(height int) string {
 
 	// Show down indicator if more items below
 	if hasMoreBelow {
-		content.WriteString(subtleStyle.Render(fmt.Sprintf("  ↓ %d more below", totalRows-endIdx)))
+		content.WriteString(styles.subtle.Render(fmt.Sprintf("  ↓ %d more below", totalRows-endIdx)))
 		content.WriteString("\n")
 	}
 
@@ -793,6 +816,7 @@ func (m Model) renderTaskListBoardView(height int) string {
 // renderBoardSwimlanesView renders board issues grouped by status category (swimlanes view)
 func (m Model) renderBoardSwimlanesView(height int) string {
 	var content strings.Builder
+	styles := m.renderStyles()
 
 	totalRows := len(m.BoardMode.SwimlaneRows)
 
@@ -812,10 +836,7 @@ func (m Model) renderBoardSwimlanesView(height int) string {
 			boardName = m.BoardMode.Board.Name
 		}
 		panelTitle := fmt.Sprintf("BOARD: %s [swimlanes]%s (0)", boardName, sortIndicator)
-		content.WriteString(subtleStyle.Render("No issues match the board query"))
-		content.WriteString("\n\n")
-		content.WriteString(subtleStyle.Render("Try adjusting the status filter with 'c' or 'F'"))
-		return m.wrapPanel(panelTitle, content.String(), height, PanelTaskList)
+		return m.wrapPanel(panelTitle, m.boardEmptyStateBody(), height, PanelTaskList)
 	}
 
 	cursor := m.BoardMode.SwimlaneCursor
@@ -869,13 +890,14 @@ func (m Model) renderBoardSwimlanesView(height int) string {
 
 	// Show up indicator if scrolled down
 	if showUpIndicator {
-		content.WriteString(subtleStyle.Render("  ▲ more above"))
+		content.WriteString(styles.subtle.Render("  ▲ more above"))
 		content.WriteString("\n")
 	}
 
 	// Track current category for section headers
 	var currentCategory TaskListCategory
 	linesWritten := 0
+	keyWidth := m.swimlaneKeyWidth()
 
 	for i, row := range m.BoardMode.SwimlaneRows {
 		if linesWritten >= effectiveMaxLines {
@@ -907,13 +929,12 @@ func (m Model) renderBoardSwimlanesView(height int) string {
 			}
 		}
 
-		// Format row with category tag and selection highlight
-		tag := m.formatCategoryTag(row.Category)
-		issueStr := m.formatIssueShort(&row.Issue)
-		line := fmt.Sprintf("%s %s", tag, issueStr)
+		// Column layout; the swimlane header carries the status.
+		selected := isActive && cursor == i
+		line := m.formatIssueRow(&row.Issue, selected, keyWidth, m.Width-4, "")
 
-		if isActive && cursor == i {
-			line = highlightRow(line, m.Width-4)
+		if selected {
+			line = m.highlightRow(line, m.Width-4)
 		}
 
 		content.WriteString(line)
@@ -923,7 +944,7 @@ func (m Model) renderBoardSwimlanesView(height int) string {
 
 	// Show down indicator if more content below
 	if hasMoreBelow {
-		content.WriteString(subtleStyle.Render("  ▼ more below"))
+		content.WriteString(styles.subtle.Render("  ▼ more below"))
 		content.WriteString("\n")
 	}
 
@@ -933,88 +954,125 @@ func (m Model) renderBoardSwimlanesView(height int) string {
 // formatSwimlaneCategoryHeader returns the section header for a swimlane category
 func (m Model) formatSwimlaneCategoryHeader(cat TaskListCategory) string {
 	count := 0
+	label := ""
 	switch cat {
 	case CategoryReviewable:
 		count = len(m.BoardMode.SwimlaneData.Reviewable)
-		return reviewAlertStyle.Render("★ REVIEWABLE") + fmt.Sprintf(" (%d):", count)
+		label = "★ REVIEWABLE"
+	case CategoryReadyToClose:
+		count = len(m.BoardMode.SwimlaneData.ReadyToClose)
+		label = "✓ READY TO CLOSE"
 	case CategoryNeedsRework:
 		count = len(m.BoardMode.SwimlaneData.NeedsRework)
-		return reworkColor.Render("⚠ NEEDS REWORK") + fmt.Sprintf(" (%d):", count)
+		label = "⚠ NEEDS REWORK"
 	case CategoryInProgress:
 		count = len(m.BoardMode.SwimlaneData.InProgress)
-		return inProgressHeaderStyle.Render("IN PROGRESS") + fmt.Sprintf(" (%d):", count)
+		label = "IN PROGRESS"
 	case CategoryReady:
 		count = len(m.BoardMode.SwimlaneData.Ready)
-		return readyHeaderStyle.Render("READY") + fmt.Sprintf(" (%d):", count)
+		label = "READY"
 	case CategoryPendingReview:
 		count = len(m.BoardMode.SwimlaneData.PendingReview)
-		return pendingReviewHeaderStyle.Render("PENDING REVIEW") + fmt.Sprintf(" (%d):", count)
+		label = "PENDING REVIEW"
+	case CategoryPendingOther:
+		count = len(m.BoardMode.SwimlaneData.PendingOther)
+		label = "PENDING OTHER"
 	case CategoryBlocked:
 		count = len(m.BoardMode.SwimlaneData.Blocked)
-		return blockedHeaderStyle.Render("BLOCKED") + fmt.Sprintf(" (%d):", count)
+		label = "BLOCKED"
 	case CategoryClosed:
 		count = len(m.BoardMode.SwimlaneData.Closed)
-		return subtleStyle.Render("CLOSED") + fmt.Sprintf(" (%d):", count)
+		label = "CLOSED"
 	}
-	return ""
+	style, ok := m.renderStyles().category[cat]
+	if !ok {
+		return ""
+	}
+	return m.formatSectionHeaderLine(label, count, style)
 }
 
 // formatCategoryHeader returns the section header for a category
 func (m Model) formatCategoryHeader(cat TaskListCategory) string {
 	count := 0
+	label := ""
 	switch cat {
 	case CategoryReviewable:
 		count = len(m.TaskList.Reviewable)
-		return reviewAlertStyle.Render("★ REVIEWABLE") + fmt.Sprintf(" (%d):", count)
+		label = "★ REVIEWABLE"
+	case CategoryReadyToClose:
+		count = len(m.TaskList.ReadyToClose)
+		label = "✓ READY TO CLOSE"
 	case CategoryNeedsRework:
 		count = len(m.TaskList.NeedsRework)
-		return reworkColor.Render("⚠ NEEDS REWORK") + fmt.Sprintf(" (%d):", count)
+		label = "⚠ NEEDS REWORK"
 	case CategoryInProgress:
 		count = len(m.TaskList.InProgress)
-		return inProgressHeaderStyle.Render("IN PROGRESS") + fmt.Sprintf(" (%d):", count)
+		label = "IN PROGRESS"
 	case CategoryReady:
 		count = len(m.TaskList.Ready)
-		return readyHeaderStyle.Render("READY") + fmt.Sprintf(" (%d):", count)
+		label = "READY"
 	case CategoryPendingReview:
 		count = len(m.TaskList.PendingReview)
-		return pendingReviewHeaderStyle.Render("PENDING REVIEW") + fmt.Sprintf(" (%d):", count)
+		label = "PENDING REVIEW"
+	case CategoryPendingOther:
+		count = len(m.TaskList.PendingOther)
+		label = "PENDING OTHER"
 	case CategoryBlocked:
 		count = len(m.TaskList.Blocked)
-		return blockedHeaderStyle.Render("BLOCKED") + fmt.Sprintf(" (%d):", count)
+		label = "BLOCKED"
 	case CategoryClosed:
 		count = len(m.TaskList.Closed)
-		return subtleStyle.Render("CLOSED") + fmt.Sprintf(" (%d):", count)
+		label = "CLOSED"
 	}
-	return ""
+	style, ok := m.renderStyles().category[cat]
+	if !ok {
+		return ""
+	}
+	return m.formatSectionHeaderLine(label, count, style)
 }
 
 // formatCategoryTag returns a short tag for inline display
 func (m Model) formatCategoryTag(cat TaskListCategory) string {
-	switch cat {
-	case CategoryReviewable:
-		return reviewColor.Render("[REV]")
-	case CategoryNeedsRework:
-		return reworkColor.Render("[RWK]")
-	case CategoryInProgress:
-		return inProgressColor.Render("[WIP]")
-	case CategoryReady:
-		return readyColor.Render("[RDY]")
-	case CategoryPendingReview:
-		return pendingReviewColor.Render("[PRV]")
-	case CategoryBlocked:
-		return blockedColor.Render("[BLK]")
-	case CategoryClosed:
-		return subtleStyle.Render("[CLS]")
+	label, ok := categoryTagLabels[cat]
+	if !ok {
+		return ""
 	}
-	return ""
+	style, ok := m.renderStyles().category[cat]
+	if !ok {
+		return label
+	}
+	return style.Render(label)
 }
 
-// renderModal renders the centered issue details modal
+// renderModal renders the centered issue details modal.
+//
+// Output is memoized: a host that repaints on every message (mouse motion,
+// streaming panes, other plugins' ticks) calls this orders of magnitude more
+// often than the standalone TUI, and rebuilding the modal costs milliseconds
+// plus megabytes of garbage per frame. The fingerprint in modalRenderKeyFor
+// must cover every input buildIssueModalView reads — keep them in sync.
 func (m Model) renderModal() string {
 	modal := m.CurrentModal()
 	if modal == nil {
 		return ""
 	}
+	key := m.modalRenderKeyFor(modal)
+	if m.modalRender != nil && key.equal(m.modalRender.key) {
+		return m.modalRender.out
+	}
+	out := m.buildIssueModalView(modal)
+	if m.modalRender != nil {
+		m.modalRender.key = key
+		m.modalRender.out = out
+	}
+	return out
+}
+
+// buildIssueModalView assembles the issue-detail modal from scratch. Reads no
+// database state: everything it renders was fetched into the ModalEntry by
+// fetchIssueDetails.
+func (m Model) buildIssueModalView(modal *ModalEntry) string {
+	styles := m.renderStyles()
 
 	// Calculate modal dimensions (80% of terminal, capped)
 	modalWidth := m.Width * 80 / 100
@@ -1032,27 +1090,27 @@ func (m Model) renderModal() string {
 		modalHeight = 15
 	}
 
-	contentWidth := modalWidth - 4 // Account for border and padding
+	contentWidth := modalInnerWidth(modalWidth)
 
 	var content strings.Builder
 
 	// Loading state
 	if modal.Loading {
-		content.WriteString(subtleStyle.Render("Loading..."))
+		content.WriteString(styles.subtle.Render("Loading..."))
 		return m.wrapModalWithDepth(content.String(), modalWidth, modalHeight)
 	}
 
 	// Error state
 	if modal.Error != nil {
-		content.WriteString(errorStyle.Render(fmt.Sprintf("Error: %v", modal.Error)))
+		content.WriteString(styles.modalError.Render(fmt.Sprintf("Error: %v", modal.Error)))
 		content.WriteString("\n\n")
-		content.WriteString(subtleStyle.Render("Press esc to close"))
+		content.WriteString(styles.subtle.Render("Press esc to close"))
 		return m.wrapModalWithDepth(content.String(), modalWidth, modalHeight)
 	}
 
 	// No issue loaded
 	if modal.Issue == nil {
-		content.WriteString(subtleStyle.Render("No issue data"))
+		content.WriteString(styles.subtle.Render("No issue data"))
 		return m.wrapModalWithDepth(content.String(), modalWidth, modalHeight)
 	}
 
@@ -1062,22 +1120,22 @@ func (m Model) renderModal() string {
 	var lines []string
 
 	// Status first for quicker scanning in the issue detail modal.
-	lines = append(lines, formatIssueDetailStatus(issue.Status))
-	lines = append(lines, titleStyle.Render(issue.ID)+" "+issue.Title)
+	lines = append(lines, m.formatIssueDetailStatus(issue.Status))
+	lines = append(lines, styles.title.Render(issue.ID)+" "+issue.Title)
 	lines = append(lines, "")
 
 	// Metadata line: type, priority, points, timestamps
 	metadataLine := fmt.Sprintf("%s  %s",
-		formatTypeIcon(issue.Type),
-		formatPriority(issue.Priority))
+		m.formatTypeIcon(issue.Type),
+		m.formatPriority(issue.Priority))
 	if issue.Points > 0 {
 		metadataLine += fmt.Sprintf("  %dpts", issue.Points)
 	}
 	// Add created timestamp in subtle style
-	metadataLine += subtleStyle.Render(fmt.Sprintf("  created %s", issue.CreatedAt.Format("2006-01-02 15:04")))
+	metadataLine += styles.subtle.Render(fmt.Sprintf("  created %s", formatLocalTime(issue.CreatedAt, "2006-01-02 15:04")))
 	// Add closed timestamp if closed
 	if issue.ClosedAt != nil {
-		metadataLine += subtleStyle.Render(fmt.Sprintf("  closed %s", issue.ClosedAt.Format("2006-01-02 15:04")))
+		metadataLine += styles.subtle.Render(fmt.Sprintf("  closed %s", formatLocalTime(*issue.ClosedAt, "2006-01-02 15:04")))
 	}
 	lines = append(lines, metadataLine)
 
@@ -1086,39 +1144,72 @@ func (m Model) renderModal() string {
 		epicText := "Epic: " + modal.ParentEpic.ID + " " +
 			truncateString(modal.ParentEpic.Title, contentWidth-20)
 		if modal.ParentEpicFocused {
-			lines = append(lines, parentEpicFocusedStyle.Render("> "+epicText)+" [Enter:open]")
+			lines = append(lines, styles.modalParentFocused.Render("> "+epicText)+" [Enter:open]")
 		} else {
-			lines = append(lines, parentEpicStyle.Render("  "+epicText))
+			lines = append(lines, styles.modalParent.Render("  "+epicText))
 		}
 	}
 
 	// Labels
 	if len(issue.Labels) > 0 {
-		labelStr := subtleStyle.Render("Labels: ") + strings.Join(issue.Labels, ", ")
+		labelStr := styles.subtle.Render("Labels: ") + strings.Join(issue.Labels, ", ")
 		lines = append(lines, labelStr)
 	}
 
 	// Implementer/Reviewer
 	if issue.ImplementerSession != "" {
-		lines = append(lines, subtleStyle.Render("Impl: ")+truncateSession(issue.ImplementerSession))
+		lines = append(lines, styles.subtle.Render("Impl: ")+truncateSession(issue.ImplementerSession))
 	}
 	if issue.ReviewerSession != "" {
-		lines = append(lines, subtleStyle.Render("Review: ")+truncateSession(issue.ReviewerSession))
+		reviewerLine := styles.subtle.Render("Reviewer: ") + truncateSession(issue.ReviewerSession)
+		if issue.ReviewedAt != nil {
+			reviewerLine += styles.subtle.Render("  at ") + formatLocalTime(*issue.ReviewedAt, "2006-01-02 15:04")
+		}
+		// Freshness: only emit (fresh) when an active (non-superseded)
+		// approval row exists. Relying on ReviewerSession alone is lossy once
+		// changes_requested reviews (which don't clear ReviewerSession) are
+		// recordable from the TUI. HasActiveApproval mirrors
+		// GetActiveApprovalReview and is refreshed by fetchIssueDetails.
+		if issue.Status == models.StatusInReview && modal.HasActiveApproval {
+			reviewerLine += styles.subtle.Render("  (fresh)")
+		}
+		lines = append(lines, reviewerLine)
+	}
+	if issue.ClosedBySession != "" && issue.Status == models.StatusClosed {
+		lines = append(lines, styles.subtle.Render("Closed by: ")+truncateSession(issue.ClosedBySession))
+	}
+	// Recent review history (last 3) from issue_reviews, fetched with the
+	// issue details so View never queries the database.
+	if reviews := modal.Reviews; len(reviews) > 0 {
+		// Take last 3 in reverse chronological order.
+		start := 0
+		if len(reviews) > 3 {
+			start = len(reviews) - 3
+		}
+		lines = append(lines, styles.subtle.Render("Recent reviews:"))
+		for i := len(reviews) - 1; i >= start; i-- {
+			r := reviews[i]
+			status := ""
+			if r.SupersededAt != nil {
+				status = " (superseded)"
+			}
+			lines = append(lines, "  "+truncateSession(r.ReviewerSession)+" "+r.Decision+status+" "+formatLocalTime(r.CreatedAt, "2006-01-02 15:04"))
+		}
 	}
 
 	// Defer/Due fields
 	if issue.DeferUntil != nil {
-		lines = append(lines, subtleStyle.Render("Deferred: ")+formatDeferUntil(*issue.DeferUntil))
+		lines = append(lines, styles.subtle.Render("Deferred: ")+m.formatDeferUntil(*issue.DeferUntil))
 	}
 	if issue.DueDate != nil {
-		lines = append(lines, subtleStyle.Render("Due: ")+formatDueDate(*issue.DueDate))
+		lines = append(lines, styles.subtle.Render("Due: ")+m.formatDueDate(*issue.DueDate))
 	}
 	if issue.DeferCount > 0 {
 		s := "s"
 		if issue.DeferCount == 1 {
 			s = ""
 		}
-		lines = append(lines, subtleStyle.Render(fmt.Sprintf("Deferred %d time%s", issue.DeferCount, s)))
+		lines = append(lines, styles.subtle.Render(fmt.Sprintf("Deferred %d time%s", issue.DeferCount, s)))
 	}
 
 	lines = append(lines, "")
@@ -1127,22 +1218,22 @@ func (m Model) renderModal() string {
 	if issue.Type == models.TypeEpic && len(modal.EpicTasks) > 0 {
 		header := fmt.Sprintf("TASKS IN EPIC (%d)", len(modal.EpicTasks))
 		if modal.TaskSectionFocused {
-			header = epicTasksFocusedStyle.Render(header + " [j/k:nav Enter:open Tab:scroll]")
+			header = styles.modalEpicFocused.Render(header + " [j/k:nav Enter:open Tab:scroll]")
 		} else {
-			header = sectionHeader.Render(header + " [Tab:focus]")
+			header = styles.sectionHeader.Render(header + " [Tab:focus]")
 		}
 		lines = append(lines, header)
 
 		for i, task := range modal.EpicTasks {
 			prefix := "  "
 			taskLine := fmt.Sprintf("%s %s %s %s",
-				formatTypeIcon(task.Type),
-				subtleStyle.Render(task.ID),
-				formatStatus(task.Status),
+				m.formatTypeIcon(task.Type),
+				styles.subtle.Render(task.ID),
+				m.formatStatus(task.Status),
 				truncateString(task.Title, contentWidth-29))
 
 			if modal.TaskSectionFocused && i == modal.EpicTasksCursor {
-				taskLine = epicTaskSelectedStyle.Render("> " + formatTypeIcon(task.Type) + " " + task.ID + " " + formatStatus(task.Status) + " " + truncateString(task.Title, contentWidth-29))
+				taskLine = styles.modalSelected.Render("> " + m.formatTypeIcon(task.Type) + " " + task.ID + " " + m.formatStatus(task.Status) + " " + truncateString(task.Title, contentWidth-29))
 			} else {
 				taskLine = prefix + taskLine
 			}
@@ -1153,7 +1244,7 @@ func (m Model) renderModal() string {
 
 	// Description (use pre-rendered markdown from model)
 	if issue.Description != "" {
-		lines = append(lines, sectionHeader.Render("DESCRIPTION"))
+		lines = append(lines, styles.sectionHeader.Render("DESCRIPTION"))
 		rendered := modal.DescRender
 		if rendered == "" {
 			rendered = issue.Description // fallback if not rendered yet
@@ -1164,7 +1255,7 @@ func (m Model) renderModal() string {
 
 	// Acceptance criteria (use pre-rendered markdown from model)
 	if issue.Acceptance != "" {
-		lines = append(lines, sectionHeader.Render("ACCEPTANCE CRITERIA"))
+		lines = append(lines, styles.sectionHeader.Render("ACCEPTANCE CRITERIA"))
 		rendered := modal.AcceptRender
 		if rendered == "" {
 			rendered = issue.Acceptance // fallback if not rendered yet
@@ -1188,20 +1279,20 @@ func (m Model) renderModal() string {
 		if len(activeBlockers) > 0 {
 			header := fmt.Sprintf("⚠ BLOCKED BY (%d)", len(activeBlockers))
 			if modal.BlockedBySectionFocused {
-				header = blockedBySectionFocusedStyle.Render(header + " [j/k:nav Enter:open Tab:next]")
+				header = styles.modalBlockedFocused.Render(header + " [j/k:nav Enter:open Tab:next]")
 			} else {
-				header = blockedColor.Render(header + " [Tab:focus]")
+				header = styles.modalError.Render(header + " [Tab:focus]")
 			}
 			lines = append(lines, header)
 
 			for i, dep := range activeBlockers {
 				depLine := fmt.Sprintf("%s %s %s %s",
-					formatTypeIcon(dep.Type),
-					titleStyle.Render(dep.ID),
-					formatStatus(dep.Status),
+					m.formatTypeIcon(dep.Type),
+					styles.title.Render(dep.ID),
+					m.formatStatus(dep.Status),
 					truncateString(dep.Title, contentWidth-24))
 				if modal.BlockedBySectionFocused && i == modal.BlockedByCursor {
-					depLine = blockedBySelectedStyle.Render("> " + depLine)
+					depLine = styles.modalSelected.Render("> " + depLine)
 				} else {
 					depLine = "  " + depLine
 				}
@@ -1212,9 +1303,9 @@ func (m Model) renderModal() string {
 
 		// Show resolved dependencies dimmed
 		if len(resolvedDeps) > 0 {
-			lines = append(lines, subtleStyle.Render(fmt.Sprintf("✓ RESOLVED DEPS (%d)", len(resolvedDeps))))
+			lines = append(lines, styles.subtle.Render(fmt.Sprintf("✓ RESOLVED DEPS (%d)", len(resolvedDeps))))
 			for _, dep := range resolvedDeps {
-				depLine := subtleStyle.Render(fmt.Sprintf("  %s %s",
+				depLine := styles.subtle.Render(fmt.Sprintf("  %s %s",
 					dep.ID,
 					truncateString(dep.Title, contentWidth-15)))
 				lines = append(lines, depLine)
@@ -1227,20 +1318,20 @@ func (m Model) renderModal() string {
 	if len(modal.Blocks) > 0 {
 		header := fmt.Sprintf("BLOCKS (%d)", len(modal.Blocks))
 		if modal.BlocksSectionFocused {
-			header = blocksSectionFocusedStyle.Render(header + " [j/k:nav Enter:open Tab:next]")
+			header = styles.modalBlocksFocused.Render(header + " [j/k:nav Enter:open Tab:next]")
 		} else {
-			header = sectionHeader.Render(header + " [Tab:focus]")
+			header = styles.sectionHeader.Render(header + " [Tab:focus]")
 		}
 		lines = append(lines, header)
 
 		for i, dep := range modal.Blocks {
 			depLine := fmt.Sprintf("%s %s %s %s",
-				formatTypeIcon(dep.Type),
-				titleStyle.Render(dep.ID),
-				formatStatus(dep.Status),
+				m.formatTypeIcon(dep.Type),
+				styles.title.Render(dep.ID),
+				m.formatStatus(dep.Status),
 				truncateString(dep.Title, contentWidth-24))
 			if modal.BlocksSectionFocused && i == modal.BlocksCursor {
-				depLine = blocksSelectedStyle.Render("> " + depLine)
+				depLine = styles.modalSelected.Render("> " + depLine)
 			} else {
 				depLine = "  " + depLine
 			}
@@ -1251,23 +1342,23 @@ func (m Model) renderModal() string {
 
 	// Latest handoff
 	if modal.Handoff != nil {
-		lines = append(lines, sectionHeader.Render("LATEST HANDOFF"))
-		lines = append(lines, timestampStyle.Render(modal.Handoff.Timestamp.Format("2006-01-02 15:04"))+" "+
-			subtleStyle.Render(truncateSession(modal.Handoff.SessionID)))
+		lines = append(lines, styles.sectionHeader.Render("LATEST HANDOFF"))
+		lines = append(lines, styles.timestamp.Render(formatLocalTime(modal.Handoff.Timestamp, "2006-01-02 15:04"))+" "+
+			styles.subtle.Render(truncateSession(modal.Handoff.SessionID)))
 		if len(modal.Handoff.Done) > 0 {
-			lines = append(lines, readyColor.Render("Done:"))
+			lines = append(lines, styles.modalSuccess.Render("Done:"))
 			for _, item := range modal.Handoff.Done {
 				lines = append(lines, "  • "+item)
 			}
 		}
 		if len(modal.Handoff.Remaining) > 0 {
-			lines = append(lines, reviewColor.Render("Remaining:"))
+			lines = append(lines, styles.category[CategoryReviewable].Render("Remaining:"))
 			for _, item := range modal.Handoff.Remaining {
 				lines = append(lines, "  • "+item)
 			}
 		}
 		if len(modal.Handoff.Uncertain) > 0 {
-			lines = append(lines, blockedColor.Render("Uncertain:"))
+			lines = append(lines, styles.modalError.Render("Uncertain:"))
 			for _, item := range modal.Handoff.Uncertain {
 				lines = append(lines, "  • "+item)
 			}
@@ -1277,18 +1368,18 @@ func (m Model) renderModal() string {
 
 	// Recent logs
 	if len(modal.Logs) > 0 {
-		lines = append(lines, sectionHeader.Render(fmt.Sprintf("RECENT LOGS (%d)", len(modal.Logs))))
+		lines = append(lines, styles.sectionHeader.Render(fmt.Sprintf("RECENT LOGS (%d)", len(modal.Logs))))
 		for _, log := range modal.Logs {
-			lines = append(lines, renderLogLines(log, contentWidth)...)
+			lines = append(lines, m.renderLogLines(log, contentWidth)...)
 		}
 	}
 
 	// Comments
 	if len(modal.Comments) > 0 {
-		lines = append(lines, sectionHeader.Render(fmt.Sprintf("COMMENTS (%d)", len(modal.Comments))))
+		lines = append(lines, styles.sectionHeader.Render(fmt.Sprintf("COMMENTS (%d)", len(modal.Comments))))
 		for _, c := range modal.Comments {
-			line := timestampStyle.Render(c.CreatedAt.Format("01-02 15:04")) + " " +
-				subtleStyle.Render(truncateSession(c.SessionID)) + " " +
+			line := styles.timestamp.Render(formatLocalTime(c.CreatedAt, "01-02 15:04")) + " " +
+				styles.subtle.Render(truncateSession(c.SessionID)) + " " +
 				truncateString(c.Text, contentWidth-25)
 			lines = append(lines, line)
 		}
@@ -1321,7 +1412,7 @@ func (m Model) renderModal() string {
 	// Add scroll indicator if needed
 	if totalLines > visibleHeight {
 		content.WriteString("\n")
-		scrollInfo := subtleStyle.Render(fmt.Sprintf("─ %d/%d ─", scroll+1, totalLines))
+		scrollInfo := styles.subtle.Render(fmt.Sprintf("─ %d/%d ─", scroll+1, totalLines))
 		content.WriteString(scrollInfo)
 	}
 
@@ -1335,20 +1426,19 @@ func (m Model) wrapStatsModal(content string, width, height int) string {
 		// Add vertical padding to match lipgloss Padding(1, 2) behavior.
 		// Custom renderer only handles horizontal padding, so we add blank lines
 		// for top/bottom padding manually.
-		paddedContent := "\n" + content + "\n"
-		// Add 2 to width/height: lipgloss Width/Height = content area, renderer expects outer with borders
-		return m.ModalRenderer(paddedContent, width+2, height+2, ModalTypeStats, 1)
+		paddedContent := m.fillModalSurface("\n"+content+"\n", hostContentWidth(width))
+		// The host draws its own border and padding inside this outer box, so it
+		// gets the same outer dimensions the standalone box would occupy.
+		return m.ModalRenderer(paddedContent, width, height, ModalTypeStats, 1)
 	}
 
 	// Default lipgloss rendering
-	modalStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(primaryColor).
+	modalStyle := m.renderStyles().kanbanBox.
 		Padding(1, 2).
 		Width(width).
 		Height(height)
 
-	return modalStyle.Render(content)
+	return modalStyle.Render(m.fillModalSurface(content, 0))
 }
 
 // renderStatsModal renders the stats modal using the declarative modal library
@@ -1365,6 +1455,7 @@ func (m Model) renderStatsModal() string {
 
 // renderStatsModalLegacy is the legacy rendering for loading/error states
 func (m Model) renderStatsModalLegacy() string {
+	styles := m.renderStyles()
 	// Calculate modal dimensions (80% of terminal, capped)
 	modalWidth := m.Width * 80 / 100
 	if modalWidth > 100 {
@@ -1385,7 +1476,7 @@ func (m Model) renderStatsModalLegacy() string {
 
 	// Loading state
 	if m.StatsLoading {
-		content.WriteString(subtleStyle.Render("Loading statistics..."))
+		content.WriteString(styles.subtle.Render("Loading statistics..."))
 		return m.wrapStatsModal(content.String(), modalWidth, modalHeight)
 	}
 
@@ -1399,14 +1490,14 @@ func (m Model) renderStatsModalLegacy() string {
 		} else {
 			errMsg = "Unknown error"
 		}
-		content.WriteString(errorStyle.Render(fmt.Sprintf("Error: %s", errMsg)))
+		content.WriteString(styles.errorText.Render(fmt.Sprintf("Error: %s", errMsg)))
 		content.WriteString("\n\n")
-		content.WriteString(subtleStyle.Render("Press esc to close"))
+		content.WriteString(styles.subtle.Render("Press esc to close"))
 		return m.wrapStatsModal(content.String(), modalWidth, modalHeight)
 	}
 
 	if m.StatsData == nil || m.StatsData.ExtendedStats == nil {
-		content.WriteString(subtleStyle.Render("No stats available"))
+		content.WriteString(styles.subtle.Render("No stats available"))
 		return m.wrapStatsModal(content.String(), modalWidth, modalHeight)
 	}
 
@@ -1418,23 +1509,24 @@ func (m Model) renderStatsModalLegacy() string {
 // This is called from the Custom section and returns all content lines.
 // The modal library handles scrolling automatically.
 func (m Model) renderStatsContent(contentWidth int) string {
+	styles := m.renderStyles()
 	// Handle missing data gracefully (shouldn't happen, but be safe)
 	if m.StatsData == nil || m.StatsData.ExtendedStats == nil {
-		return subtleStyle.Render("No stats available")
+		return styles.subtle.Render("No stats available")
 	}
 
 	stats := m.StatsData.ExtendedStats
 	var lines []string
 
 	// Status bar chart
-	lines = append(lines, sectionHeader.Render("STATUS BREAKDOWN"))
+	lines = append(lines, styles.sectionHeader.Render("STATUS BREAKDOWN"))
 	lines = append(lines, m.renderStatusBarChart(stats, contentWidth))
 	lines = append(lines, "")
 
 	// Type breakdown (compact)
 	typeBreakdown := m.formatTypeBreakdown(stats)
 	if typeBreakdown != "" {
-		lines = append(lines, sectionHeader.Render("BY TYPE"))
+		lines = append(lines, styles.sectionHeader.Render("BY TYPE"))
 		lines = append(lines, typeBreakdown)
 		lines = append(lines, "")
 	}
@@ -1442,44 +1534,44 @@ func (m Model) renderStatsContent(contentWidth int) string {
 	// Priority breakdown (compact)
 	priorityBreakdown := m.formatPriorityBreakdown(stats)
 	if priorityBreakdown != "" {
-		lines = append(lines, sectionHeader.Render("BY PRIORITY"))
+		lines = append(lines, styles.sectionHeader.Render("BY PRIORITY"))
 		lines = append(lines, priorityBreakdown)
 		lines = append(lines, "")
 	}
 
 	// Summary stats
-	lines = append(lines, sectionHeader.Render("SUMMARY"))
-	lines = append(lines, fmt.Sprintf("%s Total: %d", statsTableLabel.Render("  "), stats.Total))
-	lines = append(lines, fmt.Sprintf("%s Points: %d", statsTableLabel.Render("  "), stats.TotalPoints))
+	lines = append(lines, styles.sectionHeader.Render("SUMMARY"))
+	lines = append(lines, fmt.Sprintf("%s Total: %d", styles.statsTableLabel.Render("  "), stats.Total))
+	lines = append(lines, fmt.Sprintf("%s Points: %d", styles.statsTableLabel.Render("  "), stats.TotalPoints))
 	if stats.Total > 0 {
-		lines = append(lines, fmt.Sprintf("%s Avg Points: %.1f", statsTableLabel.Render("  "), stats.AvgPointsPerTask))
+		lines = append(lines, fmt.Sprintf("%s Avg Points: %.1f", styles.statsTableLabel.Render("  "), stats.AvgPointsPerTask))
 	}
 	completionPct := int(stats.CompletionRate * 100)
-	lines = append(lines, fmt.Sprintf("%s Completion: %d%%", statsTableLabel.Render("  "), completionPct))
+	lines = append(lines, fmt.Sprintf("%s Completion: %d%%", styles.statsTableLabel.Render("  "), completionPct))
 	lines = append(lines, "")
 
 	// Timeline
-	lines = append(lines, sectionHeader.Render("TIMELINE"))
+	lines = append(lines, styles.sectionHeader.Render("TIMELINE"))
 	if stats.OldestOpen != nil {
 		age := time.Since(stats.OldestOpen.CreatedAt)
 		ageDays := int(age.Hours() / 24)
-		lines = append(lines, fmt.Sprintf("%s Oldest open: %s (%dd)", statsTableLabel.Render("  "),
+		lines = append(lines, fmt.Sprintf("%s Oldest open: %s (%dd)", styles.statsTableLabel.Render("  "),
 			stats.OldestOpen.ID, ageDays))
 	}
 	if stats.LastClosed != nil {
-		lines = append(lines, fmt.Sprintf("%s Last closed: %s", statsTableLabel.Render("  "),
+		lines = append(lines, fmt.Sprintf("%s Last closed: %s", styles.statsTableLabel.Render("  "),
 			stats.LastClosed.ID))
 	}
-	lines = append(lines, fmt.Sprintf("%s Created today: %d", statsTableLabel.Render("  "), stats.CreatedToday))
-	lines = append(lines, fmt.Sprintf("%s Created this week: %d", statsTableLabel.Render("  "), stats.CreatedThisWeek))
+	lines = append(lines, fmt.Sprintf("%s Created today: %d", styles.statsTableLabel.Render("  "), stats.CreatedToday))
+	lines = append(lines, fmt.Sprintf("%s Created this week: %d", styles.statsTableLabel.Render("  "), stats.CreatedThisWeek))
 	lines = append(lines, "")
 
 	// Activity
-	lines = append(lines, sectionHeader.Render("ACTIVITY"))
-	lines = append(lines, fmt.Sprintf("%s Total logs: %d", statsTableLabel.Render("  "), stats.TotalLogs))
-	lines = append(lines, fmt.Sprintf("%s Total handoffs: %d", statsTableLabel.Render("  "), stats.TotalHandoffs))
+	lines = append(lines, styles.sectionHeader.Render("ACTIVITY"))
+	lines = append(lines, fmt.Sprintf("%s Total logs: %d", styles.statsTableLabel.Render("  "), stats.TotalLogs))
+	lines = append(lines, fmt.Sprintf("%s Total handoffs: %d", styles.statsTableLabel.Render("  "), stats.TotalHandoffs))
 	if stats.MostActiveSession != "" {
-		lines = append(lines, fmt.Sprintf("%s Most active: %s", statsTableLabel.Render("  "),
+		lines = append(lines, fmt.Sprintf("%s Most active: %s", styles.statsTableLabel.Render("  "),
 			truncateSession(stats.MostActiveSession)))
 	}
 
@@ -1499,6 +1591,7 @@ func (m Model) renderHandoffsModal() string {
 
 // renderHandoffsModalLegacy is the legacy rendering for loading/error/empty states
 func (m Model) renderHandoffsModalLegacy() string {
+	styles := m.renderStyles()
 	// Calculate modal dimensions (80% of terminal, capped)
 	modalWidth := m.Width * 80 / 100
 	if modalWidth > 100 {
@@ -1519,32 +1612,33 @@ func (m Model) renderHandoffsModalLegacy() string {
 
 	// Loading state
 	if m.HandoffsLoading {
-		content.WriteString(subtleStyle.Render("Loading handoffs..."))
+		content.WriteString(styles.subtle.Render("Loading handoffs..."))
 		return m.wrapHandoffsModal(content.String(), modalWidth, modalHeight)
 	}
 
 	// Error state
 	if m.HandoffsError != nil {
-		content.WriteString(errorStyle.Render(fmt.Sprintf("Error: %v", m.HandoffsError)))
+		content.WriteString(styles.modalError.Render(fmt.Sprintf("Error: %v", m.HandoffsError)))
 		content.WriteString("\n\n")
-		content.WriteString(subtleStyle.Render("Press esc to close"))
+		content.WriteString(styles.subtle.Render("Press esc to close"))
 		return m.wrapHandoffsModal(content.String(), modalWidth, modalHeight)
 	}
 
 	// Empty state
 	if len(m.HandoffsData) == 0 {
-		content.WriteString(subtleStyle.Render("No handoffs found"))
+		content.WriteString(styles.subtle.Render("No handoffs found"))
 		return m.wrapHandoffsModal(content.String(), modalWidth, modalHeight)
 	}
 
 	// This should not be reached in practice (declarative modal handles this case)
-	content.WriteString(subtleStyle.Render("Loading..."))
+	content.WriteString(styles.subtle.Render("Loading..."))
 	return m.wrapHandoffsModal(content.String(), modalWidth, modalHeight)
 }
 
 // wrapHandoffsModal wraps content in a modal box with green border
 func (m Model) wrapHandoffsModal(content string, width, height int) string {
-	footer := subtleStyle.Render("↑↓:select  Enter:open issue  Esc:close  r:refresh")
+	styles := m.renderStyles()
+	footer := styles.subtle.Render("↑↓:select  Enter:open issue  Esc:close  r:refresh")
 	inner := lipgloss.JoinVertical(lipgloss.Left, content, "", footer)
 
 	// Use custom renderer if provided (for embedded mode with custom theming)
@@ -1552,24 +1646,28 @@ func (m Model) wrapHandoffsModal(content string, width, height int) string {
 		// Add vertical padding to match lipgloss Padding(1, 2) behavior.
 		// Custom renderer only handles horizontal padding, so we add blank lines
 		// for top/bottom padding manually.
-		paddedInner := "\n" + inner + "\n"
-		// Add 2 to width/height: lipgloss Width/Height = content area, renderer expects outer with borders
-		return m.ModalRenderer(paddedInner, width+2, height+2, ModalTypeHandoffs, 1)
+		paddedInner := m.fillModalSurface("\n"+inner+"\n", hostContentWidth(width))
+		// The host draws its own border and padding inside this outer box, so it
+		// gets the same outer dimensions the standalone box would occupy.
+		return m.ModalRenderer(paddedInner, width, height, ModalTypeHandoffs, 1)
 	}
 
 	// Default lipgloss rendering
 	modalStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("42")). // Green for handoffs
+		BorderForeground(lipgloss.Color(m.themeOrDefault().Success)).
+		Foreground(lipgloss.Color(m.themeOrDefault().TextPrimary)).
+		Background(lipgloss.Color(m.themeOrDefault().Surface)).
 		Padding(1, 2).
 		Width(width).
 		Height(height)
 
-	return modalStyle.Render(inner)
+	return modalStyle.Render(m.fillModalSurface(inner, 0))
 }
 
 // renderBoardPicker renders the board picker modal
 func (m Model) renderBoardPicker() string {
+	styles := m.renderStyles()
 	// Use declarative modal when available
 	if m.BoardPickerModal != nil && m.BoardPickerMouseHandler != nil && len(m.AllBoards) > 0 {
 		return m.BoardPickerModal.Render(m.Width, m.Height, m.BoardPickerMouseHandler)
@@ -1595,12 +1693,12 @@ func (m Model) renderBoardPicker() string {
 
 	// Empty state
 	if len(m.AllBoards) == 0 {
-		content.WriteString(subtleStyle.Render("No boards found"))
+		content.WriteString(styles.subtle.Render("No boards found"))
 		content.WriteString("\n\n")
-		content.WriteString(subtleStyle.Render("Create a board with: td board create <name>"))
+		content.WriteString(styles.subtle.Render("Create a board with: td board create <name>"))
 	} else {
 		// Loading state (modal not yet created)
-		content.WriteString(subtleStyle.Render("Loading boards..."))
+		content.WriteString(styles.subtle.Render("Loading boards..."))
 	}
 
 	return m.wrapBoardPickerModal(content.String(), modalWidth, modalHeight)
@@ -1608,7 +1706,7 @@ func (m Model) renderBoardPicker() string {
 
 // wrapBoardPickerModal wraps board picker content in a styled modal
 func (m Model) wrapBoardPickerModal(content string, width, height int) string {
-	footer := subtleStyle.Render("↑↓:select  Enter:open  Esc:close")
+	footer := m.renderStyles().subtle.Render("↑↓:select  Enter:open  Esc:close")
 	inner := lipgloss.JoinVertical(lipgloss.Left, content, "", footer)
 
 	// Use custom renderer if provided (for embedded mode with custom theming)
@@ -1616,20 +1714,23 @@ func (m Model) wrapBoardPickerModal(content string, width, height int) string {
 		// Add vertical padding to match lipgloss Padding(1, 2) behavior.
 		// Custom renderer only handles horizontal padding, so we add blank lines
 		// for top/bottom padding manually.
-		paddedInner := "\n" + inner + "\n"
-		// Add 2 to width/height: lipgloss Width/Height = content area, renderer expects outer with borders
-		return m.ModalRenderer(paddedInner, width+2, height+2, ModalTypeBoardPicker, 1)
+		paddedInner := m.fillModalSurface("\n"+inner+"\n", hostContentWidth(width))
+		// The host draws its own border and padding inside this outer box, so it
+		// gets the same outer dimensions the standalone box would occupy.
+		return m.ModalRenderer(paddedInner, width, height, ModalTypeBoardPicker, 1)
 	}
 
 	// Default lipgloss rendering
 	modalStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("212")). // Purple
+		BorderForeground(lipgloss.Color(m.themeOrDefault().Primary)).
+		Foreground(lipgloss.Color(m.themeOrDefault().TextPrimary)).
+		Background(lipgloss.Color(m.themeOrDefault().Surface)).
 		Padding(1, 2).
 		Width(width).
 		Height(height)
 
-	return modalStyle.Render(inner)
+	return modalStyle.Render(m.fillModalSurface(inner, 0))
 }
 
 // renderFormModal renders the form modal using huh form
@@ -1640,8 +1741,8 @@ func (m Model) renderFormModal() string {
 
 	modalWidth, _ := m.formModalDimensions()
 
-	// Set form width to match modal content area (modalWidth minus Padding(1,2) = 4 horizontal chars)
-	formWidth := modalWidth - 4
+	// Set form width to the modal content area.
+	formWidth := modalInnerWidth(modalWidth)
 	if formWidth > 0 {
 		m.FormState.Width = formWidth
 		m.FormState.Form.WithWidth(formWidth)
@@ -1655,17 +1756,19 @@ func (m Model) renderFormModal() string {
 	cancelFocused := m.FormState.ButtonFocus == formButtonFocusCancel
 	submitHovered := m.FormState.ButtonHover == 1
 	cancelHovered := m.FormState.ButtonHover == 2
-	buttons := renderButtonPair("Submit", "Cancel", submitFocused, cancelFocused, submitHovered, cancelHovered, false, false)
+	styles := m.renderStyles()
+	theme := m.themeOrDefault()
+	buttons := m.renderButtonPair("Submit", "Cancel", submitFocused, cancelFocused, submitHovered, cancelHovered, false, false)
 
 	// Build footer with key hints (truncated to fit modal content width)
 	var footerParts []string
 	if m.FormState.ShowExtended {
-		footerParts = append(footerParts, subtleStyle.Render("Ctrl+X:hide extended"))
+		footerParts = append(footerParts, styles.subtle.Render("Ctrl+X:hide extended"))
 	} else {
-		footerParts = append(footerParts, subtleStyle.Render("Ctrl+X:show extended"))
+		footerParts = append(footerParts, styles.subtle.Render("Ctrl+X:show extended"))
 	}
-	footerParts = append(footerParts, subtleStyle.Render("Tab:next  Shift+Tab:prev  Enter:select"))
-	footerParts = append(footerParts, subtleStyle.Render("Ctrl+S:submit  Esc:cancel"))
+	footerParts = append(footerParts, styles.subtle.Render("Tab:next  Shift+Tab:prev  Enter:select"))
+	footerParts = append(footerParts, styles.subtle.Render("Ctrl+S:submit  Esc:cancel"))
 	footer := strings.Join(footerParts, "  ")
 	if lipgloss.Width(footer) > formWidth {
 		footer = lipgloss.NewStyle().MaxWidth(formWidth).Render(footer)
@@ -1738,15 +1841,15 @@ func (m Model) renderFormModal() string {
 		var indicator string
 		canScrollUp := scrollOffset > 0
 		canScrollDown := end < totalLines
-		upArrow := subtleStyle.Render("▲")
-		downArrow := subtleStyle.Render("▼")
+		upArrow := styles.subtle.Render("▲")
+		downArrow := styles.subtle.Render("▼")
 		switch {
 		case canScrollUp && canScrollDown:
-			indicator = upArrow + subtleStyle.Render(" scroll ") + downArrow
+			indicator = upArrow + styles.subtle.Render(" scroll ") + downArrow
 		case canScrollUp:
-			indicator = upArrow + subtleStyle.Render(" top visible — PgUp/Shift+Tab to scroll")
+			indicator = upArrow + styles.subtle.Render(" top visible — PgUp/Shift+Tab to scroll")
 		default:
-			indicator = downArrow + subtleStyle.Render(" more below — PgDn/Tab to scroll")
+			indicator = downArrow + styles.subtle.Render(" more below — PgDn/Tab to scroll")
 		}
 
 		visibleInner = strings.Join(visible, "\n") + "\n" + indicator
@@ -1759,7 +1862,7 @@ func (m Model) renderFormModal() string {
 		// Add vertical padding to match lipgloss Padding(1, 2) behavior.
 		// Custom renderer only handles horizontal padding, so we add blank lines
 		// for top/bottom padding manually.
-		paddedInner := "\n" + visibleInner + "\n"
+		paddedInner := m.fillModalSurface("\n"+visibleInner+"\n", hostContentWidth(modalWidth))
 		var renderedHeight int
 		if scrolled {
 			renderedHeight = maxHeight
@@ -1769,13 +1872,12 @@ func (m Model) renderFormModal() string {
 				renderedHeight = maxHeight
 			}
 		}
-		// Add 2 to width: renderer expects outer dimensions with borders
-		return m.ModalRenderer(paddedInner, modalWidth+2, renderedHeight, ModalTypeForm, 1)
+		return m.ModalRenderer(paddedInner, modalWidth, renderedHeight, ModalTypeForm, 1)
 	}
 
 	// Default lipgloss rendering
 	// Select border color - cyan for forms (different from issue modals)
-	borderColor := lipgloss.Color("45") // Cyan
+	borderColor := lipgloss.Color(theme.Info)
 
 	var actualHeight int
 	if scrolled {
@@ -1792,15 +1894,18 @@ func (m Model) renderFormModal() string {
 	modalStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
+		Foreground(lipgloss.Color(theme.TextPrimary)).
+		Background(lipgloss.Color(theme.Surface)).
 		Padding(1, 2).
 		Width(modalWidth).
 		Height(actualHeight)
 
-	return modalStyle.Render(visibleInner)
+	return modalStyle.Render(m.fillModalSurface(visibleInner, 0))
 }
 
 // renderStatusBarChart renders a horizontal bar chart for status breakdown
 func (m Model) renderStatusBarChart(stats *models.ExtendedStats, width int) string {
+	styles := m.renderStyles()
 	var lines []string
 
 	statuses := []models.Status{
@@ -1836,12 +1941,12 @@ func (m Model) renderStatusBarChart(stats *models.ExtendedStats, width int) stri
 		}
 
 		// Build bar with appropriate color from pre-created styles
-		statusColor := statusChartStyles[status]
+		statusColor := styles.statusChart[status]
 
 		// Build filled and empty segments
 		filled := strings.Repeat(statsBarFilled, barLen)
 		empty := strings.Repeat(statsBarEmpty, barWidth-barLen)
-		bar := statusColor.Render(filled) + subtleStyle.Render(empty)
+		bar := statusColor.Render(filled) + styles.subtle.Render(empty)
 
 		// Format label and count
 		label := fmt.Sprintf("%-11s", string(status))
@@ -1876,7 +1981,7 @@ func (m Model) formatTypeBreakdown(stats *models.ExtendedStats) string {
 		return ""
 	}
 
-	return statsTableLabel.Render("  ") + strings.Join(parts, "  ")
+	return m.renderStyles().statsTableLabel.Render("  ") + strings.Join(parts, "  ")
 }
 
 // formatPriorityBreakdown formats a compact priority breakdown
@@ -1901,39 +2006,73 @@ func (m Model) formatPriorityBreakdown(stats *models.ExtendedStats) string {
 		return ""
 	}
 
-	return statsTableLabel.Render("  ") + strings.Join(parts, "  ")
+	return m.renderStyles().statsTableLabel.Render("  ") + strings.Join(parts, "  ")
+}
+
+// fillModalSurface paints the modal surface behind every cell of content.
+//
+// Lip Gloss only emits the block background at the start of a line and around
+// padding it adds itself, so a nested style's reset clears it for the rest of
+// the line. Host chrome renderers pad short lines with unstyled spaces of their
+// own. Both leave the surface splotchy behind styled text; re-applying the
+// background after every SGR (and padding to width when the host owns the
+// chrome) keeps it solid. width <= 0 leaves padding to Lip Gloss.
+func (m Model) fillModalSurface(content string, width int) string {
+	return ansifill.Lines(content, ansifill.Code(m.themeOrDefault().Surface), width)
+}
+
+// modalInnerWidth returns the columns available to content inside a modal box
+// of the given outer width.
+//
+// Lip Gloss v2 counts border and padding inside Width, so a Width(outer) box
+// with Padding(1, 2) leaves outer-6 columns. Content built for outer-4 (the v1
+// budget) overruns by two cells and Lip Gloss re-wraps the overrun onto its own
+// unindented line, which is what made wrapped log and description text jagged.
+func modalInnerWidth(outer int) int {
+	return outer - 6
+}
+
+// hostContentWidth converts a modal outer width into the interior width its
+// chrome renderer exposes: the host spends one cell per side on the border and
+// one more per side on padding, so its interior runs two cells wider than the
+// standalone one. Content is wrapped to modalInnerWidth for both; the surface
+// fill covers the difference so the host never pads with unstyled spaces.
+func hostContentWidth(width int) int {
+	return width - 4
 }
 
 // wrapModalWithDepth wraps content in a modal box with depth-aware styling
 func (m Model) wrapModalWithDepth(content string, width, height int) string {
 	depth := m.ModalDepth()
+	styles := m.renderStyles()
+	theme := m.themeOrDefault()
 
 	// Build footer with breadcrumb if depth > 1
 	var footerParts []string
 
 	// Add status message if present (not in embedded mode - sidecar handles toasts)
 	if m.StatusMessage != "" && !m.Embedded {
-		footerParts = append(footerParts, readyColor.Render(m.StatusMessage))
+		footerParts = append(footerParts, styles.modalSuccess.Render(m.StatusMessage))
 	}
 
 	// Add breadcrumb for stacked modals
 	if breadcrumb := m.ModalBreadcrumb(); breadcrumb != "" {
-		footerParts = append(footerParts, breadcrumbStyle.Render(breadcrumb))
+		footerParts = append(footerParts, styles.modalBreadcrumb.Render(breadcrumb))
 	}
 
 	// Add key hints
 	modal := m.CurrentModal()
 	if modal != nil && modal.TaskSectionFocused {
-		footerParts = append(footerParts, subtleStyle.Render("↑↓:navigate  Enter:open  Tab:scroll  Esc:close"))
+		footerParts = append(footerParts, styles.subtle.Render("↑↓:navigate  Enter:open  Tab:scroll  Esc:close"))
 	} else if depth > 1 {
 		// Show Tab hint if this is an epic with tasks
 		if modal != nil && modal.Issue != nil && modal.Issue.Type == models.TypeEpic && len(modal.EpicTasks) > 0 {
-			footerParts = append(footerParts, subtleStyle.Render("↑↓:scroll  Tab:tasks  Esc:back  r:refresh"))
+			footerParts = append(footerParts, styles.subtle.Render("↑↓:scroll  Tab:tasks  Esc:back  r:refresh"))
 		} else {
-			footerParts = append(footerParts, subtleStyle.Render("↑↓:scroll  Esc:back  r:refresh"))
+			footerParts = append(footerParts, styles.subtle.Render("↑↓:scroll  Esc:back  r:refresh"))
 		}
 	} else {
-		footerParts = append(footerParts, subtleStyle.Render(m.Keymap.ModalFooterHelp()))
+		footerParts = append(footerParts, styles.subtle.Render(m.Keymap.ModalFooterHelp()))
 	}
 
 	footer := strings.Join(footerParts, "\n")
@@ -1944,31 +2083,34 @@ func (m Model) wrapModalWithDepth(content string, width, height int) string {
 		// Add vertical padding to match lipgloss Padding(1, 2) behavior.
 		// Custom renderer only handles horizontal padding, so we add blank lines
 		// for top/bottom padding manually.
-		paddedInner := "\n" + inner + "\n"
-		// Add 2 to width/height: lipgloss Width/Height = content area, renderer expects outer with borders
-		return m.ModalRenderer(paddedInner, width+2, height+2, ModalTypeIssue, depth)
+		paddedInner := m.fillModalSurface("\n"+inner+"\n", hostContentWidth(width))
+		// The host draws its own border and padding inside this outer box, so it
+		// gets the same outer dimensions the standalone box would occupy.
+		return m.ModalRenderer(paddedInner, width, height, ModalTypeIssue, depth)
 	}
 
 	// Default lipgloss rendering
 	// Select border color based on depth
-	var borderColor lipgloss.Color
+	var borderColor color.Color
 	switch depth {
 	case 1:
-		borderColor = primaryColor // Purple/Magenta (212)
+		borderColor = lipgloss.Color(theme.Primary)
 	case 2:
-		borderColor = lipgloss.Color("45") // Cyan
+		borderColor = lipgloss.Color(theme.Info)
 	default:
-		borderColor = lipgloss.Color("214") // Orange for depth 3+
+		borderColor = lipgloss.Color(theme.Warning)
 	}
 
 	modalStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
+		Foreground(lipgloss.Color(theme.TextPrimary)).
+		Background(lipgloss.Color(theme.Surface)).
 		Padding(1, 2).
 		Width(width).
 		Height(height)
 
-	return modalStyle.Render(inner)
+	return modalStyle.Render(m.fillModalSurface(inner, 0))
 }
 
 // wrapConfirmationModal wraps content in a confirmation modal box with standard styling
@@ -1981,19 +2123,22 @@ func (m Model) wrapConfirmationModal(content string, width int) string {
 		// Add vertical padding to match lipgloss Padding(1, 2) behavior.
 		// Custom renderer only handles horizontal padding, so we add blank lines
 		// for top/bottom padding manually.
-		paddedContent := "\n" + content + "\n"
-		// Add 2 to width/height: lipgloss Width/Height = content area, renderer expects outer with borders
-		return m.ModalRenderer(paddedContent, width+2, height+2, ModalTypeConfirmation, 1)
+		paddedContent := m.fillModalSurface("\n"+content+"\n", hostContentWidth(width))
+		// The host draws its own border and padding inside this outer box, so it
+		// gets the same outer dimensions the standalone box would occupy.
+		return m.ModalRenderer(paddedContent, width, height, ModalTypeConfirmation, 1)
 	}
 
 	// Default lipgloss rendering
 	modalStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(errorColor).
+		BorderForeground(lipgloss.Color(m.themeOrDefault().Error)).
+		Foreground(lipgloss.Color(m.themeOrDefault().TextPrimary)).
+		Background(lipgloss.Color(m.themeOrDefault().Surface)).
 		Padding(1, 2).
 		Width(width)
 
-	return modalStyle.Render(content)
+	return modalStyle.Render(m.fillModalSurface(content, 0))
 }
 
 // renderDeleteConfirmation renders the delete confirmation dialog using the declarative modal library
@@ -2010,6 +2155,7 @@ func (m Model) renderDeleteConfirmation() string {
 // renderDeleteConfirmationLegacy is the legacy rendering for the delete confirmation dialog
 // Kept for backward compatibility and edge cases
 func (m Model) renderDeleteConfirmationLegacy() string {
+	styles := m.renderStyles()
 	width := 40
 	if len(m.ConfirmTitle) > 30 {
 		width = len(m.ConfirmTitle) + 10
@@ -2025,7 +2171,7 @@ func (m Model) renderDeleteConfirmationLegacy() string {
 	if m.ConfirmAction != "delete" {
 		action = m.ConfirmAction
 	}
-	content.WriteString(titleStyle.Render(fmt.Sprintf("%s %s?", action, m.ConfirmIssueID)))
+	content.WriteString(styles.title.Render(fmt.Sprintf("%s %s?", action, m.ConfirmIssueID)))
 	content.WriteString("\n")
 
 	// Issue title (truncated to fit on one line)
@@ -2038,7 +2184,7 @@ func (m Model) renderDeleteConfirmationLegacy() string {
 	if len(title) > maxTitleLen {
 		title = title[:maxTitleLen-3] + "..."
 	}
-	content.WriteString(subtleStyle.Render(fmt.Sprintf("\"%s\"", title)))
+	content.WriteString(styles.subtle.Render(fmt.Sprintf("\"%s\"", title)))
 	content.WriteString("\n\n")
 
 	// Interactive buttons
@@ -2047,8 +2193,8 @@ func (m Model) renderDeleteConfirmationLegacy() string {
 	yesHovered := m.ConfirmButtonHover == 1
 	noHovered := m.ConfirmButtonHover == 2
 
-	yesBtn := renderButton("Yes", yesFocused, yesHovered, true) // Danger button for destructive action
-	noBtn := renderButton("No", noFocused, noHovered, false)
+	yesBtn := m.renderButton("Yes", yesFocused, yesHovered, true)
+	noBtn := m.renderButton("No", noFocused, noHovered, false)
 
 	content.WriteString(yesBtn)
 	content.WriteString("  ")
@@ -2056,7 +2202,7 @@ func (m Model) renderDeleteConfirmationLegacy() string {
 	content.WriteString("\n\n")
 
 	// Shortcut hints
-	content.WriteString(subtleStyle.Render("Tab:switch  Y/N:quick  Esc:cancel"))
+	content.WriteString(styles.subtle.Render("Tab:switch  Y/N:quick  Esc:cancel"))
 
 	return m.wrapConfirmationModal(content.String(), width)
 }
@@ -2064,8 +2210,9 @@ func (m Model) renderDeleteConfirmationLegacy() string {
 // Legacy renderCloseConfirmation removed - close confirmation now uses declarative modal
 
 func renderLogLines(log models.Log, contentWidth int) []string {
-	prefix := timestampStyle.Render(log.Timestamp.Format("01-02 15:04")) + " " +
-		subtleStyle.Render(truncateSession(log.SessionID)) + " "
+	styles := newMonitorStyles(DefaultTheme())
+	prefix := styles.timestamp.Render(formatLocalTime(log.Timestamp, "01-02 15:04")) + " " +
+		styles.subtle.Render(truncateSession(log.SessionID)) + " "
 	prefixWidth := lipgloss.Width(prefix)
 	messageWidth := contentWidth - prefixWidth
 	if messageWidth < 1 {
@@ -2088,22 +2235,63 @@ func renderLogLines(log models.Log, contentWidth int) []string {
 	return lines
 }
 
-// Error style for modal
-var errorStyle = lipgloss.NewStyle().Foreground(errorColor)
-var warningStyle = lipgloss.NewStyle().Foreground(warningColor)
+func (m Model) renderLogLines(log models.Log, contentWidth int) []string {
+	styles := m.renderStyles()
+	prefix := styles.timestamp.Render(formatLocalTime(log.Timestamp, "01-02 15:04")) + " " +
+		styles.subtle.Render(truncateSession(log.SessionID)) + " "
+	prefixWidth := lipgloss.Width(prefix)
+	messageWidth := contentWidth - prefixWidth
+	if messageWidth < 1 {
+		messageWidth = 1
+	}
+	wapped := cellbuf.Wrap(log.Message, messageWidth, "")
+	messageLines := strings.Split(wapped, "\n")
+	indent := strings.Repeat(" ", prefixWidth)
+	lines := make([]string, 0, len(messageLines))
+	for i, line := range messageLines {
+		if i == 0 {
+			lines = append(lines, prefix+line)
+		} else {
+			lines = append(lines, indent+line)
+		}
+	}
+	return lines
+}
+
+// formatLocalTime formats t in the process local timezone.
+// All monitor wall-clock timestamps should go through this (or .Local()) so
+// UTC-stored DB values render as local time rather than UTC wall clock.
+func formatLocalTime(t time.Time, layout string) string {
+	return t.Local().Format(layout)
+}
+
+// calendarDaysBetween returns the signed count of civil calendar days from
+// start to end (end − start). Both times are reduced to their calendar dates
+// in their own locations; the difference is computed at noon UTC so a
+// 23-hour spring-forward or 25-hour fall-back day still counts as one day.
+// Using t.Sub(...).Hours()/24 truncates those DST transitions to 0 or 1
+// incorrectly (e.g. "tomorrow" during US spring-forward becomes "today").
+func calendarDaysBetween(start, end time.Time) int {
+	y1, m1, d1 := start.Date()
+	y2, m2, d2 := end.Date()
+	a := time.Date(y1, m1, d1, 12, 0, 0, 0, time.UTC)
+	b := time.Date(y2, m2, d2, 12, 0, 0, 0, time.UTC)
+	return int(b.Sub(a).Hours() / 24)
+}
 
 // formatDeferUntil formats a defer_until date string for display.
+// dateStr is a civil date (YYYY-MM-DD) interpreted in the local timezone.
 func formatDeferUntil(dateStr string) string {
-	t, err := time.Parse("2006-01-02", dateStr)
+	t, err := time.ParseInLocation("2006-01-02", dateStr, time.Local)
 	if err != nil {
 		return dateStr
 	}
 	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	days := int(t.Sub(today).Hours() / 24)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	days := calendarDaysBetween(today, t)
 	switch {
 	case days < 0:
-		return warningStyle.Render(t.Format("Jan 2") + " (past)")
+		return newMonitorStyles(DefaultTheme()).modalWarning.Render(t.Format("Jan 2") + " (past)")
 	case days == 0:
 		return "today"
 	case days == 1:
@@ -2113,15 +2301,36 @@ func formatDeferUntil(dateStr string) string {
 	}
 }
 
-// formatDueDate formats a due_date string for display with urgency styling.
-func formatDueDate(dateStr string) string {
-	t, err := time.Parse("2006-01-02", dateStr)
+func (m Model) formatDeferUntil(dateStr string) string {
+	t, err := time.ParseInLocation("2006-01-02", dateStr, time.Local)
 	if err != nil {
 		return dateStr
 	}
 	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	days := int(t.Sub(today).Hours() / 24)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	days := calendarDaysBetween(today, t)
+	if days < 0 {
+		return m.renderStyles().modalWarning.Render(t.Format("Jan 2") + " (past)")
+	}
+	if days == 0 {
+		return "today"
+	}
+	if days == 1 {
+		return "tomorrow"
+	}
+	return fmt.Sprintf("%s (%d days)", t.Format("Jan 2"), days)
+}
+
+// formatDueDate formats a due_date string for display with urgency styling.
+// dateStr is a civil date (YYYY-MM-DD) interpreted in the local timezone.
+func formatDueDate(dateStr string) string {
+	t, err := time.ParseInLocation("2006-01-02", dateStr, time.Local)
+	if err != nil {
+		return dateStr
+	}
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	days := calendarDaysBetween(today, t)
 	switch {
 	case days < 0:
 		n := -days
@@ -2129,11 +2338,37 @@ func formatDueDate(dateStr string) string {
 		if n == 1 {
 			s = ""
 		}
-		return errorStyle.Render(fmt.Sprintf("OVERDUE by %d day%s", n, s))
+		return newMonitorStyles(DefaultTheme()).modalError.Render(fmt.Sprintf("OVERDUE by %d day%s", n, s))
 	case days == 0:
-		return warningStyle.Render("due TODAY")
+		return newMonitorStyles(DefaultTheme()).modalWarning.Render("due TODAY")
 	case days <= 7:
-		return warningStyle.Render(fmt.Sprintf("%s (%d days)", t.Format("Jan 2"), days))
+		return newMonitorStyles(DefaultTheme()).modalWarning.Render(fmt.Sprintf("%s (%d days)", t.Format("Jan 2"), days))
+	default:
+		return fmt.Sprintf("%s (%d days)", t.Format("Jan 2"), days)
+	}
+}
+
+func (m Model) formatDueDate(dateStr string) string {
+	t, err := time.ParseInLocation("2006-01-02", dateStr, time.Local)
+	if err != nil {
+		return dateStr
+	}
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	days := calendarDaysBetween(today, t)
+	styles := m.renderStyles()
+	switch {
+	case days < 0:
+		n := -days
+		suffix := "s"
+		if n == 1 {
+			suffix = ""
+		}
+		return styles.modalError.Render(fmt.Sprintf("OVERDUE by %d day%s", n, suffix))
+	case days == 0:
+		return styles.modalWarning.Render("due TODAY")
+	case days <= 7:
+		return styles.modalWarning.Render(fmt.Sprintf("%s (%d days)", t.Format("Jan 2"), days))
 	default:
 		return fmt.Sprintf("%s (%d days)", t.Format("Jan 2"), days)
 	}
@@ -2146,16 +2381,16 @@ func (m Model) renderSearchBar() string {
 	}
 
 	var sb strings.Builder
+	styles := m.renderStyles()
 
 	// Icon: triangle with color indicating state
 	// Pink when in search mode, orange when filter active, subtle otherwise
-	pinkStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205")) // Pink
 	if m.SearchMode {
-		sb.WriteString(pinkStyle.Render("▸"))
+		sb.WriteString(styles.searchEditing.Render("▸"))
 		sb.WriteString(" ")
 	} else {
 		// Orange triangle to match the active filter query
-		sb.WriteString(searchQueryActiveStyle.Render("▸"))
+		sb.WriteString(styles.searchActive.Render("▸"))
 		sb.WriteString(" ")
 	}
 
@@ -2164,14 +2399,14 @@ func (m Model) renderSearchBar() string {
 		sb.WriteString(m.SearchInput.View())
 	} else {
 		// Not in search mode but have a query - show it bright to indicate active filtering
-		sb.WriteString(searchQueryActiveStyle.Render(m.SearchQuery))
+		sb.WriteString(styles.searchActive.Render(m.SearchQuery))
 	}
 
 	// Closed indicator
 	if m.IncludeClosed {
 		numClosed := len(m.TaskList.Closed)
 		sb.WriteString("  ")
-		sb.WriteString(subtleStyle.Render(fmt.Sprintf("[%d closed]", numClosed)))
+		sb.WriteString(styles.subtle.Render(fmt.Sprintf("[%d closed]", numClosed)))
 	}
 
 	// Hint
@@ -2179,17 +2414,14 @@ func (m Model) renderSearchBar() string {
 	if padding > 0 {
 		sb.WriteString(strings.Repeat(" ", padding))
 	}
-	sb.WriteString(subtleStyle.Render("[Esc:exit]"))
+	sb.WriteString(styles.subtle.Render("[Esc:exit]"))
 
-	return lipgloss.NewStyle().
-		Border(lipgloss.NormalBorder(), false, false, true, false).
-		BorderForeground(lipgloss.Color("240")).
-		Padding(0, 1).
-		Render(sb.String())
+	return styles.searchBar.Render(sb.String())
 }
 
 // renderFooter renders the footer with key bindings and refresh time
 func (m Model) renderFooter() string {
+	styles := m.renderStyles()
 	// Use board-specific footer when in board mode
 	var keysStr string
 	if m.TaskListMode == TaskListModeBoard {
@@ -2197,43 +2429,43 @@ func (m Model) renderFooter() string {
 	} else {
 		keysStr = m.Keymap.FooterHelp()
 	}
-	keys := helpStyle.Render(keysStr)
+	keys := styles.help.Render(keysStr)
 
 	// Show active sessions indicator
 	sessionsIndicator := ""
 	if len(m.ActiveSessions) > 0 {
-		sessionsIndicator = activeSessionStyle.Render(fmt.Sprintf(" %d active ", len(m.ActiveSessions)))
+		sessionsIndicator = styles.activeSession.Render(fmt.Sprintf(" %d active ", len(m.ActiveSessions)))
 	}
 
 	// Show prominent handoff alert if new handoffs occurred
 	handoffAlert := ""
 	if len(m.RecentHandoffs) > 0 {
-		handoffAlert = handoffAlertStyle.Render(fmt.Sprintf(" [%d HANDOFF] ", len(m.RecentHandoffs)))
+		handoffAlert = styles.handoffAlert.Render(fmt.Sprintf(" [%d HANDOFF] ", len(m.RecentHandoffs)))
 	}
 
 	// Show prominent review alert if items need review
 	reviewAlert := ""
 	if len(m.TaskList.Reviewable) > 0 {
-		reviewAlert = reviewAlertStyle.Render(fmt.Sprintf(" [%d TO REVIEW] ", len(m.TaskList.Reviewable)))
+		reviewAlert = styles.reviewAlert.Render(fmt.Sprintf(" [%d TO REVIEW] ", len(m.TaskList.Reviewable)))
 	}
 
 	// Show update available notification
 	updateNotif := ""
 	if m.UpdateAvail != nil {
-		updateNotif = updateAvailStyle.Render(fmt.Sprintf(" [UPDATE: %s] ", m.UpdateAvail.LatestVersion))
+		updateNotif = styles.updateAvailable.Render(fmt.Sprintf(" [UPDATE: %s] ", m.UpdateAvail.LatestVersion))
 	}
 
 	// Show status message toast (yank confirmation, errors, etc.)
 	statusToast := ""
 	if m.StatusMessage != "" {
-		style := toastStyle
+		style := styles.toast
 		if m.StatusIsError {
-			style = toastErrorStyle
+			style = styles.toastError
 		}
 		statusToast = style.Render(fmt.Sprintf(" %s ", m.StatusMessage))
 	}
 
-	refresh := timestampStyle.Render(fmt.Sprintf("Last: %s", m.LastRefresh.Format("15:04:05")))
+	refresh := styles.timestamp.Render(fmt.Sprintf("Last: %s", formatLocalTime(m.LastRefresh, "15:04:05")))
 
 	// Calculate spacing
 	padding := m.Width - lipgloss.Width(keys) - lipgloss.Width(sessionsIndicator) - lipgloss.Width(handoffAlert) - lipgloss.Width(reviewAlert) - lipgloss.Width(updateNotif) - lipgloss.Width(statusToast) - lipgloss.Width(refresh) - 2
@@ -2246,6 +2478,8 @@ func (m Model) renderFooter() string {
 
 // renderHelp renders the help modal with scrolling support
 func (m Model) renderHelp() string {
+	styles := m.renderStyles()
+	theme := m.themeOrDefault()
 	// Calculate modal dimensions (80% of terminal, clamped)
 	modalWidth := m.Width * 80 / 100
 	if modalWidth > 80 {
@@ -2304,19 +2538,19 @@ func (m Model) renderHelp() string {
 
 	// Show filter input if filtering
 	if m.HelpFilterMode {
-		filterStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
+		filterStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
 		content.WriteString(filterStyle.Render("/ " + m.HelpFilter + "█"))
 		content.WriteString("\n")
 	} else if m.HelpFilter != "" {
-		filterStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
-		matchInfo := subtleStyle.Render(fmt.Sprintf(" (%d matches)", totalLines))
+		filterStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.Primary))
+		matchInfo := styles.subtle.Render(fmt.Sprintf(" (%d matches)", totalLines))
 		content.WriteString(filterStyle.Render("/ "+m.HelpFilter) + matchInfo)
 		content.WriteString("\n")
 	}
 
 	// Show up indicator if scrolled down
 	if scroll > 0 {
-		content.WriteString(subtleStyle.Render(fmt.Sprintf("  ▲ %d more above\n", scroll)))
+		content.WriteString(styles.subtle.Render(fmt.Sprintf("  ▲ %d more above\n", scroll)))
 		visibleHeight-- // Reduce visible lines for indicator
 	}
 
@@ -2327,7 +2561,7 @@ func (m Model) renderHelp() string {
 	}
 	if scroll < totalLines {
 		for i := scroll; i < endIdx; i++ {
-			content.WriteString(displayLines[i])
+			content.WriteString(m.renderHelpLine(displayLines[i]))
 			if i < endIdx-1 {
 				content.WriteString("\n")
 			}
@@ -2338,43 +2572,50 @@ func (m Model) renderHelp() string {
 	linesBelow := totalLines - endIdx
 	if linesBelow > 0 {
 		content.WriteString("\n")
-		content.WriteString(subtleStyle.Render(fmt.Sprintf("  ▼ %d more below", linesBelow)))
+		content.WriteString(styles.subtle.Render(fmt.Sprintf("  ▼ %d more below", linesBelow)))
 	}
 
 	// Build footer with scroll info
 	var footerParts []string
 	if totalLines > visibleHeight {
-		scrollInfo := subtleStyle.Render(fmt.Sprintf("─ %d/%d ─", scroll+1, totalLines))
+		scrollInfo := styles.subtle.Render(fmt.Sprintf("─ %d/%d ─", scroll+1, totalLines))
 		footerParts = append(footerParts, scrollInfo)
 	}
 	if m.HelpFilter != "" {
-		footerParts = append(footerParts, subtleStyle.Render("Esc:clear  j/k:scroll  ?:close"))
+		footerParts = append(footerParts, styles.subtle.Render("Esc:clear  j/k:scroll  ?:close"))
 	} else {
-		footerParts = append(footerParts, subtleStyle.Render("/:filter  j/k:scroll  Ctrl+d/u:½page  G/gg:end/start  ?/Esc:close"))
+		footerParts = append(footerParts, styles.subtle.Render("/:filter  j/k:scroll  Ctrl+d/u:½page  G/gg:end/start  ?/Esc:close"))
 	}
 	footer := strings.Join(footerParts, "  ")
 
 	// Combine content and footer
 	inner := lipgloss.JoinVertical(lipgloss.Left, content.String(), "", footer)
+	if m.ModalRenderer != nil {
+		paddedInner := m.fillModalSurface("\n"+inner+"\n", hostContentWidth(modalWidth))
+		return m.ModalRenderer(paddedInner, modalWidth, modalHeight, ModalTypeHelp, 1)
+	}
 
 	// Style the modal
 	modalStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("141")). // Purple for help
+		BorderForeground(lipgloss.Color(theme.Secondary)).
+		Foreground(lipgloss.Color(theme.TextPrimary)).
+		Background(lipgloss.Color(theme.Surface)).
 		Padding(1, 2).
 		Width(modalWidth).
 		Height(modalHeight)
 
-	return modalStyle.Render(inner)
+	return modalStyle.Render(m.fillModalSurface(inner, 0))
 }
 
 // determinePanelState determines the visual state of a panel for theming
 func (m Model) determinePanelState(panel Panel) PanelState {
 	// Check divider states first (more specific)
 	dividerForPanel := -1
-	if panel == PanelCurrentWork {
+	switch panel {
+	case PanelCurrentWork:
 		dividerForPanel = 0
-	} else if panel == PanelTaskList {
+	case PanelTaskList:
 		dividerForPanel = 1
 	}
 
@@ -2397,13 +2638,87 @@ func (m Model) determinePanelState(panel Panel) PanelState {
 	return PanelStateNormal
 }
 
+const (
+	emptyCurrentWorkMsg   = "Ask an agent to start a task with td and it will show up here."
+	emptyBoardNoTasksMsg  = "No tasks yet. Ask an agent to create tasks with td or run td create."
+	emptyBoardFilteredMsg = "No issues match the board query, try adjusting the status filter."
+	emptyBoardFilterHint  = "Try adjusting the status filter with 'c' or 'F'"
+	emptyActivityMsg      = "No recent activity"
+	embeddedNextStepMsg   = "Next: Press [3] for Workspaces to create a worktree and start an agent shell."
+)
+
+// panelTitleIndent is the visible left pad of a panel title, so empty-state
+// copy lines up with the title letters (the 'C' in CURRENT WORK).
+func (m Model) panelTitleIndent() string {
+	const marker = "T"
+	plain := ansi.Strip(m.renderStyles().panelTitle.Render(marker))
+	n := strings.Index(plain, marker)
+	if n <= 0 {
+		return " "
+	}
+	return strings.Repeat(" ", n)
+}
+
+func (m Model) withEmbeddedNextStep(lines []string) []string {
+	if !m.Embedded || m.HasIssues {
+		return lines
+	}
+	out := make([]string, 0, len(lines)+2)
+	out = append(out, lines...)
+	out = append(out, "", embeddedNextStepMsg)
+	return out
+}
+
+func (m Model) boardEmptyStateBody() string {
+	if m.HasIssues {
+		return m.emptyStateBody([]string{emptyBoardFilteredMsg, "", emptyBoardFilterHint})
+	}
+	return m.emptyStateBody(m.withEmbeddedNextStep([]string{emptyBoardNoTasksMsg}))
+}
+
+// emptyStateBody renders empty-pane copy: a blank line under the header, then
+// each line indented to match the panel title text.
+func (m Model) emptyStateBody(lines []string) string {
+	styles := m.renderStyles()
+	indent := m.panelTitleIndent()
+	indentWidth := lipgloss.Width(indent)
+	contentWidth := m.Width - 4
+	wrapWidth := contentWidth - indentWidth
+	if wrapWidth < 16 {
+		wrapWidth = contentWidth
+		indent = ""
+	}
+
+	var b strings.Builder
+	b.WriteByte('\n')
+	for i, line := range lines {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		if line == "" {
+			continue
+		}
+		wrapped := cellbuf.Wrap(line, wrapWidth, "")
+		for j, part := range strings.Split(wrapped, "\n") {
+			if j > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(indent)
+			b.WriteString(styles.subtle.Render(part))
+		}
+	}
+	b.WriteByte('\n')
+	return b.String()
+}
+
 // wrapPanel wraps content in a panel with title and border
 func (m Model) wrapPanel(title, content string, height int, panel Panel) string {
+	styles := m.renderStyles()
 	// Use custom renderer if provided (for embedded mode with custom theming)
 	if m.PanelRenderer != nil {
 		state := m.determinePanelState(panel)
 		// Render title
-		titleStr := panelTitleStyle.Render(title)
+		titleStr := styles.panelTitle.Render(title)
 		// Calculate content width
 		contentWidth := m.Width - 4 // Account for border and padding
 		// Truncate/pad content to fit
@@ -2430,32 +2745,33 @@ func (m Model) wrapPanel(title, content string, height int, panel Panel) string 
 	}
 
 	// Default lipgloss rendering
-	style := panelStyle
+	style := styles.panel
 	if m.ActivePanel == panel {
-		style = activePanelStyle
+		style = styles.activePanel
 	} else if m.HoverPanel == panel {
-		style = hoverPanelStyle
+		style = styles.hoverPanel
 	}
 
 	// Override style for divider drag/hover feedback
 	// Divider 0 is bottom of PanelCurrentWork, Divider 1 is bottom of PanelTaskList
 	dividerForPanel := -1
-	if panel == PanelCurrentWork {
+	switch panel {
+	case PanelCurrentWork:
 		dividerForPanel = 0
-	} else if panel == PanelTaskList {
+	case PanelTaskList:
 		dividerForPanel = 1
 	}
 
 	if dividerForPanel >= 0 {
 		if m.DraggingDivider == dividerForPanel {
-			style = dividerActivePanelStyle
+			style = styles.dividerActivePanel
 		} else if m.DividerHover == dividerForPanel && m.DraggingDivider < 0 {
-			style = dividerHoverPanelStyle
+			style = styles.dividerHoverPanel
 		}
 	}
 
 	// Render title
-	titleStr := panelTitleStyle.Render(title)
+	titleStr := styles.panelTitle.Render(title)
 
 	// Calculate content width
 	contentWidth := m.Width - 4 // Account for border and padding
@@ -2487,48 +2803,6 @@ func (m Model) wrapPanel(title, content string, height int, panel Panel) string 
 	return style.Width(m.Width - 2).Render(inner)
 }
 
-// formatIssueCompact formats an issue in a compact single-line format
-func (m Model) formatIssueCompact(issue *models.Issue) string {
-	parts := []string{
-		formatTypeIcon(issue.Type),
-		titleStyle.Render(issue.ID),
-		formatPriority(issue.Priority),
-		issue.Title,
-	}
-
-	if issue.ImplementerSession != "" {
-		parts = append(parts, subtleStyle.Render(fmt.Sprintf("(%s)", truncateSession(issue.ImplementerSession))))
-	}
-
-	return strings.Join(parts, " ")
-}
-
-// formatIssueShort formats an issue in a short format
-func (m Model) formatIssueShort(issue *models.Issue) string {
-	typeIcon := formatTypeIcon(issue.Type)
-	idStr := subtleStyle.Render(issue.ID)
-	priorityStr := formatPriority(issue.Priority)
-
-	// Calculate available width for title.
-	// Line format (in callers): fmt.Sprintf("%s %s", tag, issueStr)
-	//   where issueStr = fmt.Sprintf("%s %s %s %s", typeIcon, idStr, priorityStr, title)
-	// Overhead:
-	//   4             = panel border + padding (wrapPanel uses m.Width - 4 for content)
-	//   5             = category tag visual width (all tags are 5 chars: [RDY], [BLK], etc.)
-	//   1             = space between tag and issueStr (outer format "%s %s")
-	//   typeIconWidth = actual width of the type icon character (varies by terminal)
-	//   idWidth       = visual width of styled issue ID
-	//   priorityWidth = visual width of styled priority
-	//   3             = three spaces in issueStr format (after typeIcon, after id, after priority)
-	overhead := 4 + 5 + 1 + lipgloss.Width(typeIcon) + lipgloss.Width(idStr) + lipgloss.Width(priorityStr) + 3
-	titleWidth := m.Width - overhead
-	if titleWidth < 20 {
-		titleWidth = 20 // minimum reasonable width
-	}
-
-	return fmt.Sprintf("%s %s %s %s", typeIcon, idStr, priorityStr, truncateString(issue.Title, titleWidth))
-}
-
 // truncateString truncates a string to maxLen with ellipsis (ANSI-aware)
 func truncateString(s string, maxLen int) string {
 	if maxLen <= 3 {
@@ -2548,56 +2822,3 @@ func truncateSession(sessionID string) string {
 	}
 	return sessionID[:10]
 }
-
-// Color styles for task list sections
-var (
-	readyColor         = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	reviewColor        = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
-	blockedColor       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	reworkColor        = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // Orange/warning
-	inProgressColor    = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))  // Cyan
-	pendingReviewColor = lipgloss.NewStyle().Foreground(lipgloss.Color("183")) // Light purple
-
-	// Prominent style for review alert in footer
-	reviewAlertStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("0")).
-				Background(lipgloss.Color("141"))
-
-	// Header styles for category sections (matching reviewAlertStyle pattern)
-	readyHeaderStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("0")).
-				Background(lipgloss.Color("42")) // Green bg
-
-	blockedHeaderStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("255")).
-				Background(lipgloss.Color("196")) // Red bg
-
-	inProgressHeaderStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("0")).
-				Background(lipgloss.Color("45")) // Cyan bg
-
-	pendingReviewHeaderStyle = lipgloss.NewStyle().
-					Bold(true).
-					Foreground(lipgloss.Color("0")).
-					Background(lipgloss.Color("183")) // Light purple bg
-
-	// Prominent style for handoff alert - green background
-	handoffAlertStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("0")).
-				Background(lipgloss.Color("42"))
-
-	// Style for active sessions indicator - cyan text
-	activeSessionStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("45"))
-
-	// Style for update available notification - yellow/gold
-	updateAvailStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("0")).
-				Background(lipgloss.Color("214"))
-)

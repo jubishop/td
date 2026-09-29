@@ -5,10 +5,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/query"
 	"github.com/marcus/td/pkg/monitor/modal"
@@ -59,7 +58,7 @@ func (m Model) openBoardEditorModal(board *models.Board) Model {
 	// the bubbletea Model copies all reference the same underlying instance.
 	nameInput := textinput.New()
 	nameInput.Placeholder = "Board name"
-	nameInput.Width = 40
+	nameInput.SetWidth(40)
 	nameInput.CharLimit = 100
 	if board != nil {
 		nameInput.SetValue(board.Name)
@@ -127,7 +126,7 @@ func (m *Model) createBoardEditorModal() *modal.Modal {
 		variant = modal.VariantInfo
 	}
 
-	md := modal.New(title,
+	md := m.newModal(title, ModalTypeBoardEditor,
 		modal.WithWidth(modalWidth),
 		modal.WithVariant(variant),
 		modal.WithHints(false),
@@ -163,10 +162,14 @@ func (m *Model) createBoardEditorModal() *modal.Modal {
 		md.AddSection(modal.Spacer())
 
 		// Live query preview section
-		md.AddSection(modal.Custom(
-			func(contentWidth int, focusID, hoverID string) modal.RenderedSection {
+		preview := m.BoardEditorPreview
+		queryInput := m.BoardEditorQueryInput
+		md.AddSection(modal.ThemedCustom(
+			func(contentWidth int, focusID, hoverID string, theme modal.Theme) modal.RenderedSection {
+				currentTheme := monitorTheme(theme)
+				snapshot := Model{BoardEditorPreview: preview, BoardEditorQueryInput: queryInput, theme: currentTheme, styles: newMonitorStyles(currentTheme)}
 				return modal.RenderedSection{
-					Content: m.renderBoardEditorQueryPreview(contentWidth),
+					Content: snapshot.renderBoardEditorQueryPreview(contentWidth),
 				}
 			},
 			nil,
@@ -174,10 +177,12 @@ func (m *Model) createBoardEditorModal() *modal.Modal {
 		md.AddSection(modal.Spacer())
 
 		// TDQ Quick Reference section
-		md.AddSection(modal.Custom(
-			func(contentWidth int, focusID, hoverID string) modal.RenderedSection {
+		md.AddSection(modal.ThemedCustom(
+			func(contentWidth int, focusID, hoverID string, theme modal.Theme) modal.RenderedSection {
+				currentTheme := monitorTheme(theme)
+				snapshot := Model{theme: currentTheme, styles: newMonitorStyles(currentTheme)}
 				return modal.RenderedSection{
-					Content: m.renderBoardEditorTDQRef(contentWidth),
+					Content: snapshot.renderBoardEditorTDQRef(contentWidth),
 				}
 			},
 			nil,
@@ -208,26 +213,26 @@ func (m *Model) createBoardEditorModal() *modal.Modal {
 // renderBoardEditorQueryPreview renders the live query preview section.
 func (m *Model) renderBoardEditorQueryPreview(contentWidth int) string {
 	var sb strings.Builder
+	styles := m.renderStyles()
 
 	preview := m.BoardEditorPreview
 	if preview == nil {
-		sb.WriteString(subtleStyle.Render("Preview: (loading...)"))
+		sb.WriteString(styles.subtle.Render("Preview: (loading...)"))
 		return sb.String()
 	}
 
 	if m.BoardEditorQueryInput == nil {
-		sb.WriteString(subtleStyle.Render("Preview: (no query input)"))
+		sb.WriteString(styles.subtle.Render("Preview: (no query input)"))
 		return sb.String()
 	}
 	queryStr := m.BoardEditorQueryInput.Value()
 	if queryStr == "" {
-		sb.WriteString(subtleStyle.Render("Preview: (empty query matches all issues)"))
+		sb.WriteString(styles.subtle.Render("Preview: (empty query matches all issues)"))
 		return sb.String()
 	}
 
 	if preview.Error != nil {
-		errStyle := lipgloss.NewStyle().Foreground(errorColor)
-		sb.WriteString(errStyle.Render("Error: " + preview.Error.Error()))
+		sb.WriteString(styles.errorText.Render("Error: " + preview.Error.Error()))
 		return sb.String()
 	}
 
@@ -235,7 +240,7 @@ func (m *Model) renderBoardEditorQueryPreview(contentWidth int) string {
 	if preview.Count < 0 {
 		sb.WriteString("Matches: 5+ issue(s)")
 	} else {
-		sb.WriteString(fmt.Sprintf("Matches: %d issue(s)", preview.Count))
+		fmt.Fprintf(&sb, "Matches: %d issue(s)", preview.Count)
 	}
 	if len(preview.Titles) > 0 {
 		for _, t := range preview.Titles {
@@ -244,12 +249,12 @@ func (m *Model) renderBoardEditorQueryPreview(contentWidth int) string {
 			if maxLen > 0 && len(title) > maxLen {
 				title = title[:maxLen-3] + "..."
 			}
-			sb.WriteString("\n  " + subtleStyle.Render("• "+title))
+			sb.WriteString("\n  " + styles.subtle.Render("• "+title))
 		}
 		if preview.Count < 0 {
-			sb.WriteString("\n  " + subtleStyle.Render("... and more"))
+			sb.WriteString("\n  " + styles.subtle.Render("... and more"))
 		} else if preview.Count > len(preview.Titles) {
-			sb.WriteString(fmt.Sprintf("\n  "+subtleStyle.Render("... and %d more"), preview.Count-len(preview.Titles)))
+			fmt.Fprintf(&sb, "\n  "+styles.subtle.Render("... and %d more"), preview.Count-len(preview.Titles))
 		}
 	}
 
@@ -260,8 +265,8 @@ func (m *Model) renderBoardEditorQueryPreview(contentWidth int) string {
 func (m *Model) renderBoardEditorTDQRef(contentWidth int) string {
 	var sb strings.Builder
 
-	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(primaryColor)
-	sb.WriteString(headerStyle.Render("TDQ Quick Reference") + "\n")
+	styles := m.renderStyles()
+	sb.WriteString(styles.boardEditorHeader.Render("TDQ Quick Reference") + "\n")
 	sb.WriteString("─────────────────────────────\n")
 	sb.WriteString("Fields: status, type, priority, labels, title\n")
 	sb.WriteString("Status: open, in_progress, blocked, in_review, closed\n")
@@ -272,7 +277,7 @@ func (m *Model) renderBoardEditorTDQRef(contentWidth int) string {
 	sb.WriteString("Sort:   sort:priority  sort:-created  sort:-updated\n")
 	sb.WriteString("Values: @me, today, -7d, EMPTY\n")
 	sb.WriteString("─────────────────────────────\n")
-	sb.WriteString(subtleStyle.Render("Example: type = bug AND priority <= P1"))
+	sb.WriteString(styles.subtle.Render("Example: type = bug AND priority <= P1"))
 
 	return sb.String()
 }
@@ -313,7 +318,7 @@ func (m *Model) createBoardEditorDeleteConfirmModal() *modal.Modal {
 		boardName = m.BoardEditorBoard.Name
 	}
 
-	md := modal.New("DELETE BOARD?",
+	md := m.newModal("DELETE BOARD?", ModalTypeConfirmation,
 		modal.WithWidth(50),
 		modal.WithVariant(modal.VariantDanger),
 		modal.WithHints(false),
@@ -351,6 +356,9 @@ func (m Model) executeBoardEditorSave() (Model, tea.Cmd) {
 	return m, func() tea.Msg {
 		if isNew {
 			newBoard, err := m.DB.CreateBoardLogged(name, queryStr, m.SessionID)
+			if err == nil {
+				m.wakeSync()
+			}
 			return BoardEditorSaveResultMsg{Board: newBoard, IsNew: true, Error: err}
 		}
 		// Copy the board struct to avoid mutating a shared pointer from
@@ -359,6 +367,9 @@ func (m Model) executeBoardEditorSave() (Model, tea.Cmd) {
 		boardCopy.Name = name
 		boardCopy.Query = queryStr
 		err := m.DB.UpdateBoardLogged(&boardCopy, m.SessionID)
+		if err == nil {
+			m.wakeSync()
+		}
 		return BoardEditorSaveResultMsg{Board: &boardCopy, IsNew: false, Error: err}
 	}
 }
@@ -372,6 +383,9 @@ func (m Model) executeBoardEditorDelete() (Model, tea.Cmd) {
 
 	return m, func() tea.Msg {
 		err := m.DB.DeleteBoardLogged(boardID, m.SessionID)
+		if err == nil {
+			m.wakeSync()
+		}
 		return BoardEditorDeleteResultMsg{BoardID: boardID, Error: err}
 	}
 }

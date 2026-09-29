@@ -1,7 +1,13 @@
 package db
 
-// SchemaVersion is the current database schema version
-const SchemaVersion = 29
+// SchemaVersion is the current database schema version.
+//
+// It MUST equal the highest Version in Migrations. RunMigrations short-circuits
+// on `currentVersion >= SchemaVersion`, so appending a migration without
+// bumping this const means the migration never runs on any existing database —
+// only on fresh ones, which start at 0. TestSchemaVersionMatchesMigrations
+// enforces the invariant.
+const SchemaVersion = 38
 
 const schema = `
 -- Issues table
@@ -91,6 +97,9 @@ CREATE TABLE IF NOT EXISTS work_sessions (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     session_id TEXT NOT NULL,
+    worktree_id TEXT DEFAULT '',
+    worktree_root TEXT DEFAULT '',
+    repo_root TEXT DEFAULT '',
     started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     ended_at DATETIME,
     start_sha TEXT DEFAULT '',
@@ -126,6 +135,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_type TEXT DEFAULT '',
     agent_pid INTEGER DEFAULT 0,
     context_id TEXT DEFAULT '',
+    match_context_id TEXT DEFAULT '',
+    worktree_id TEXT DEFAULT '',
+    worktree_root TEXT DEFAULT '',
+    repo_root TEXT DEFAULT '',
     previous_session_id TEXT DEFAULT '',
     started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     ended_at DATETIME,
@@ -150,7 +163,17 @@ CREATE INDEX IF NOT EXISTS idx_git_snapshots_issue ON git_snapshots(issue_id);
 CREATE INDEX IF NOT EXISTS idx_issue_files_issue ON issue_files(issue_id);
 CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(branch);
-CREATE INDEX IF NOT EXISTS idx_sessions_branch_agent ON sessions(branch, agent_type, agent_pid);
+CREATE INDEX IF NOT EXISTS idx_sessions_branch_agent ON sessions(branch, agent_type, agent_pid, match_context_id, worktree_id);
+
+-- Session state table for local-only current focus/work-session state
+CREATE TABLE IF NOT EXISTS session_state (
+    session_id TEXT NOT NULL,
+    worktree_id TEXT DEFAULT '',
+    focused_issue_id TEXT DEFAULT '',
+    active_work_session_id TEXT DEFAULT '',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(session_id, worktree_id)
+);
 `
 
 // BaseSchema returns the initial database schema DDL.
@@ -478,6 +501,93 @@ ALTER TABLE issues ADD COLUMN due_date TEXT;
 ALTER TABLE issues ADD COLUMN defer_count INTEGER DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_issues_defer_until ON issues(defer_until);
 CREATE INDEX IF NOT EXISTS idx_issues_due_date ON issues(due_date);
+`,
+	},
+	{
+		Version:     30,
+		Description: "FK orphan cleanup + ON DELETE CASCADE for FK enforcement (td-4846e6)",
+		// Handled by custom Go code in migration_fk_enforcement.go (migrateEnableFKEnforcement)
+		SQL: "",
+	},
+	{
+		Version:     31,
+		Description: "Add review-attestation columns to issues and issue_reviews table",
+		// Handled by custom Go code in reviews_migration.go (migrateReviewAttestations)
+		// so that re-running is safe even if some columns already exist.
+		SQL: "",
+	},
+	{
+		Version:     32,
+		Description: "Add self_review column to issue_reviews",
+		// Handled by custom Go code in reviews_migration.go (migrateSelfReviewColumn)
+		// using a columnExists guard so re-running is safe.
+		SQL: "",
+	},
+	{
+		Version:     33,
+		Description: "Add match_context_id to sessions for sub-agent session keying (td-64dc09)",
+		// Handled by custom Go code in migrations.go (migrateSessionMatchContextID)
+		// using a columnExists guard so re-running is safe.
+		SQL: "",
+	},
+	{
+		Version:     34,
+		Description: "Add worktree identity metadata to sessions and work sessions (td-83cfc9)",
+		// Handled by custom Go code in migrations.go (migrateWorktreeIdentity)
+		// using columnExists guards so re-running is safe.
+		SQL: "",
+	},
+	{
+		Version:     35,
+		Description: "Add local-only session_state table (td-3d427b)",
+		SQL: `
+CREATE TABLE IF NOT EXISTS session_state (
+    session_id TEXT NOT NULL,
+    worktree_id TEXT DEFAULT '',
+    focused_issue_id TEXT DEFAULT '',
+    active_work_session_id TEXT DEFAULT '',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(session_id, worktree_id)
+);
+`,
+	},
+	{
+		Version:     36,
+		Description: "Normalize legacy Go-format timestamps to canonical SQLite layout",
+		// Handled by custom Go code in migrations.go (migrateNormalizeTimestamps).
+		// Rewrites values written by modernc's default time.Time.String() writer;
+		// idempotent and safe to re-run.
+		SQL: "",
+	},
+	{
+		Version:     37,
+		Description: "Add reviewed_by attribution column to issue_reviews",
+		// Handled by custom Go code in reviews_migration.go (migrateReviewedByColumn)
+		// using a columnExists guard so re-running is safe.
+		SQL: "",
+	},
+	{
+		Version:     38,
+		Description: "Add sync_skipped_events table so an unappliable remote event cannot wedge the stream",
+		// A remote event that can never apply used to roll its whole batch back
+		// with the cursor preserved, so every later pull replayed the same
+		// failure and the peer stopped converging permanently. Skipped events
+		// are now recorded here instead of blocking the stream. server_seq is
+		// the primary key so re-recording the same event is idempotent.
+		SQL: `
+CREATE TABLE IF NOT EXISTS sync_skipped_events (
+    server_seq INTEGER PRIMARY KEY,
+    device_id TEXT NOT NULL DEFAULT '',
+    action_type TEXT NOT NULL DEFAULT '',
+    entity_type TEXT NOT NULL DEFAULT '',
+    entity_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    payload JSON,
+    skipped_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_sync_skipped_time ON sync_skipped_events(skipped_at);
+CREATE INDEX IF NOT EXISTS idx_sync_skipped_reason ON sync_skipped_events(reason);
 `,
 	},
 }

@@ -54,6 +54,7 @@ const (
 	EntityIssueDependencies   EntityType = "issue_dependencies"
 	EntityGitSnapshots        EntityType = "git_snapshots"
 	EntityIssueSessionHistory EntityType = "issue_session_history"
+	EntityIssueReviews        EntityType = "issue_reviews"
 	EntityNotes               EntityType = "notes"
 )
 
@@ -82,6 +83,7 @@ func AllEntityTypes() map[EntityType]bool {
 		EntityIssueDependencies:   true,
 		EntityGitSnapshots:        true,
 		EntityIssueSessionHistory: true,
+		EntityIssueReviews:        true,
 		EntityNotes:               true,
 	}
 }
@@ -140,6 +142,8 @@ func NormalizeEntityType(entityType string) (EntityType, bool) {
 		return EntityGitSnapshots, true
 	case "issue_session_history", "issue_session_histories":
 		return EntityIssueSessionHistory, true
+	case "issue_review", "issue_reviews":
+		return EntityIssueReviews, true
 	default:
 		return "", false
 	}
@@ -153,7 +157,7 @@ func NormalizeActionType(tdAction string) ActionType {
 	case "create", "handoff", "add_dependency", "link_file", "board_create",
 		"board_update", "board_add_issue", "board_set_position", "work_session_tag":
 		return ActionCreate
-	case "remove_dependency", "unlink_file", "board_delete", "work_session_untag":
+	case "remove_dependency", "unlink_file", "board_delete", "work_session_untag", "review_delete":
 		return ActionDelete
 	case "delete", "board_unposition", "board_remove_issue", "soft_delete":
 		return ActionSoftDelete
@@ -229,6 +233,22 @@ func ValidEntityActionCombinations() map[EntityType]map[ActionType]bool {
 		},
 		EntityIssueSessionHistory: {
 			ActionCreate: true,
+		},
+		EntityIssueReviews: {
+			// create = new review row; update = superseded_at stamp;
+			// delete = undo a locally-created review row.
+			// Supersede is sent as an UPDATE so peers see superseded_at
+			// propagate via the existing partial-update sync path.
+			//
+			// TODO (Step 2): sync events.go has no per-entity column allowlist
+			// for ActionUpdate payloads, so a malicious or buggy peer could
+			// theoretically mutate decision / reviewer_session / summary via
+			// applyPartialUpdateEvent. When the sync layer gains a column
+			// allowlist mechanism, gate issue_reviews to only accept
+			// superseded_at updates.
+			ActionCreate: true,
+			ActionUpdate: true,
+			ActionDelete: true,
 		},
 		EntityNotes: {
 			ActionCreate:     true,

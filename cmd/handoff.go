@@ -6,13 +6,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/git"
 	"github.com/marcus/td/internal/input"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/output"
-	"github.com/marcus/td/internal/session"
 	"github.com/spf13/cobra"
 )
 
@@ -39,6 +37,18 @@ Or use flags with values, stdin (-), or file (@path):
 	Args:    cobra.RangeArgs(0, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		baseDir := getBaseDir()
+		isJSON := jsonMode(cmd)
+
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
+		emitWarn := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Warning(format, args...)
+			}
+		}
 
 		// Resolve issue ID: from args or focused issue
 		var issueArg string
@@ -57,39 +67,41 @@ Or use flags with values, stdin (-), or file (@path):
 			}
 		}
 
+		database, err := db.Open(baseDir)
+		if err != nil {
+			emitErr("%v", err)
+			return err
+		}
+		defer func() { _ = database.Close() }()
+
+		sess, scope, err := getCurrentStateSession(database, baseDir)
+		if err != nil {
+			emitErr("%v", err)
+			return err
+		}
+
 		if issueArg == "" {
 			// Infer from focused issue
-			focusedID, err := config.GetFocus(baseDir)
+			focusedID, err := database.GetFocus(scope)
 			if err != nil || focusedID == "" {
-				output.Error("no issue specified and no focused issue")
-				fmt.Fprintln(os.Stderr, "  Use: td handoff <id> [message]  OR  td start <id> first")
+				emitErr("no issue specified and no focused issue")
+				if !isJSON {
+					fmt.Fprintln(os.Stderr, "  Use: td handoff <id> [message]  OR  td start <id> first")
+				}
 				return fmt.Errorf("no issue specified")
 			}
 			issueArg = focusedID
 		}
 
 		if err := ValidateIssueID(issueArg, "handoff <issue-id> [message]"); err != nil {
-			output.Error("%v", err)
-			return err
-		}
-
-		database, err := db.Open(baseDir)
-		if err != nil {
-			output.Error("%v", err)
-			return err
-		}
-		defer database.Close()
-
-		sess, err := session.GetOrCreate(database)
-		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
 
 		issueID := issueArg
 		issue, err := database.GetIssue(issueID)
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
 
@@ -103,6 +115,7 @@ Or use flags with values, stdin (-), or file (@path):
 		remaining, _ := cmd.Flags().GetStringArray("remaining")
 		decisions, _ := cmd.Flags().GetStringArray("decision")
 		uncertain, _ := cmd.Flags().GetStringArray("uncertain")
+		explicitInput := len(done) > 0 || len(remaining) > 0 || len(decisions) > 0 || len(uncertain) > 0
 
 		var stdinUsed bool
 		handoff.Done, stdinUsed = input.ExpandFlagValues(done, stdinUsed)
@@ -113,6 +126,7 @@ Or use flags with values, stdin (-), or file (@path):
 		// Handle --note/-n or --message/-m flag for simple handoffs
 		note, _ := cmd.Flags().GetString("note")
 		message, _ := cmd.Flags().GetString("message")
+		explicitInput = explicitInput || note != "" || message != "" || messageArg != ""
 		if note != "" {
 			handoff.Done = append(handoff.Done, note)
 		}
@@ -126,7 +140,7 @@ Or use flags with values, stdin (-), or file (@path):
 		}
 
 		// Check if stdin has data (YAML format) - only if not already used by flag expansion
-		if !stdinUsed {
+		if !stdinUsed && !explicitInput {
 			stat, _ := os.Stdin.Stat()
 			if (stat.Mode() & os.ModeCharDevice) == 0 {
 				parseHandoffInput(handoff)
@@ -134,7 +148,7 @@ Or use flags with values, stdin (-), or file (@path):
 		}
 
 		if err := database.AddHandoff(handoff); err != nil {
-			output.Error("failed to record handoff: %v", err)
+			emitErr("failed to record handoff: %v", err)
 			return err
 		}
 
@@ -148,19 +162,21 @@ Or use flags with values, stdin (-), or file (@path):
 				Branch:     gitState.Branch,
 				DirtyFiles: gitState.DirtyFiles,
 			}); err != nil {
-				output.Warning("failed to save git snapshot: %v", err)
+				emitWarn("failed to save git snapshot: %v", err)
 			}
 		}
 
 		// Update issue timestamp
 		if err := database.UpdateIssueLogged(issue, sess.ID, models.ActionUpdate); err != nil {
-			output.Warning("failed to update issue: %v", err)
+			emitWarn("%s", describeIssueWriteFailure(database, "record a handoff for", issueID, err))
 		}
 
 		// Output
-		fmt.Printf("HANDOFF RECORDED %s\n", issueID)
+		if !isJSON {
+			fmt.Printf("HANDOFF RECORDED %s\n", issueID)
+		}
 
-		if gitErr == nil {
+		if gitErr == nil && !isJSON {
 			// Check for commits since start
 			startSnapshot, _ := database.GetStartSnapshot(issueID)
 			if startSnapshot != nil {
@@ -177,10 +193,14 @@ Or use flags with values, stdin (-), or file (@path):
 			}
 		}
 
+		// Track cascade counts so json mode can report them in the envelope.
+		totalCascaded := 0
+		totalSkippedExisting := 0
+
 		// Cascade to descendants if this is a parent issue
 		hasChildren, err := database.HasChildren(issueID)
 		if err != nil {
-			output.Warning("check children: %v", err)
+			emitWarn("check children: %v", err)
 		}
 		if hasChildren {
 			descendants, err := database.GetDescendantIssues(issueID, []models.Status{
@@ -195,7 +215,7 @@ Or use flags with values, stdin (-), or file (@path):
 					// Skip children that already have handoffs
 					existingHandoff, err := database.GetLatestHandoff(child.ID)
 					if err != nil {
-						output.Warning("check handoff %s: %v", child.ID, err)
+						emitWarn("check handoff %s: %v", child.ID, err)
 						continue
 					}
 					if existingHandoff != nil {
@@ -211,12 +231,12 @@ Or use flags with values, stdin (-), or file (@path):
 					}
 
 					if err := database.AddHandoff(childHandoff); err != nil {
-						output.Warning("cascade handoff %s: %v", child.ID, err)
+						emitWarn("cascade handoff %s: %v", child.ID, err)
 						continue
 					}
 
 					// Add log entry for visibility
-					database.AddLog(&models.Log{
+					_ = database.AddLog(&models.Log{
 						IssueID:   child.ID,
 						SessionID: sess.ID,
 						Message:   fmt.Sprintf("Cascaded handoff from %s", issueID),
@@ -226,13 +246,30 @@ Or use flags with values, stdin (-), or file (@path):
 					cascaded++
 				}
 
-				if cascaded > 0 {
+				totalCascaded = cascaded
+				totalSkippedExisting = skippedExisting
+
+				if cascaded > 0 && !isJSON {
 					fmt.Printf("  + %d descendant(s) also received handoffs\n", cascaded)
 				}
-				if skippedExisting > 0 {
+				if skippedExisting > 0 && !isJSON {
 					fmt.Printf("  - %d descendant(s) skipped (existing handoffs)\n", skippedExisting)
 				}
 			}
+		}
+
+		if isJSON {
+			extra := map[string]any{
+				"id":      issueID,
+				"handoff": handoff,
+			}
+			if totalCascaded > 0 {
+				extra["cascaded"] = totalCascaded
+			}
+			if totalSkippedExisting > 0 {
+				extra["cascade_skipped"] = totalSkippedExisting
+			}
+			return output.EmitResult("handoff_recorded", extra)
 		}
 
 		fmt.Printf("\nNext: `td review %s` to submit for review\n", issueID)

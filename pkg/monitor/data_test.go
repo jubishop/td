@@ -28,7 +28,7 @@ func TestComputeBoardIssueCategories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open db: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create a blocker issue (open)
 	blocker := createTestIssue(t, database, "Blocker issue", models.StatusOpen)
@@ -88,7 +88,14 @@ func TestComputeBoardIssueCategories(t *testing.T) {
 		{"explicit blocked is blocked", explicitBlocked.ID, CategoryBlocked},
 		{"in progress is in_progress", inProgress.ID, CategoryInProgress},
 		{"review by other is reviewable", reviewByOther.ID, CategoryReviewable},
-		{"review by self is pending_review", reviewBySelf.ID, CategoryPendingReview},
+		// In the default trusted mode an issue you implemented IS actionable by
+		// you — approving it opens the attribution prompt, where naming the
+		// reviewer or acknowledging a self-review completes the approval. It is
+		// also what db.reviewableByFilterTrusted returns, so labelling it
+		// "pending review" would both mislead the operator and put the TUI at
+		// odds with `td reviewable`. Delegated and strict keep pending_review,
+		// where the rejection really is final.
+		{"review by self is reviewable in trusted", reviewBySelf.ID, CategoryReviewable},
 	}
 
 	// Build lookup map
@@ -160,7 +167,7 @@ func TestGetSortFuncWithPosition(t *testing.T) {
 			name:     "mixed - positioned come before unpositioned",
 			sortMode: SortByPriority,
 			issues: []models.BoardIssueView{
-				{Issue: models.Issue{ID: "unpos-p0", Priority: models.PriorityP0, UpdatedAt: now}}, // high priority but unpositioned
+				{Issue: models.Issue{ID: "unpos-p0", Priority: models.PriorityP0, UpdatedAt: now}},               // high priority but unpositioned
 				{Issue: models.Issue{ID: "pos-p3", Priority: models.PriorityP3}, Position: 1, HasPosition: true}, // low priority but positioned
 				{Issue: models.Issue{ID: "unpos-p1", Priority: models.PriorityP1, UpdatedAt: now}},
 			},
@@ -308,7 +315,7 @@ func TestComputeBoardIssueCategoriesClosedDepUnblocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open db: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create a blocker issue (closed)
 	blocker := createTestIssue(t, database, "Blocker issue", models.StatusClosed)
@@ -325,5 +332,76 @@ func TestComputeBoardIssueCategoriesClosedDepUnblocks(t *testing.T) {
 
 	if issues[0].Category != string(CategoryReady) {
 		t.Errorf("dependent with closed blocker: got %q, want %q", issues[0].Category, CategoryReady)
+	}
+}
+
+func TestFormatActionMessageNoteVsIssue(t *testing.T) {
+	tests := []struct {
+		name string
+		act  models.ActionLog
+		want string
+	}{
+		{
+			name: "create issue",
+			act:  models.ActionLog{ActionType: models.ActionCreate, EntityType: "issue", EntityID: "td-abc"},
+			want: "created issue",
+		},
+		{
+			name: "update issue",
+			act:  models.ActionLog{ActionType: models.ActionUpdate, EntityType: "issue", EntityID: "td-abc"},
+			want: "updated issue",
+		},
+		{
+			name: "create note by entity type",
+			act:  models.ActionLog{ActionType: models.ActionCreate, EntityType: "note", EntityID: "nt-abc123"},
+			want: "created note",
+		},
+		{
+			name: "update note by entity type",
+			act:  models.ActionLog{ActionType: models.ActionUpdate, EntityType: "note", EntityID: "nt-abc123"},
+			want: "updated note",
+		},
+		{
+			name: "create note by nt- id",
+			act:  models.ActionLog{ActionType: models.ActionCreate, EntityType: "", EntityID: "nt-ffffff"},
+			want: "created note",
+		},
+		{
+			name: "started work stays generic",
+			act:  models.ActionLog{ActionType: models.ActionStart, EntityType: "issue", EntityID: "td-abc"},
+			want: "started work",
+		},
+		{
+			name: "approve stays generic",
+			act:  models.ActionLog{ActionType: models.ActionApprove, EntityType: "issue", EntityID: "td-abc"},
+			want: "approved",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatActionMessage(tt.act); got != tt.want {
+				t.Fatalf("formatActionMessage() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFetchDataHasIssues(t *testing.T) {
+	baseDir := t.TempDir()
+	database, err := db.Initialize(baseDir)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	empty := FetchData(database, "test-session", time.Now(), "", false, SortByPriority)
+	if empty.HasIssues {
+		t.Fatal("empty database reported HasIssues=true")
+	}
+
+	createTestIssue(t, database, "first", models.StatusOpen)
+	withIssue := FetchData(database, "test-session", time.Now(), "", false, SortByPriority)
+	if !withIssue.HasIssues {
+		t.Fatal("database with an issue reported HasIssues=false")
 	}
 }

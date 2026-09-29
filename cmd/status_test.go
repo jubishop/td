@@ -13,7 +13,7 @@ func TestStatusCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create test issues
 	issue1 := &models.Issue{
@@ -56,14 +56,16 @@ func TestStatusCommand(t *testing.T) {
 		t.Fatalf("AddDependency failed: %v", err)
 	}
 
+	scope := db.SessionStateScope{SessionID: "ses_test"}
+
 	// Test outputStatusDashboard doesn't crash
-	err = outputStatusDashboard(database, baseDir, "ses_test")
+	err = outputStatusDashboard(database, baseDir, "ses_test", scope)
 	if err != nil {
 		t.Errorf("outputStatusDashboard failed: %v", err)
 	}
 
 	// Test outputStatusJSON doesn't crash
-	err = outputStatusJSON(database, baseDir, "ses_test")
+	err = outputStatusJSON(database, baseDir, "ses_test", scope)
 	if err != nil {
 		t.Errorf("outputStatusJSON failed: %v", err)
 	}
@@ -75,15 +77,17 @@ func TestStatusWithEmptyDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
+
+	scope := db.SessionStateScope{SessionID: "ses_test"}
 
 	// Test with empty database
-	err = outputStatusDashboard(database, baseDir, "ses_test")
+	err = outputStatusDashboard(database, baseDir, "ses_test", scope)
 	if err != nil {
 		t.Errorf("outputStatusDashboard failed with empty db: %v", err)
 	}
 
-	err = outputStatusJSON(database, baseDir, "ses_test")
+	err = outputStatusJSON(database, baseDir, "ses_test", scope)
 	if err != nil {
 		t.Errorf("outputStatusJSON failed with empty db: %v", err)
 	}

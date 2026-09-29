@@ -51,7 +51,7 @@ var syncProjectCreateCmd = &cobra.Command{
 		baseDir := getBaseDir()
 		database, err := db.Open(baseDir)
 		if err == nil {
-			defer database.Close()
+			defer func() { _ = database.Close() }()
 			if err := database.SetSyncState(project.ID); err == nil {
 				output.Success("Created and linked to project %s (%s)", project.Name, project.ID)
 				return nil
@@ -84,7 +84,7 @@ var syncProjectLinkCmd = &cobra.Command{
 			output.Error("open database: %v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		projectID := args[0]
 		force, _ := cmd.Flags().GetBool("force")
@@ -144,7 +144,7 @@ var syncProjectUnlinkCmd = &cobra.Command{
 			output.Error("open database: %v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		force, _ := cmd.Flags().GetBool("force")
 
@@ -236,7 +236,7 @@ var syncProjectMembersCmd = &cobra.Command{
 			output.Error("open database: %v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		syncState, err := database.GetSyncState()
 		if err != nil || syncState == nil {
@@ -266,7 +266,7 @@ var syncProjectMembersCmd = &cobra.Command{
 
 var syncProjectInviteCmd = &cobra.Command{
 	Use:   "invite <email> [role]",
-	Short: "Invite a user to the project by email",
+	Short: "Add an existing account to the project by email",
 	Args:  cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !syncconfig.IsAuthenticated() {
@@ -280,7 +280,7 @@ var syncProjectInviteCmd = &cobra.Command{
 			output.Error("open database: %v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		syncState, err := database.GetSyncState()
 		if err != nil || syncState == nil {
@@ -301,11 +301,11 @@ var syncProjectInviteCmd = &cobra.Command{
 		client := syncclient.New(syncconfig.GetServerURL(), syncconfig.GetAPIKey(), "")
 		m, err := client.AddMember(syncState.ProjectID, email, role)
 		if err != nil {
-			output.Error("invite member: %v", err)
+			output.Error("add member: %v", err)
 			return err
 		}
 
-		output.Success("Invited %s as %s (user %s)", email, m.Role, m.UserID)
+		output.Success("Added %s as %s (user %s)", email, m.Role, m.UserID)
 		return nil
 	},
 }
@@ -326,7 +326,7 @@ var syncProjectKickCmd = &cobra.Command{
 			output.Error("open database: %v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		syncState, err := database.GetSyncState()
 		if err != nil || syncState == nil {
@@ -361,7 +361,7 @@ var syncProjectRoleCmd = &cobra.Command{
 			output.Error("open database: %v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		syncState, err := database.GetSyncState()
 		if err != nil || syncState == nil {
@@ -465,7 +465,7 @@ var syncProjectJoinCmd = &cobra.Command{
 			output.Error("open database: %v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		if err := database.SetSyncState(selected.ID); err != nil {
 			output.Error("link project: %v", err)

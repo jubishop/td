@@ -1,5 +1,7 @@
 # td - Task management for AI-assisted development
 
+Always check if you are running in Sidecar: run `sidecar --agents` for capabilities.
+
 **[Documentation](https://marcus.github.io/td/) | [Getting Started](https://marcus.github.io/td/docs/intro) | [GitHub](https://github.com/marcus/td)**
 
 A minimalist CLI for tracking tasks across AI coding sessions. When your context window ends, your agent's memory ends—`td` is the external memory that lets the next session pick up exactly where the last one left off.
@@ -10,7 +12,9 @@ A minimalist CLI for tracking tasks across AI coding sessions. When your context
 
 **Key Features**: Query-based boards, dependency graphs, epic tracking, powerful query language (TDQ), session analytics, and state machine workflows.
 
-![td](docs/td.png)
+![td monitor running inside Sidecar](docs/td-in-sidecar.png)
+
+*Above: `td monitor` running inside **[Sidecar](https://github.com/marcus/sidecar)**, a terminal development dashboard that embeds it alongside live git diffs, file browsing, and multi-agent workspace management. `td` runs standalone in any terminal too — see [Live Monitor](#live-monitor).*
 
 ## Table of Contents
 
@@ -35,6 +39,7 @@ A minimalist CLI for tracking tasks across AI coding sessions. When your context
 - [AI Agent Testimonials](#ai-agent-testimonials)
 - [Documentation Site](#documentation-site)
 - [Design Philosophy](#design-philosophy)
+- [Built on td](#built-on-td)
 - [Contributing](#contributing)
 - [Support](#support)
 - [License](#license)
@@ -57,7 +62,11 @@ td handoff td-a1b2 \
   --uncertain "Should tokens expire on password change?"
 ```
 
-**Session isolation** — Every terminal/context window gets an ID (automatically). The session that writes code can't approve it. A different session has to review. This isn't process theater—it forces actual handoffs and catches the "works on my context" bugs.
+**Audited reviews** — Every terminal/context window gets an ID automatically.
+Independent review is preferred; the default trusted mode also lets you record
+who actually reviewed the work when that is not the session doing the recording
+— so an orchestrator can credit its reviewing sub-agent instead of claiming a
+self-review it did not perform.
 
 **Query-based boards** — Organize work with boards that filter issues using TDQ queries. View as swimlanes in the monitor for visual status tracking.
 
@@ -121,8 +130,9 @@ td version
 cd /path/to/your/project
 td init
 
-# For AI agents: Add this to your system prompt or CLAUDE.md:
-# "Run `td usage --new-session` at conversation start (or after /clear)."
+# For AI agents: add the compact guidance printed by `td init` to your
+# AGENTS.md, CLAUDE.md, or similar file. New contexts can start with:
+# `td usage --new-session -q`
 
 # Create your first issue
 td create "Add user auth" --type feature --priority P1
@@ -197,18 +207,38 @@ See [SPEC.md](./SPEC.md) for detailed schemas and workflows.
 # Build
 go build -o td .
 
-# Install from your local working tree
-make install
+# Activate the canonical main checkout machine-wide
+make install-local
 
-# Install with an explicit dev version injected (useful for local binaries)
-make install-dev
+# Deliberately activate the current branch/worktree instead
+make install-worktree
+
+# Show which td is active and what each shell actually resolves
+make install-status
+
+# Restore the installed Homebrew release
+make use-homebrew
+
+# Unmanaged go install into GOBIN (does not change Homebrew links)
+make install
 
 # Format code
 make fmt
 
 # Install git pre-commit hook (gofmt, go vet, go build on staged files)
 make install-hooks
+
+# Test install switching against an isolated fake Homebrew prefix
+make test-dev-install
 ```
+
+`make install-local` refuses feature branches and linked worktrees so an
+incidental checkout cannot silently replace the normal development binary; use
+`make install-worktree` when that replacement is intentional. Both managed
+commands swap the `td` symlink in Homebrew's `bin` directory, keep every build
+under `~/.local/state/td/dev-installs` with metadata recording its source
+checkout, revision and dirty state, and roll back if activation fails. They
+refuse to touch a `td` that is neither a managed build nor a Homebrew link.
 
 ## Tests & Quality Checks
 
@@ -224,15 +254,25 @@ make test
 # Format code (runs gofmt)
 make fmt
 
-# No linter configured yet — clean gofmt is current quality bar
+# Same analysis GitHub runs: full codebase, linux, GOWORK=off, golangci-lint v2.13.1
+make lint
 ```
+
+### Go Lint Baseline
+
+- Formatting: staged Go files must be `gofmt`-clean (pre-commit hook)
+- Correctness lint: `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`
+- Enforcement: CI and `make lint` run the same full-codebase linux analysis
+  (`golangci-lint` v2.13.1, `GOWORK=off`). `--new-from-merge-base` is not the
+  gate; it misses unused leftovers whose function bodies were not edited.
 
 ## Release
 
 Releases are automated via GoReleaser. Pushing a version tag triggers GitHub Actions to build binaries and update the Homebrew formula.
 
 ```bash
-# Create and push an annotated tag (triggers automated release)
+# Push main first; the target tests, verifies origin/main, tags, and pushes
+git push origin main
 make release VERSION=v0.2.0
 
 # Homebrew users get the update via:
@@ -260,10 +300,16 @@ td handoff td-a1b2 --done "OAuth flow" --remaining "Token refresh"
 # Submit for review
 td review td-a1b2
 
-# Different session reviews
+# Review (independent when practical)
 td reviewable        # What can I review?
 td approve td-a1b2   # Ship it
 td reject td-a1b2 --reason "Missing error handling"  # Back to work
+
+# A sub-agent reviewed it; record who
+td approve td-a1b2 --reviewed-by "code-reviewer sub-agent"
+
+# You reviewed your own work
+td approve td-a1b2 --self-review --reason "Reviewed own diff; tests pass"
 ```
 
 ## Boards
@@ -335,6 +381,23 @@ td query "stale(14)"       # Issues not updated in 14 days
 
 **Operators**: `=`, `!=`, `~` (contains), `!~`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`.
 
+## JSON output
+
+`--json` is a global flag on every command (reads and mutations). Mutating
+commands emit a consistent envelope — issue-affecting commands return
+`{"id","status","action","issue":{...}}`, other mutations return
+`{"action", ...}`, and errors return `{"error":{"code","message"}}` with exit
+code 1. Handy for scripting:
+
+```bash
+id=$(td add "Wire up payment retry" --json | jq -r .id)
+td start "$id" --json | jq -r .status
+```
+
+Note: `td query` uses `--output table|json|ids|count` instead of `--json`. See
+the [CLI commands guide](docs/guides/cli-commands-guide.md#json-output---json)
+for the full contract.
+
 ## Epics
 
 Track large initiatives that span multiple issues.
@@ -391,7 +454,12 @@ td add "Update comment" --minor
 
 Minor tasks bypass session-based review—you can approve your own work. Use sparingly for documentation fixes, typos, and other low-risk changes.
 
-For non-minor tasks, td now supports a balanced review policy (on by default): the creator can approve only if a different session implemented the issue, and the approval must include a reason. Implementers still cannot approve their own implementation.
+For non-minor tasks, the default `trusted` policy prefers independent review. An
+involved session may still approve by saying who reviewed the work — either
+`--reviewed-by "<who>"` to credit someone else, or `--self-review --reason` to
+own it. Both are recorded; neither is verifiable by td, so this is an honesty
+guardrail. Projects that require a mechanical independence boundary can select
+`delegated` or `strict`, where an involved session cannot approve at all.
 
 ## Analytics & Stats
 
@@ -506,6 +574,21 @@ The dashboard displays:
 
 Navigate with arrow keys or j/k, refresh with `r`, close with `esc`.
 
+### Sidecar
+
+For a full terminal development environment, **[Sidecar](https://github.com/marcus/sidecar)** embeds `td monitor` alongside live git diffs, file browsing, and multi-agent workspace management:
+
+```
+┌─────────────────────────────┬─────────────────────┐
+│                             │                     │
+│   Claude Code / Cursor      │      Sidecar        │
+│                             │                     │
+│   $ claude                  │   [Git] [Files]     │
+│   > fix the auth bug...     │   [Tasks] [Workspaces]│
+│                             │                     │
+└─────────────────────────────┴─────────────────────┘
+```
+
 ## Issue Lifecycle
 
 ```
@@ -552,6 +635,15 @@ Full documentation is available at [marcus.github.io/td](https://marcus.github.i
 - Go (single binary, no runtime deps)
 - SQLite (pure Go, no CGO)
 - Cobra for CLI
+
+## Built on td
+
+- **[Sidecar](https://github.com/marcus/sidecar)** — Terminal development dashboard embedding `td monitor` alongside real-time git diffs, file browsing, and multi-agent workspace management.
+- **[td-gui](https://github.com/madic-creates/td-gui)** by [@madic-creates](https://github.com/madic-creates) — A local, single-binary web UI for `td` projects with issue detail, structured handoffs, review dialogs, and backlog/swimlane boards.
+- **[myrlin-workbook](https://github.com/therealarthur/myrlin-workbook)** by [@therealarthur](https://github.com/therealarthur) — Browser-based developer workbook and session manager that surfaces `td` issues in doc panels/sidebars and promotes them to worktrees and agent sessions.
+- **[sergeant](https://github.com/callmeradical/sergeant)** by [@callmeradical](https://github.com/callmeradical) — Multi-agent coordination and dispatch CLI with deep `td` integration for findings routing, dispatch runs, and review gates.
+- **[pi-td](https://github.com/espennilsen/pi/tree/main/extensions/pi-td)** by [@espennilsen](https://github.com/espennilsen) — Extension for the [Pi](https://github.com/espennilsen/pi) coding agent harness providing native `td` tools and context hooks.
+- **[llm-agents.nix](https://github.com/numtide/llm-agents.nix)** by [@numtide](https://github.com/numtide) — Nix packages and Flakes for `td` within the LLM agent tooling ecosystem.
 
 ## Contributing
 

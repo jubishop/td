@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 const sequenceTimeout = 500 * time.Millisecond
@@ -29,13 +29,13 @@ const (
 	ContextHelp              Context = "help"                // When help modal is open
 	ContextBoardPicker       Context = "board-picker"        // When board picker is open
 	ContextBoard             Context = "board"               // When board mode is active
-	ContextGettingStarted    Context = "getting-started"    // When getting started modal is open
-	ContextTDQHelp           Context = "tdq-help"           // When TDQ help modal is open
-	ContextBoardEditor       Context = "board-editor"       // When board edit/create modal is open
-	ContextCloseConfirm      Context = "close-confirm"      // When close confirmation modal is open (has text input)
-	ContextSyncPrompt        Context = "td-sync-prompt"    // When sync prompt modal is open
-	ContextKanban            Context = "kanban"            // When kanban view modal is open
-	ContextNotes             Context = "notes"             // When notes modal is open
+	ContextGettingStarted    Context = "getting-started"     // When getting started modal is open
+	ContextTDQHelp           Context = "tdq-help"            // When TDQ help modal is open
+	ContextBoardEditor       Context = "board-editor"        // When board edit/create modal is open
+	ContextCloseConfirm      Context = "close-confirm"       // When close confirmation modal is open (has text input)
+	ContextSyncPrompt        Context = "td-sync-prompt"      // When sync prompt modal is open
+	ContextKanban            Context = "kanban"              // When kanban view modal is open
+	ContextNotes             Context = "notes"               // When notes modal is open
 )
 
 // Command represents a named command that can be triggered by key bindings
@@ -52,32 +52,33 @@ const (
 	CmdNextPanel    Command = "next-panel"
 	CmdPrevPanel    Command = "prev-panel"
 	CmdCursorDown   Command = "cursor-down"
-	CmdCursorUp      Command = "cursor-up"
-	CmdCursorTop     Command = "cursor-top"
-	CmdCursorBottom  Command = "cursor-bottom"
-	CmdHalfPageDown  Command = "half-page-down"
-	CmdHalfPageUp    Command = "half-page-up"
-	CmdFullPageDown  Command = "full-page-down"
-	CmdFullPageUp    Command = "full-page-up"
-	CmdScrollDown    Command = "scroll-down"
-	CmdScrollUp      Command = "scroll-up"
-	CmdSelect        Command = "select"
-	CmdBack          Command = "back"
-	CmdClose         Command = "close"
-	CmdNavigatePrev  Command = "navigate-prev"
-	CmdNavigateNext  Command = "navigate-next"
+	CmdCursorUp     Command = "cursor-up"
+	CmdCursorTop    Command = "cursor-top"
+	CmdCursorBottom Command = "cursor-bottom"
+	CmdHalfPageDown Command = "half-page-down"
+	CmdHalfPageUp   Command = "half-page-up"
+	CmdFullPageDown Command = "full-page-down"
+	CmdFullPageUp   Command = "full-page-up"
+	CmdScrollDown   Command = "scroll-down"
+	CmdScrollUp     Command = "scroll-up"
+	CmdSelect       Command = "select"
+	CmdBack         Command = "back"
+	CmdClose        Command = "close"
+	CmdNavigatePrev Command = "navigate-prev"
+	CmdNavigateNext Command = "navigate-next"
 
 	// Action commands
-	CmdOpenDetails    Command = "open-details"
-	CmdOpenStats      Command = "open-stats"
-	CmdSearch         Command = "search"
-	CmdToggleClosed   Command = "toggle-closed"
-	CmdMarkForReview  Command = "mark-for-review"
-	CmdApprove        Command = "approve"
-	CmdDelete         Command = "delete"
-	CmdConfirm        Command = "confirm"
-	CmdCancel         Command = "cancel"
-	CmdCycleSortMode  Command = "cycle-sort-mode"
+	CmdOpenDetails   Command = "open-details"
+	CmdOpenStats     Command = "open-stats"
+	CmdSearch        Command = "search"
+	CmdToggleClosed  Command = "toggle-closed"
+	CmdMarkForReview Command = "mark-for-review"
+	CmdApprove       Command = "approve"
+	CmdRecordReview  Command = "record-review"
+	CmdDelete        Command = "delete"
+	CmdConfirm       Command = "confirm"
+	CmdCancel        Command = "cancel"
+	CmdCycleSortMode Command = "cycle-sort-mode"
 
 	// Search-specific commands
 	CmdSearchConfirm   Command = "search-confirm"
@@ -143,19 +144,19 @@ const (
 	CmdSendToWorktree Command = "send-to-worktree"
 
 	// Board editor commands
-	CmdEditBoard          Command = "edit-board"
-	CmdNewBoard           Command = "new-board"
-	CmdBoardEditorSave    Command = "board-editor-save"
-	CmdBoardEditorCancel  Command = "board-editor-cancel"
-	CmdBoardEditorDelete  Command = "board-editor-delete"
+	CmdEditBoard         Command = "edit-board"
+	CmdNewBoard          Command = "new-board"
+	CmdBoardEditorSave   Command = "board-editor-save"
+	CmdBoardEditorCancel Command = "board-editor-cancel"
+	CmdBoardEditorDelete Command = "board-editor-delete"
 
 	// Getting started commands
 	CmdOpenGettingStarted  Command = "open-getting-started"
 	CmdInstallInstructions Command = "install-instructions"
 
 	// Kanban view commands
-	CmdOpenKanban            Command = "open-kanban"
-	CmdCloseKanban           Command = "close-kanban"
+	CmdOpenKanban             Command = "open-kanban"
+	CmdCloseKanban            Command = "close-kanban"
 	CmdToggleKanbanFullscreen Command = "toggle-kanban-fullscreen"
 )
 
@@ -352,102 +353,24 @@ func (r *Registry) AllContexts() []Context {
 	return contexts
 }
 
-// KeyToString converts a tea.KeyMsg to a string representation
+// KeyToString converts a tea.KeyMsg to a string representation.
+//
+// In bubbletea v2, shifted printable keys arrive as the unshifted Code plus
+// ModShift (e.g. shift+y => Code 'y', Mod ModShift), so Keystroke() renders
+// them as "shift+y" rather than "Y". Our bindings are written in textual form
+// ("Y", "?", "G"), so we use String(), which returns the key's Text when it is
+// a printable character ("Y", "?") and falls back to Keystroke() for special
+// keys ("tab", "enter", "ctrl+c", "shift+tab", etc.).
 func KeyToString(key tea.KeyMsg) string {
-	switch key.Type {
-	case tea.KeyCtrlC:
-		return "ctrl+c"
-	case tea.KeyCtrlA:
-		return "ctrl+a"
-	case tea.KeyCtrlB:
-		return "ctrl+b"
-	case tea.KeyCtrlD:
-		return "ctrl+d"
-	case tea.KeyCtrlE:
-		return "ctrl+e"
-	case tea.KeyCtrlF:
-		return "ctrl+f"
-	case tea.KeyCtrlG:
-		return "ctrl+g"
-	case tea.KeyCtrlH:
-		return "ctrl+h"
-	case tea.KeyTab:
-		return "tab"
-	case tea.KeyCtrlJ:
-		return "ctrl+j"
-	case tea.KeyCtrlK:
-		return "ctrl+k"
-	case tea.KeyCtrlL:
-		return "ctrl+l"
-	case tea.KeyEnter:
-		return "enter"
-	case tea.KeyCtrlN:
-		return "ctrl+n"
-	case tea.KeyCtrlO:
-		return "ctrl+o"
-	case tea.KeyCtrlP:
-		return "ctrl+p"
-	case tea.KeyCtrlQ:
-		return "ctrl+q"
-	case tea.KeyCtrlR:
-		return "ctrl+r"
-	case tea.KeyCtrlS:
-		return "ctrl+s"
-	case tea.KeyCtrlT:
-		return "ctrl+t"
-	case tea.KeyCtrlU:
-		return "ctrl+u"
-	case tea.KeyCtrlV:
-		return "ctrl+v"
-	case tea.KeyCtrlW:
-		return "ctrl+w"
-	case tea.KeyCtrlX:
-		return "ctrl+x"
-	case tea.KeyCtrlY:
-		return "ctrl+y"
-	case tea.KeyCtrlZ:
-		return "ctrl+z"
-	case tea.KeyEsc:
-		return "esc"
-	case tea.KeySpace:
-		return "space"
-	case tea.KeyBackspace:
-		return "backspace"
-	case tea.KeyUp:
-		return "up"
-	case tea.KeyDown:
-		return "down"
-	case tea.KeyLeft:
-		return "left"
-	case tea.KeyRight:
-		return "right"
-	case tea.KeyHome:
-		return "home"
-	case tea.KeyEnd:
-		return "end"
-	case tea.KeyPgUp:
-		return "pgup"
-	case tea.KeyPgDown:
-		return "pgdown"
-	case tea.KeyDelete:
-		return "delete"
-	case tea.KeyShiftTab:
-		return "shift+tab"
-	case tea.KeyRunes:
-		return string(key.Runes)
-	default:
-		return key.String()
-	}
+	return key.String()
 }
 
 // IsPrintable returns true if the key represents a printable character
 func IsPrintable(key tea.KeyMsg) bool {
-	if key.Type != tea.KeyRunes {
+	k := key.Key()
+	if len(k.Text) != 1 {
 		return false
 	}
-	if len(key.Runes) != 1 {
-		return false
-	}
-	r := key.Runes[0]
+	r := rune(k.Text[0])
 	return r >= ' ' && r <= '~'
 }

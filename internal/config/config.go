@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/marcus/td/internal/models"
 )
@@ -63,39 +62,20 @@ func Save(baseDir string, cfg *models.Config) error {
 	tmpName := tmp.Name()
 
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 
 	return os.Rename(tmpName, configPath)
 }
 
-// withConfigLock serializes access to config.json using flock
-func withConfigLock(baseDir string, fn func() error) error {
-	lockPath := filepath.Join(baseDir, lockFile)
-
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
-		return err
-	}
-
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return err
-	}
-	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
-
-	return fn()
-}
+// withConfigLock serializes access to config.json using platform-specific
+// file locking. See config_lock_unix.go and config_lock_windows.go.
 
 // SetFocus sets the focused issue ID
 func SetFocus(baseDir string, issueID string) error {
@@ -229,6 +209,29 @@ func SetFilterState(baseDir string, state *FilterState) error {
 	})
 }
 
+// GetGettingStartedSeen reports whether the Getting Started modal has already
+// been shown at least once in this project.
+func GetGettingStartedSeen(baseDir string) (bool, error) {
+	cfg, err := Load(baseDir)
+	if err != nil {
+		return false, err
+	}
+	return cfg.GettingStartedSeen, nil
+}
+
+// SetGettingStartedSeen records that the Getting Started modal has been shown,
+// so it is not re-displayed on subsequent monitor launches.
+func SetGettingStartedSeen(baseDir string, seen bool) error {
+	return withConfigLock(baseDir, func() error {
+		cfg, err := Load(baseDir)
+		if err != nil {
+			return err
+		}
+		cfg.GettingStartedSeen = seen
+		return Save(baseDir, cfg)
+	})
+}
+
 // GetTitleLengthLimits returns min/max title length limits from config (with defaults)
 func GetTitleLengthLimits(baseDir string) (min, max int, err error) {
 	cfg, err := Load(baseDir)
@@ -273,6 +276,50 @@ func SetFeatureFlag(baseDir, name string, enabled bool) error {
 		cfg.FeatureFlags = make(map[string]bool)
 	}
 	cfg.FeatureFlags[name] = enabled
+	return Save(baseDir, cfg)
+}
+
+// GetFeatureStringFlag returns a string-valued feature flag from local config.
+// The second return value indicates whether the flag is explicitly set.
+func GetFeatureStringFlag(baseDir, name string) (string, bool, error) {
+	cfg, err := Load(baseDir)
+	if err != nil {
+		return "", false, err
+	}
+	if cfg.FeatureStringFlags == nil {
+		return "", false, nil
+	}
+	value, ok := cfg.FeatureStringFlags[name]
+	return value, ok, nil
+}
+
+// SetFeatureStringFlag persists a string-valued feature flag in local config.
+func SetFeatureStringFlag(baseDir, name, value string) error {
+	cfg, err := Load(baseDir)
+	if err != nil {
+		return err
+	}
+	if cfg.FeatureStringFlags == nil {
+		cfg.FeatureStringFlags = make(map[string]string)
+	}
+	cfg.FeatureStringFlags[name] = value
+	return Save(baseDir, cfg)
+}
+
+// UnsetFeatureStringFlag removes an explicitly-set string-valued feature flag
+// from local config. It is a no-op when the flag is not set.
+func UnsetFeatureStringFlag(baseDir, name string) error {
+	cfg, err := Load(baseDir)
+	if err != nil {
+		return err
+	}
+	if cfg.FeatureStringFlags == nil {
+		return nil
+	}
+	delete(cfg.FeatureStringFlags, name)
+	if len(cfg.FeatureStringFlags) == 0 {
+		cfg.FeatureStringFlags = nil
+	}
 	return Save(baseDir, cfg)
 }
 

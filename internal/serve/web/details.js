@@ -97,7 +97,7 @@ export function createPanels(state, refresh) {
 
   function renderDetail(data, description, acceptance) {
     const issue = data.issue;
-    const actions =
+    const actions = (
       {
         open: [
           ["start", "Start work"],
@@ -114,7 +114,12 @@ export function createPanels(state, refresh) {
           ["reject", "Reject"],
         ],
         closed: [["reopen", "Reopen"]],
-      }[issue.status] || [];
+      }[issue.status] || []
+    ).filter(
+      ([action]) =>
+        !issue.available_transitions ||
+        issue.available_transitions.includes(action),
+    );
     const handoff = data.latest_handoff;
     const children = data.children || [];
     showDrawer(
@@ -129,6 +134,7 @@ export function createPanels(state, refresh) {
       <dl class="task-properties"><dt>Implementer</dt><dd>${esc(sessionName(state.sessions, issue.implementer_session))}</dd><dt>Parent</dt><dd>${issue.parent_id ? issueLink(issue.parent_id) : "—"}</dd><dt>Labels</dt><dd>${issue.labels.length ? issue.labels.map((l) => `<span class="label">${esc(l)}</span>`).join(" ") : "—"}</dd><dt>Updated</dt><dd title="${esc(timestamp(issue.updated_at))}">${relative(issue.updated_at)}</dd>${issue.due_date ? `<dt>Due</dt><dd>${esc(issue.due_date)}</dd>` : ""}${issue.defer_until ? `<dt>Deferred until</dt><dd>${esc(issue.defer_until)}</dd>` : ""}${issue.sprint ? `<dt>Sprint</dt><dd>${esc(issue.sprint)}</dd>` : ""}${issue.points ? `<dt>Points</dt><dd>${issue.points}</dd>` : ""}${issue.minor ? "<dt>Review policy</dt><dd>Minor task</dd>" : ""}</dl>
       <section class="detail-section"><h3>Description</h3><div class="markdown">${description}</div></section>
       <section class="detail-section"><h3>Acceptance criteria</h3><div class="markdown">${acceptance}</div></section>
+      ${issue.active_review ? `<section class="detail-section"><h3>Recorded approval</h3><p>${esc(issue.active_review.reviewed_by || sessionName(state.sessions, issue.active_review.reviewer_session))}</p><p class="preserve-lines">${esc(issue.active_review.summary)}</p></section>` : ""}
       ${children.length ? `<section class="detail-section"><h3>Child tasks <span class="count">${children.length}</span></h3>${children.map((c) => `<div class="relation-row">${statusBadge(c.status)}${issueLink(c.id, c.title)}</div>`).join("")}</section>` : ""}
       <section class="detail-section handoff"><h3>Latest handoff ${handoff ? `<span class="muted">${relative(handoff.timestamp)}</span>` : ""}</h3>${
         handoff
@@ -148,7 +154,7 @@ export function createPanels(state, refresh) {
       <section class="detail-section"><h3>Dependencies</h3><p class="small muted">This task depends on</p>${data.dependencies.length ? data.dependencies.map((dep) => `<div class="relation-row">${issueLink(dep.depends_on_id, state.issues.find((i) => i.id === dep.depends_on_id)?.title || dep.depends_on_id)}<button class="icon-button" data-action="remove-dependency" data-id="${esc(dep.dep_id)}" aria-label="Remove dependency ${esc(dep.depends_on_id)}">×</button></div>`).join("") : '<p class="muted">No dependencies.</p>'}<form id="dependency-form" class="inline-form"><input name="depends_on" placeholder="Find a task or enter its ID" aria-label="Dependency task" list="dependency-options" data-issue-search="dependency-options" required autocomplete="off"><datalist id="dependency-options"></datalist><button class="secondary">Add</button></form>${data.blocked_by.length ? `<h4>Tasks that depend on this</h4>${data.blocked_by.map((dep) => `<div class="relation-row">${issueLink(dep.issue_id)}</div>`).join("")}` : ""}</section>
       <section class="detail-section"><h3>Comments <span class="count">${data.comments.length}</span></h3>${data.comments.map((c) => `<article class="comment"><div class="activity-byline"><strong>${esc(sessionName(state.sessions, c.session_id))}</strong><time>${relative(c.created_at)}</time></div><p class="preserve-lines">${esc(c.text)}</p></article>`).join("")}<form id="comment-form"><label for="comment-text" class="sr-only">Add a comment</label><textarea id="comment-text" name="comment" rows="3" placeholder="Add context or review feedback…" required></textarea><button class="secondary">Add comment</button></form></section>
       <section class="detail-section"><h3>Task log <span class="count">${data.logs.length}</span></h3>${data.logs.length ? data.logs.map((log) => `<article class="log-item"><div class="activity-byline"><span class="label">${esc(log.type)}</span><time title="${esc(timestamp(log.timestamp))}">${relative(log.timestamp)}</time></div><p class="preserve-lines">${esc(log.message)}</p><small class="muted">${esc(sessionName(state.sessions, log.session_id))}</small></article>`).join("") : '<p class="muted">No log entries yet.</p>'}</section>
-      <div class="detail-admin">${issue.status !== "closed" ? '<button class="quiet" data-action="transition" data-transition="close">Close without review…</button>' : ""}<button class="quiet danger-text" data-action="delete-task">Delete task…</button></div>
+      <div class="detail-admin">${issue.available_transitions?.includes("close") ? '<button class="quiet" data-action="transition" data-transition="close">Close without review…</button>' : ""}<button class="quiet danger-text" data-action="delete-task">Delete task…</button></div>
       <p id="detail-error" class="form-error" role="alert" hidden></p>
     </div>`,
     );
@@ -272,18 +278,28 @@ export function createPanels(state, refresh) {
       review: "Submit for review",
       block: "Block task",
       unblock: "Unblock task",
-      approve: "Approve task",
+      approve: issue.active_review ? "Close reviewed task" : "Approve task",
       reject: "Reject task",
       reopen: "Reopen task",
       close: "Close without review",
     };
     showModal(
       labels[action],
-      `<p><strong>${esc(issue.title)}</strong></p><p class="muted">${action === "close" ? "Use this for duplicates, cancellations, or administrative cleanup." : action === "approve" ? "Approval closes this task and records your review." : action === "reject" ? "Rejection returns the task to Open for rework." : "This action is recorded in the task log."}</p><label>${["reject", "close", "block"].includes(action) ? "Reason" : "Note (optional)"}<textarea name="reason" rows="4" ${["reject", "close", "block"].includes(action) ? "required" : ""}></textarea></label>`,
+      `<p><strong>${esc(issue.title)}</strong></p><p class="muted">${action === "close" ? "Use this for duplicates, cancellations, or administrative cleanup." : action === "approve" ? (issue.active_review ? "Close this task using its recorded approval." : "Approval closes this task and records who reviewed it.") : action === "reject" ? "Rejection returns the task to Open for rework." : "This action is recorded in the task log."}</p>${action === "approve" && !issue.active_review ? '<label>Review attribution<select name="review_method"><option value="independent">I reviewed someone else’s work</option><option value="self">I reviewed my own work</option><option value="attributed">Another reviewer performed the review</option></select></label><label>Other reviewer’s name<input name="reviewed_by" placeholder="Only when another reviewer performed the review"></label>' : ""}<label>${["approve", "reject", "close", "block"].includes(action) ? "Reason" : "Note (optional)"}<textarea name="reason" rows="4" ${["approve", "reject", "close", "block"].includes(action) ? "required" : ""}></textarea></label>`,
       async (form) => {
+        const body = { reason: form.elements.reason.value };
+        const method = form.elements.review_method?.value;
+        if (method === "self") body.self_review = true;
+        if (method === "attributed") {
+          body.reviewed_by = form.elements.reviewed_by.value.trim();
+          if (!body.reviewed_by)
+            throw new Error(
+              "Enter the name of the reviewer who performed the review.",
+            );
+        }
         await api(`/issues/${issue.id}/${action}`, {
           method: "POST",
-          body: { reason: form.elements.reason.value },
+          body,
           revision: issue.revision,
         });
         await open(issue.id, { quiet: true });

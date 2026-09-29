@@ -75,7 +75,7 @@ func (db *DB) GetLogs(issueID string, limit int) ([]models.Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var logs []models.Log
 	for rows.Next() {
@@ -107,7 +107,7 @@ func (db *DB) GetLogsByWorkSession(wsID string) ([]models.Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var logs []models.Log
 	for rows.Next() {
@@ -140,7 +140,7 @@ func (db *DB) GetRecentLogsAll(limit int) ([]models.Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var logs []models.Log
 	for rows.Next() {
@@ -185,7 +185,7 @@ func (db *DB) GetActiveSessions(since time.Time) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var sessions []string
 	for rows.Next() {
@@ -211,6 +211,11 @@ func (db *DB) GetActiveSessions(since time.Time) ([]string, error) {
 // AddHandoff adds a handoff entry and logs it to action_log for sync/undo.
 func (db *DB) AddHandoff(handoff *models.Handoff) error {
 	return db.withWriteLock(func() error {
+		// Normalize issue_id to the canonical td- form before persisting.
+		// The handoffs.issue_id FK references issues(id), whose PKs always
+		// carry the prefix; a bare id (e.g. "abc123") would violate the FK
+		// once foreign_keys=ON (migration 30).
+		handoff.IssueID = NormalizeIssueID(handoff.IssueID)
 		handoff.Timestamp = time.Now()
 
 		doneJSON, _ := json.Marshal(handoff.Done)
@@ -307,7 +312,7 @@ func (db *DB) GetHandoffs(issueID string) ([]models.Handoff, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var h models.Handoff
@@ -354,7 +359,7 @@ func (db *DB) GetRecentHandoffs(limit int, since time.Time) ([]models.Handoff, e
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var h models.Handoff
@@ -392,6 +397,8 @@ func (db *DB) GetRecentHandoffs(limit int, since time.Time) ([]models.Handoff, e
 // AddComment adds a comment to an issue
 func (db *DB) AddComment(comment *models.Comment) error {
 	return db.withWriteLock(func() error {
+		// Normalize issue_id to canonical td- form (comments.issue_id FK).
+		comment.IssueID = NormalizeIssueID(comment.IssueID)
 		comment.CreatedAt = time.Now()
 
 		id, err := generateCommentID()
@@ -436,7 +443,7 @@ func (db *DB) GetComments(issueID string) ([]models.Comment, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var comments []models.Comment
 	for rows.Next() {
@@ -467,7 +474,7 @@ func (db *DB) GetRecentCommentsAll(limit int) ([]models.Comment, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var comments []models.Comment
 	for rows.Next() {
@@ -577,7 +584,8 @@ func (db *DB) GetLastAction(sessionID string) (*models.ActionLog, error) {
 	err := db.conn.QueryRow(`
 		SELECT CAST(id AS TEXT), session_id, action_type, entity_type, entity_id, previous_data, new_data, timestamp, undone
 		FROM action_log
-		WHERE session_id = ? AND undone = 0 AND entity_type NOT IN ('logs', 'comments', 'work_sessions')
+		WHERE session_id = ? AND undone = 0
+		  AND entity_type NOT IN ('logs', 'comments', 'work_sessions', 'issue_review', 'issue_reviews')
 		ORDER BY timestamp DESC LIMIT 1
 	`, sessionID).Scan(
 		&action.ID, &action.SessionID, &action.ActionType, &action.EntityType,
@@ -608,7 +616,8 @@ func (db *DB) GetRecentActions(sessionID string, limit int) ([]models.ActionLog,
 	query := `
 		SELECT CAST(id AS TEXT), session_id, action_type, entity_type, entity_id, previous_data, new_data, timestamp, undone
 		FROM action_log
-		WHERE session_id = ? AND entity_type NOT IN ('logs', 'comments', 'work_sessions')
+		WHERE session_id = ?
+		  AND entity_type NOT IN ('logs', 'comments', 'work_sessions', 'issue_review', 'issue_reviews')
 		ORDER BY timestamp DESC`
 	args := []interface{}{sessionID}
 
@@ -621,7 +630,7 @@ func (db *DB) GetRecentActions(sessionID string, limit int) ([]models.ActionLog,
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var actions []models.ActionLog
 	for rows.Next() {
@@ -661,7 +670,7 @@ func (db *DB) GetRecentActionsAll(limit int) ([]models.ActionLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var actions []models.ActionLog
 	for rows.Next() {
@@ -727,7 +736,7 @@ func (db *DB) GetRejectedInProgressIssueIDs() (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make(map[string]bool)
 	for rows.Next() {
@@ -751,6 +760,8 @@ func (db *DB) GetRejectedInProgressIssueIDs() (map[string]bool, error) {
 // AddGitSnapshot records a git state snapshot
 func (db *DB) AddGitSnapshot(snapshot *models.GitSnapshot) error {
 	return db.withWriteLock(func() error {
+		// Normalize issue_id to canonical td- form (git_snapshots.issue_id FK).
+		snapshot.IssueID = NormalizeIssueID(snapshot.IssueID)
 		snapshot.Timestamp = time.Now()
 
 		id, err := generateSnapshotID()

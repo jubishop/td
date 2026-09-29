@@ -16,7 +16,7 @@ func (db *DB) columnExists(table, column string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var (
@@ -229,6 +229,16 @@ func (db *DB) runMigrationsInternal() (int, error) {
 				migrationsRun++
 				continue
 			}
+			if migration.Version == 30 {
+				if err := db.migrateEnableFKEnforcement(); err != nil {
+					return migrationsRun, fmt.Errorf("migration 30 (fk enforcement): %w", err)
+				}
+				if err := db.setSchemaVersionInternal(migration.Version); err != nil {
+					return migrationsRun, fmt.Errorf("set version %d: %w", migration.Version, err)
+				}
+				migrationsRun++
+				continue
+			}
 			if migration.Version == 29 {
 				exists, err := db.columnExists("issues", "defer_until")
 				if err != nil {
@@ -241,6 +251,66 @@ func (db *DB) runMigrationsInternal() (int, error) {
 					migrationsRun++
 					continue
 				}
+			}
+			if migration.Version == 31 {
+				if err := db.migrateReviewAttestations(); err != nil {
+					return migrationsRun, fmt.Errorf("migration 31 (review attestations): %w", err)
+				}
+				if err := db.setSchemaVersionInternal(migration.Version); err != nil {
+					return migrationsRun, fmt.Errorf("set version %d: %w", migration.Version, err)
+				}
+				migrationsRun++
+				continue
+			}
+			if migration.Version == 32 {
+				if err := db.migrateSelfReviewColumn(); err != nil {
+					return migrationsRun, fmt.Errorf("migration 32 (self_review column): %w", err)
+				}
+				if err := db.setSchemaVersionInternal(migration.Version); err != nil {
+					return migrationsRun, fmt.Errorf("set version %d: %w", migration.Version, err)
+				}
+				migrationsRun++
+				continue
+			}
+			if migration.Version == 33 {
+				if err := db.migrateSessionMatchContextID(); err != nil {
+					return migrationsRun, fmt.Errorf("migration 33 (session match_context_id): %w", err)
+				}
+				if err := db.setSchemaVersionInternal(migration.Version); err != nil {
+					return migrationsRun, fmt.Errorf("set version %d: %w", migration.Version, err)
+				}
+				migrationsRun++
+				continue
+			}
+			if migration.Version == 34 {
+				if err := db.migrateWorktreeIdentity(); err != nil {
+					return migrationsRun, fmt.Errorf("migration 34 (worktree identity): %w", err)
+				}
+				if err := db.setSchemaVersionInternal(migration.Version); err != nil {
+					return migrationsRun, fmt.Errorf("set version %d: %w", migration.Version, err)
+				}
+				migrationsRun++
+				continue
+			}
+			if migration.Version == 36 {
+				if err := db.migrateNormalizeTimestamps(); err != nil {
+					return migrationsRun, fmt.Errorf("migration 36 (normalize timestamps): %w", err)
+				}
+				if err := db.setSchemaVersionInternal(migration.Version); err != nil {
+					return migrationsRun, fmt.Errorf("set version %d: %w", migration.Version, err)
+				}
+				migrationsRun++
+				continue
+			}
+			if migration.Version == 37 {
+				if err := db.migrateReviewedByColumn(); err != nil {
+					return migrationsRun, fmt.Errorf("migration 37 (reviewed_by column): %w", err)
+				}
+				if err := db.setSchemaVersionInternal(migration.Version); err != nil {
+					return migrationsRun, fmt.Errorf("set version %d: %w", migration.Version, err)
+				}
+				migrationsRun++
+				continue
 			}
 			if _, err := db.conn.Exec(migration.SQL); err != nil {
 				return migrationsRun, fmt.Errorf("migration %d (%s): %w", migration.Version, migration.Description, err)
@@ -282,13 +352,17 @@ CREATE TABLE sessions (
     agent_type TEXT DEFAULT '',
     agent_pid INTEGER DEFAULT 0,
     context_id TEXT DEFAULT '',
+    match_context_id TEXT DEFAULT '',
+    worktree_id TEXT DEFAULT '',
+    worktree_root TEXT DEFAULT '',
+    repo_root TEXT DEFAULT '',
     previous_session_id TEXT DEFAULT '',
     started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     ended_at DATETIME,
     last_activity DATETIME
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(branch);
-CREATE INDEX IF NOT EXISTS idx_sessions_branch_agent ON sessions(branch, agent_type, agent_pid);
+CREATE INDEX IF NOT EXISTS idx_sessions_branch_agent ON sessions(branch, agent_type, agent_pid, match_context_id, worktree_id);
 `)
 		return err
 	}
@@ -316,6 +390,10 @@ CREATE TABLE sessions_new (
     agent_type TEXT DEFAULT '',
     agent_pid INTEGER DEFAULT 0,
     context_id TEXT DEFAULT '',
+    match_context_id TEXT DEFAULT '',
+    worktree_id TEXT DEFAULT '',
+    worktree_root TEXT DEFAULT '',
+    repo_root TEXT DEFAULT '',
     previous_session_id TEXT DEFAULT '',
     started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     ended_at DATETIME,
@@ -326,9 +404,76 @@ INSERT INTO sessions_new (id, name, context_id, previous_session_id, started_at,
 DROP TABLE sessions;
 ALTER TABLE sessions_new RENAME TO sessions;
 CREATE INDEX IF NOT EXISTS idx_sessions_branch ON sessions(branch);
-CREATE INDEX IF NOT EXISTS idx_sessions_branch_agent ON sessions(branch, agent_type, agent_pid);
+CREATE INDEX IF NOT EXISTS idx_sessions_branch_agent ON sessions(branch, agent_type, agent_pid, match_context_id, worktree_id);
 `)
 	return err
+}
+
+// migrateSessionMatchContextID adds the match_context_id column to the sessions
+// table. This column participates in the session identity key (branch +
+// agent_type + agent_pid + match_context_id) so that distinct sub-agent
+// contexts sharing one process/branch/checkout no longer collapse into one
+// session. Existing rows default to ” (empty), which preserves the current
+// interactive behavior since empty matches empty. Guarded by columnExists so
+// re-running is safe.
+func (db *DB) migrateSessionMatchContextID() error {
+	exists, err := db.columnExists("sessions", "match_context_id")
+	if err != nil {
+		return fmt.Errorf("check match_context_id column: %w", err)
+	}
+	if !exists {
+		if _, err := db.conn.Exec(
+			`ALTER TABLE sessions ADD COLUMN match_context_id TEXT DEFAULT ''`); err != nil {
+			return fmt.Errorf("add match_context_id column: %w", err)
+		}
+	}
+
+	// Refresh the identity index to include match_context_id. Drop the old
+	// index first so the recreate picks up the new column set.
+	if _, err := db.conn.Exec(`
+DROP INDEX IF EXISTS idx_sessions_branch_agent;
+CREATE INDEX IF NOT EXISTS idx_sessions_branch_agent ON sessions(branch, agent_type, agent_pid, match_context_id);
+`); err != nil {
+		return fmt.Errorf("rebuild idx_sessions_branch_agent: %w", err)
+	}
+	return nil
+}
+
+// migrateWorktreeIdentity adds current checkout metadata to sessions and work
+// sessions. Existing rows keep empty values, and session lookup has a one
+// release legacy fallback for those empty-worktree rows.
+func (db *DB) migrateWorktreeIdentity() error {
+	addTextColumn := func(table, column string) error {
+		exists, err := db.columnExists(table, column)
+		if err != nil {
+			return fmt.Errorf("check %s.%s column: %w", table, column, err)
+		}
+		if exists {
+			return nil
+		}
+		if _, err := db.conn.Exec(fmt.Sprintf(
+			`ALTER TABLE %s ADD COLUMN %s TEXT DEFAULT ''`, table, column)); err != nil {
+			return fmt.Errorf("add %s.%s column: %w", table, column, err)
+		}
+		return nil
+	}
+
+	for _, table := range []string{"sessions", "work_sessions"} {
+		for _, column := range []string{"worktree_id", "worktree_root", "repo_root"} {
+			if err := addTextColumn(table, column); err != nil {
+				return err
+			}
+		}
+	}
+
+	if _, err := db.conn.Exec(`
+DROP INDEX IF EXISTS idx_sessions_branch_agent;
+CREATE INDEX IF NOT EXISTS idx_sessions_branch_agent ON sessions(branch, agent_type, agent_pid, match_context_id, worktree_id);
+`); err != nil {
+		return fmt.Errorf("rebuild idx_sessions_branch_agent: %w", err)
+	}
+
+	return nil
 }
 
 // generateTextID creates a prefixed text ID with 4 random bytes (8 hex chars)
@@ -493,7 +638,7 @@ func (db *DB) migrateToTextIDsTx(tx *sql.Tx) error {
 
 		cols, err := rows.Columns()
 		if err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return fmt.Errorf("columns %s: %w", m.name, err)
 		}
 		nCols := len(cols)
@@ -506,12 +651,12 @@ func (db *DB) migrateToTextIDsTx(tx *sql.Tx) error {
 				ptrs[i] = &vals[i]
 			}
 			if err := rows.Scan(ptrs...); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return fmt.Errorf("scan %s: %w", m.name, err)
 			}
 			allRows = append(allRows, vals)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		// Track ID mappings for action_log rewriting
 		if m.entityType != "" {
@@ -601,7 +746,7 @@ func (db *DB) tableHasIntegerPKTx(tx *sql.Tx, table string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	return scanForIntegerPK(rows)
 }
@@ -709,12 +854,12 @@ func (db *DB) migrateDeterministicIDs() error {
 			for rows.Next() {
 				var r bipRow
 				if err := rows.Scan(&r.boardID, &r.issueID, &r.position, &r.addedAt); err != nil {
-					rows.Close()
+					_ = rows.Close()
 					return err
 				}
 				bRows = append(bRows, r)
 			}
-			rows.Close()
+			_ = rows.Close()
 
 			for _, r := range bRows {
 				id := BoardIssuePosID(r.boardID, r.issueID)
@@ -771,12 +916,12 @@ func (db *DB) migrateDeterministicIDs() error {
 			for rows.Next() {
 				var r depRow
 				if err := rows.Scan(&r.issueID, &r.dependsOnID, &r.relationType); err != nil {
-					rows.Close()
+					_ = rows.Close()
 					return err
 				}
 				dRows = append(dRows, r)
 			}
-			rows.Close()
+			_ = rows.Close()
 
 			for _, r := range dRows {
 				id := DependencyID(r.issueID, r.dependsOnID, r.relationType)
@@ -812,12 +957,12 @@ func (db *DB) migrateDeterministicIDs() error {
 		for rows.Next() {
 			var r ifRow
 			if err := rows.Scan(&r.oldID, &r.issueID, &r.filePath); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return err
 			}
 			fRows = append(fRows, r)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		// Deduplicate: if two rows hash to same deterministic ID, keep first
 		seen := make(map[string]bool)
@@ -858,7 +1003,7 @@ func (db *DB) columnExistsTx(tx *sql.Tx, table, column string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var cid int
 		var name, ctype string
@@ -902,12 +1047,12 @@ func (db *DB) migrateFilePathsToRelative() error {
 	for rows.Next() {
 		var r fileRow
 		if err := rows.Scan(&r.id, &r.issueID, &r.filePath); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		fRows = append(fRows, r)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	for _, r := range fRows {
 		// Skip paths that are already relative
@@ -972,7 +1117,7 @@ func (db *DB) migrateLegacyActionLogCompositeIDs() error {
 	if err != nil {
 		return fmt.Errorf("read action_log: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var (
@@ -1278,12 +1423,12 @@ func (db *DB) migrateWorkSessionIssueIDs() error {
 	for rows.Next() {
 		var r wsiRow
 		if err := rows.Scan(&r.wsID, &r.issueID, &r.taggedAt); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		wRows = append(wRows, r)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	for _, r := range wRows {
 		id := WsiID(r.wsID, r.issueID)
@@ -1380,5 +1525,155 @@ CREATE INDEX IF NOT EXISTS idx_action_log_entity_type ON action_log(entity_id, a
 		return fmt.Errorf("recreate action_log indexes: %w", err)
 	}
 
+	return tx.Commit()
+}
+
+// migrateNormalizeTimestamps rewrites timestamp values that were persisted in a
+// legacy Go time.Time.String() format (with a monotonic-clock suffix and/or a
+// zone name, e.g. "2026-07-18 07:29:04.7 -0700 PDT m=+0.10") into the canonical
+// SQLite layout that the modernc driver round-trips reliably.
+//
+// Root cause: td historically opened the DB without _time_format=sqlite, so
+// modernc's default writer serialized every bound time.Time with
+// time.Time.String(). Those values are fragile-to-unparseable on read and could
+// hard-fail a scan into time.Time/sql.NullTime (e.g. session lookup).
+//
+// It scans every DATE/DATETIME/TIMESTAMP column in the database and only
+// rewrites values that look like Go String() output, leaving canonical and
+// CURRENT_TIMESTAMP values untouched. Idempotent: a second run finds nothing.
+func (db *DB) migrateNormalizeTimestamps() error {
+	tables, err := db.listTables()
+	if err != nil {
+		return fmt.Errorf("list tables: %w", err)
+	}
+	for _, table := range tables {
+		cols, err := db.datetimeColumns(table)
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", table, err)
+		}
+		for _, col := range cols {
+			if err := db.normalizeTimestampColumn(table, col); err != nil {
+				return fmt.Errorf("normalize %s.%s: %w", table, col, err)
+			}
+		}
+	}
+	return nil
+}
+
+// listTables returns the user table names in the database.
+func (db *DB) listTables() ([]string, error) {
+	rows, err := db.conn.Query(
+		`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		tables = append(tables, name)
+	}
+	return tables, rows.Err()
+}
+
+// quoteIdent quotes a SQLite identifier (table/column name) by wrapping it in
+// double quotes and doubling any embedded double quote — the correct escaping
+// for SQLite identifiers (Go's %q uses backslash escapes, which SQLite does not
+// understand). Identifiers here come from td's own schema via sqlite_master /
+// PRAGMA, but quoting correctly keeps this safe if that ever changes.
+func quoteIdent(ident string) string {
+	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
+}
+
+// datetimeColumns returns the columns of table whose declared type is a date or
+// time type (DATE/DATETIME/TIMESTAMP).
+func (db *DB) datetimeColumns(table string) ([]string, error) {
+	rows, err := db.conn.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, quoteIdent(table)))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var cols []string
+	for rows.Next() {
+		var (
+			cid       int
+			name, typ string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dfltValue, &pk); err != nil {
+			return nil, err
+		}
+		switch strings.ToUpper(strings.TrimSpace(typ)) {
+		case "DATE", "DATETIME", "TIMESTAMP":
+			cols = append(cols, name)
+		}
+	}
+	return cols, rows.Err()
+}
+
+// normalizeTimestampColumn rewrites legacy Go-format values in one column.
+// Raw text is read via CAST(... AS TEXT) so the driver's DATETIME auto-parsing
+// (which would choke on the bad values) is bypassed. All rows are read (and the
+// cursor closed) before any write, because the pool is pinned to a single
+// connection (maxOpen=1) and a concurrent read+write would deadlock. The rewrite
+// keys on rowid, which every td table has (none are declared WITHOUT ROWID).
+func (db *DB) normalizeTimestampColumn(table, col string) error {
+	qtable, qcol := quoteIdent(table), quoteIdent(col)
+	q := fmt.Sprintf(
+		`SELECT rowid, CAST(%s AS TEXT) FROM %s WHERE %s IS NOT NULL AND %s != ''`,
+		qcol, qtable, qcol, qcol)
+	rows, err := db.conn.Query(q)
+	if err != nil {
+		return err
+	}
+
+	type fix struct {
+		rowid int64
+		value string
+	}
+	var fixes []fix
+	for rows.Next() {
+		var rowid int64
+		var raw string
+		if err := rows.Scan(&rowid, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if !LooksLikeGoTimeString(raw) {
+			continue
+		}
+		t, ok := ParseLenientTime(raw)
+		if !ok {
+			continue
+		}
+		fixes = append(fixes, fix{rowid: rowid, value: FormatCanonicalTime(t)})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+
+	if len(fixes) == 0 {
+		return nil
+	}
+
+	// Batch the rewrites in a single transaction to avoid one fsync per row.
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	upd := fmt.Sprintf(`UPDATE %s SET %s = ? WHERE rowid = ?`, qtable, qcol)
+	for _, f := range fixes {
+		if _, err := tx.Exec(upd, f.value, f.rowid); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
 	return tx.Commit()
 }

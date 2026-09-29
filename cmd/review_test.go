@@ -1,13 +1,9 @@
 package cmd
 
 import (
-	"bytes"
-	"io"
-	"os"
 	"strings"
 	"testing"
 
-	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/session"
@@ -21,25 +17,31 @@ func TestClearFocusIfNeeded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	database.Close()
+	defer func() { _ = database.Close() }()
+
+	t.Setenv("TD_SESSION_ID", "review-clear-focus")
+	sess, scope, err := getCurrentStateSession(database, dir)
+	if err != nil {
+		t.Fatalf("getCurrentStateSession failed: %v", err)
+	}
 
 	// Set focus on an issue
 	targetID := "td-test123"
-	if err := config.SetFocus(dir, targetID); err != nil {
+	if err := database.SetFocus(scope, targetID); err != nil {
 		t.Fatalf("SetFocus failed: %v", err)
 	}
 
 	// Verify focus is set
-	focused, _ := config.GetFocus(dir)
+	focused, _ := database.GetFocus(scope)
 	if focused != targetID {
 		t.Fatalf("Focus not set: got %q, want %q", focused, targetID)
 	}
 
 	// Clear focus with matching ID
-	clearFocusIfNeeded(dir, targetID)
+	clearFocusIfNeeded(database, dir, sess, targetID)
 
 	// Verify focus is cleared
-	focused, _ = config.GetFocus(dir)
+	focused, _ = database.GetFocus(scope)
 	if focused != "" {
 		t.Errorf("Focus not cleared: got %q, want empty", focused)
 	}
@@ -53,19 +55,25 @@ func TestClearFocusIfNeededNonMatching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	database.Close()
+	defer func() { _ = database.Close() }()
+
+	t.Setenv("TD_SESSION_ID", "review-keep-focus")
+	sess, scope, err := getCurrentStateSession(database, dir)
+	if err != nil {
+		t.Fatalf("getCurrentStateSession failed: %v", err)
+	}
 
 	// Set focus on an issue
 	focusedID := "td-focused"
-	if err := config.SetFocus(dir, focusedID); err != nil {
+	if err := database.SetFocus(scope, focusedID); err != nil {
 		t.Fatalf("SetFocus failed: %v", err)
 	}
 
 	// Try to clear with different ID
-	clearFocusIfNeeded(dir, "td-different")
+	clearFocusIfNeeded(database, dir, sess, "td-different")
 
 	// Focus should still be set
-	focused, _ := config.GetFocus(dir)
+	focused, _ := database.GetFocus(scope)
 	if focused != focusedID {
 		t.Errorf("Focus was incorrectly cleared: got %q, want %q", focused, focusedID)
 	}
@@ -79,19 +87,38 @@ func TestClearFocusIfNeededNoFocus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	database.Close()
+	defer func() { _ = database.Close() }()
+
+	t.Setenv("TD_SESSION_ID", "review-no-focus")
+	sess, scope, err := getCurrentStateSession(database, dir)
+	if err != nil {
+		t.Fatalf("getCurrentStateSession failed: %v", err)
+	}
 
 	// Don't set any focus, just try to clear
-	clearFocusIfNeeded(dir, "td-any")
+	clearFocusIfNeeded(database, dir, sess, "td-any")
 
 	// Should not panic or error
-	focused, _ := config.GetFocus(dir)
+	focused, _ := database.GetFocus(scope)
 	if focused != "" {
 		t.Errorf("Unexpected focus found: %q", focused)
 	}
 }
 
+// runReviewCommand returns stdout and stderr concatenated, which is what the
+// assertions on review's own rendered output want. Tests that care WHICH
+// stream a line landed on — diagnostics belong on stderr — should call
+// runReviewCommandStreams instead.
 func runReviewCommand(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	stdout, stderr := runReviewCommandStreams(t, dir, args...)
+	return stdout + stderr
+}
+
+// runReviewCommandStreams runs reviewCmd with both standard streams captured
+// separately. output.Warning and output.Error write to stderr, so a helper
+// that captured only stdout would silently drop every diagnostic.
+func runReviewCommandStreams(t *testing.T, dir string, args ...string) (string, string) {
 	t.Helper()
 
 	saveAndRestoreGlobals(t)
@@ -108,25 +135,16 @@ func runReviewCommand(t *testing.T, dir string, args ...string) string {
 	_ = reviewCmd.Flags().Set("note", "")
 	_ = reviewCmd.Flags().Set("notes", "")
 
-	var output bytes.Buffer
-	oldStdout := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe failed: %v", err)
-	}
-	os.Stdout = w
-
-	runErr := reviewCmd.RunE(reviewCmd, args)
-
-	_ = w.Close()
-	os.Stdout = oldStdout
-	_, _ = io.Copy(&output, r)
+	var runErr error
+	stdout, stderr := captureStdoutStderr(t, func() {
+		runErr = reviewCmd.RunE(reviewCmd, args)
+	})
 
 	if runErr != nil {
 		t.Fatalf("reviewCmd.RunE returned error: %v", runErr)
 	}
 
-	return output.String()
+	return stdout, stderr
 }
 
 func reviewCommandSessionID(t *testing.T, database *db.DB) string {
@@ -147,7 +165,7 @@ func TestReviewRequiresHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create an issue
 	issue := &models.Issue{
@@ -178,7 +196,7 @@ func TestSubmitIssueForReviewDetectsStaleTransition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:  "Concurrent stale review issue",
@@ -225,7 +243,7 @@ func TestApproveRequiresDifferentSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionID := "ses_impl123"
 
@@ -261,7 +279,7 @@ func TestRejectResetsToOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create an issue in review with an implementer
 	issue := &models.Issue{
@@ -301,7 +319,7 @@ func TestCloseSetsClosedAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create an issue
 	issue := &models.Issue{
@@ -342,7 +360,7 @@ func TestApproveAddsReviewerSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	implSession := "ses_impl123"
 	reviewSession := "ses_review456"
@@ -383,7 +401,7 @@ func TestReviewAddsLogEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create an issue
 	issue := &models.Issue{
@@ -425,7 +443,7 @@ func TestHasChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create epic
 	epic := &models.Issue{
@@ -473,7 +491,7 @@ func TestGetDescendantIssues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create epic -> sub-epic -> task hierarchy
 	epic := &models.Issue{
@@ -549,7 +567,7 @@ func TestCascadeReviewMarksDescendants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create epic with children
 	epic := &models.Issue{
@@ -636,7 +654,7 @@ func TestCascadeReviewNestedEpics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create epic -> sub-epic -> task
 	epic := &models.Issue{
@@ -684,7 +702,9 @@ func TestCascadeReviewNestedEpics(t *testing.T) {
 	// Mark all for review
 	for _, d := range descendants {
 		d.Status = models.StatusInReview
-		database.UpdateIssue(d)
+		if err := database.UpdateIssue(d); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Verify all are in_review
@@ -708,7 +728,7 @@ func TestCascadeUpToReviewAllChildrenReview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create epic with two children
 	epic := &models.Issue{
@@ -750,7 +770,9 @@ func TestCascadeUpToReviewAllChildrenReview(t *testing.T) {
 
 	// Now mark child2 as in_review
 	child2.Status = models.StatusInReview
-	database.UpdateIssue(child2)
+	if err := database.UpdateIssue(child2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Cascade up should now update epic
 	cascaded, _ := database.CascadeUpParentStatus(child2.ID, models.StatusInReview, sessionID)
@@ -772,7 +794,7 @@ func TestCascadeUpToClosedAllChildrenClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create epic with two children
 	epic := &models.Issue{
@@ -827,7 +849,7 @@ func TestCascadeUpRecursive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create grandparent -> parent -> child hierarchy (all epics)
 	grandparent := &models.Issue{
@@ -886,7 +908,7 @@ func TestCascadeUpNoActionNonEpicParent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create a task parent (not an epic)
 	parent := &models.Issue{
@@ -929,7 +951,7 @@ func TestCascadeUpNoActionNotAllChildrenReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create epic with two children, only one in_review
 	epic := &models.Issue{
@@ -981,7 +1003,7 @@ func TestCascadeUpReviewAllowsClosedSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create epic with two children: one in_review, one closed
 	epic := &models.Issue{
@@ -1048,7 +1070,9 @@ func TestReviewMinorFlag(t *testing.T) {
 	}
 
 	// Reset
-	reviewCmd.Flags().Set("minor", "false")
+	if err := reviewCmd.Flags().Set("minor", "false"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReviewReasonShorthand(t *testing.T) {
@@ -1071,7 +1095,9 @@ func TestReviewReasonShorthand(t *testing.T) {
 	}
 
 	// Reset
-	reviewCmd.Flags().Set("reason", "")
+	if err := reviewCmd.Flags().Set("reason", ""); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestApproveReasonShorthand(t *testing.T) {
@@ -1135,7 +1161,9 @@ func TestCloseSelfCloseExceptionRequiresValue(t *testing.T) {
 	}
 
 	// Reset flag to default before test
-	flag.Value.Set("")
+	if err := flag.Value.Set(""); err != nil {
+		t.Fatal(err)
+	}
 
 	// Set a test value
 	if err := flag.Value.Set("test reason"); err != nil {
@@ -1148,7 +1176,9 @@ func TestCloseSelfCloseExceptionRequiresValue(t *testing.T) {
 	}
 
 	// Reset for other tests
-	flag.Value.Set("")
+	if err := flag.Value.Set(""); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCloseSelfCloseScenarios(t *testing.T) {
@@ -1160,7 +1190,7 @@ func TestCloseSelfCloseScenarios(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionID := "ses_impl123"
 	otherSessionID := "ses_other456"
@@ -1174,7 +1204,9 @@ func TestCloseSelfCloseScenarios(t *testing.T) {
 	if err := database.CreateIssue(issueWithImpl); err != nil {
 		t.Fatalf("CreateIssue failed: %v", err)
 	}
-	database.UpdateIssue(issueWithImpl)
+	if err := database.UpdateIssue(issueWithImpl); err != nil {
+		t.Fatal(err)
+	}
 
 	retrieved, _ := database.GetIssue(issueWithImpl.ID)
 	if retrieved.ImplementerSession != sessionID {
@@ -1222,7 +1254,7 @@ func TestCloseSelfCloseExceptionLogMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionID := "ses_impl123"
 
@@ -1235,18 +1267,22 @@ func TestCloseSelfCloseExceptionLogMessage(t *testing.T) {
 	if err := database.CreateIssue(issue); err != nil {
 		t.Fatalf("CreateIssue failed: %v", err)
 	}
-	database.UpdateIssue(issue)
+	if err := database.UpdateIssue(issue); err != nil {
+		t.Fatal(err)
+	}
 
 	// Simulate closing with exception - manually add the log entry
 	exceptionReason := "trivial typo fix"
 	logMsg := "[test-agent] Closed (SELF-CLOSE EXCEPTION: " + exceptionReason + ")"
 
-	database.AddLog(&models.Log{
+	if err := database.AddLog(&models.Log{
 		IssueID:   issue.ID,
 		SessionID: sessionID,
 		Message:   logMsg,
 		Type:      models.LogTypeSecurity,
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Verify log contains exception
 	logs, _ := database.GetLogs(issue.ID, 0)
@@ -1268,7 +1304,7 @@ func TestCascadeUpNoActionNoParent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create task with no parent
 	task := &models.Issue{
@@ -1312,7 +1348,7 @@ func TestReviewAutoCreatesHandoffWhenMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionID := "ses_test123"
 
@@ -1370,7 +1406,7 @@ func TestReviewWarnsWhenAutoCreatingHandoffWithoutContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:  "Needs review handoff",
@@ -1380,13 +1416,13 @@ func TestReviewWarnsWhenAutoCreatingHandoffWithoutContext(t *testing.T) {
 		t.Fatalf("CreateIssue failed: %v", err)
 	}
 
-	output := runReviewCommand(t, dir, issue.ID)
+	stdout, stderr := runReviewCommandStreams(t, dir, issue.ID)
 
-	if !strings.Contains(output, "Warning: auto-created minimal handoff for "+issue.ID) {
-		t.Fatalf("expected auto-handoff warning, got %q", output)
+	if !strings.Contains(stderr, "Warning: auto-created minimal handoff for "+issue.ID) {
+		t.Fatalf("expected auto-handoff warning on stderr, got %q", stderr)
 	}
-	if !strings.Contains(output, "REVIEW REQUESTED "+issue.ID) {
-		t.Fatalf("expected review output for %q, got %q", issue.ID, output)
+	if !strings.Contains(stdout, "REVIEW REQUESTED "+issue.ID) {
+		t.Fatalf("expected review output for %q, got %q", issue.ID, stdout)
 	}
 
 	handoff, err := database.GetLatestHandoff(issue.ID)
@@ -1405,7 +1441,7 @@ func TestReviewWarnsWhenOnlyRoutineWorkflowLogsExist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:  "Routine logs only",
@@ -1425,10 +1461,10 @@ func TestReviewWarnsWhenOnlyRoutineWorkflowLogsExist(t *testing.T) {
 		t.Fatalf("AddLog failed: %v", err)
 	}
 
-	output := runReviewCommand(t, dir, issue.ID)
+	_, stderr := runReviewCommandStreams(t, dir, issue.ID)
 
-	if !strings.Contains(output, "Warning: auto-created minimal handoff for "+issue.ID) {
-		t.Fatalf("expected warning to remain for routine logs, got %q", output)
+	if !strings.Contains(stderr, "Warning: auto-created minimal handoff for "+issue.ID) {
+		t.Fatalf("expected warning to remain for routine logs, got %q", stderr)
 	}
 }
 
@@ -1439,7 +1475,7 @@ func TestReviewWarnsWhenSubstantiveLogsBelongToDifferentSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:  "Different session context",
@@ -1458,13 +1494,13 @@ func TestReviewWarnsWhenSubstantiveLogsBelongToDifferentSession(t *testing.T) {
 		t.Fatalf("AddLog failed: %v", err)
 	}
 
-	output := runReviewCommand(t, dir, issue.ID)
+	stdout, stderr := runReviewCommandStreams(t, dir, issue.ID)
 
-	if !strings.Contains(output, "Warning: auto-created minimal handoff for "+issue.ID) {
-		t.Fatalf("expected warning when substantive logs are from another session, got %q", output)
+	if !strings.Contains(stderr, "Warning: auto-created minimal handoff for "+issue.ID) {
+		t.Fatalf("expected warning when substantive logs are from another session, got %q", stderr)
 	}
-	if !strings.Contains(output, "REVIEW REQUESTED "+issue.ID) {
-		t.Fatalf("expected review output for %q, got %q", issue.ID, output)
+	if !strings.Contains(stdout, "REVIEW REQUESTED "+issue.ID) {
+		t.Fatalf("expected review output for %q, got %q", issue.ID, stdout)
 	}
 }
 
@@ -1475,7 +1511,7 @@ func TestReviewSuppressesAutoHandoffWarningWhenWorkSessionContextExists(t *testi
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issue := &models.Issue{
 		Title:  "Work session context exists",
@@ -1525,6 +1561,200 @@ func TestReviewSuppressesAutoHandoffWarningWhenWorkSessionContextExists(t *testi
 	}
 }
 
+func TestReviewSynthesizesHandoffFromLogs(t *testing.T) {
+	dir := t.TempDir()
+
+	database, err := db.Initialize(dir)
+	if err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	issue := &models.Issue{
+		Title:  "Has substantive logs",
+		Status: models.StatusInProgress,
+	}
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	sessionID := reviewCommandSessionID(t, database)
+
+	// Routine log should be ignored, substantive logs should be synthesized.
+	if err := database.AddLog(&models.Log{
+		IssueID:   issue.ID,
+		SessionID: sessionID,
+		Message:   "Started work",
+		Type:      models.LogTypeProgress,
+	}); err != nil {
+		t.Fatalf("AddLog failed: %v", err)
+	}
+	if err := database.AddLog(&models.Log{
+		IssueID:   issue.ID,
+		SessionID: sessionID,
+		Message:   "Implemented retry handling for the sync client",
+		Type:      models.LogTypeProgress,
+	}); err != nil {
+		t.Fatalf("AddLog failed: %v", err)
+	}
+	if err := database.AddLog(&models.Log{
+		IssueID:   issue.ID,
+		SessionID: sessionID,
+		Message:   "Chose exponential backoff over fixed interval",
+		Type:      models.LogTypeDecision,
+	}); err != nil {
+		t.Fatalf("AddLog failed: %v", err)
+	}
+
+	_ = runReviewCommand(t, dir, issue.ID)
+
+	handoff, err := database.GetLatestHandoff(issue.ID)
+	if err != nil {
+		t.Fatalf("GetLatestHandoff failed: %v", err)
+	}
+	if handoff == nil {
+		t.Fatal("expected auto-created handoff")
+	}
+
+	// Done should reflect the substantive progress log, not the placeholder.
+	if len(handoff.Done) == 0 {
+		t.Fatal("expected synthesized Done content")
+	}
+	for _, d := range handoff.Done {
+		if d == autoReviewHandoffMessage {
+			t.Errorf("Done should not contain placeholder when logs exist: %v", handoff.Done)
+		}
+	}
+	foundProgress := false
+	for _, d := range handoff.Done {
+		if strings.Contains(d, "Implemented retry handling") {
+			foundProgress = true
+		}
+		if strings.Contains(d, "Started work") {
+			t.Errorf("routine log should not appear in Done: %v", handoff.Done)
+		}
+	}
+	if !foundProgress {
+		t.Errorf("expected progress log in Done, got %v", handoff.Done)
+	}
+
+	// Decision log should be separated into Decisions.
+	foundDecision := false
+	for _, d := range handoff.Decisions {
+		if strings.Contains(d, "exponential backoff") {
+			foundDecision = true
+		}
+	}
+	if !foundDecision {
+		t.Errorf("expected decision log in Decisions, got %v", handoff.Decisions)
+	}
+
+	// Remaining should point reviewers at the logs when content was synthesized.
+	if len(handoff.Remaining) == 0 {
+		t.Errorf("expected non-empty Remaining for synthesized handoff, got %v", handoff.Remaining)
+	}
+}
+
+func TestReviewFallsBackToMinimalHandoffWithNoLogs(t *testing.T) {
+	dir := t.TempDir()
+
+	database, err := db.Initialize(dir)
+	if err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	issue := &models.Issue{
+		Title:  "No logs at all",
+		Status: models.StatusInProgress,
+	}
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	// No logs added at all.
+	_ = runReviewCommand(t, dir, issue.ID)
+
+	handoff, err := database.GetLatestHandoff(issue.ID)
+	if err != nil {
+		t.Fatalf("GetLatestHandoff failed: %v", err)
+	}
+	if handoff == nil {
+		t.Fatal("expected auto-created handoff even with no logs")
+	}
+	if len(handoff.Done) != 1 || handoff.Done[0] != autoReviewHandoffMessage {
+		t.Errorf("expected minimal placeholder fallback, got %v", handoff.Done)
+	}
+	if len(handoff.Remaining) != 0 {
+		t.Errorf("expected empty Remaining for minimal fallback, got %v", handoff.Remaining)
+	}
+}
+
+func TestReviewMinorSkipsAutoHandoff(t *testing.T) {
+	dir := t.TempDir()
+
+	database, err := db.Initialize(dir)
+	if err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	issue := &models.Issue{
+		Title:  "Minor issue",
+		Status: models.StatusInProgress,
+	}
+	if err := database.CreateIssue(issue); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	saveAndRestoreGlobals(t)
+	t.Setenv("TD_SESSION_ID", "ses_review_cmd")
+	baseDir := dir
+	baseDirOverride = &baseDir
+
+	_ = reviewCmd.Flags().Set("json", "false")
+	_ = reviewCmd.Flags().Set("minor", "true")
+	_ = reviewCmd.Flags().Set("reason", "")
+	_ = reviewCmd.Flags().Set("message", "")
+	_ = reviewCmd.Flags().Set("comment", "")
+	_ = reviewCmd.Flags().Set("note", "")
+	_ = reviewCmd.Flags().Set("notes", "")
+	defer func() { _ = reviewCmd.Flags().Set("minor", "false") }()
+
+	if err := reviewCmd.RunE(reviewCmd, []string{issue.ID}); err != nil {
+		t.Fatalf("reviewCmd.RunE returned error: %v", err)
+	}
+
+	// --minor issues bypass review, so no auto-handoff should be created.
+	handoff, err := database.GetLatestHandoff(issue.ID)
+	if err != nil {
+		t.Fatalf("GetLatestHandoff failed: %v", err)
+	}
+	if handoff != nil {
+		t.Errorf("expected no auto-handoff for --minor issue, got %+v", handoff)
+	}
+}
+
+func TestSynthesizeHandoffFromLogsCap(t *testing.T) {
+	// Verify only the most recent maxAutoHandoffDone entries are kept.
+	var logs []models.Log
+	for i := 0; i < maxAutoHandoffDone+5; i++ {
+		logs = append(logs, models.Log{
+			Message: "did substantive thing " + string(rune('a'+i)),
+			Type:    models.LogTypeProgress,
+		})
+	}
+	done, _ := synthesizeHandoffFromLogs(logs)
+	if len(done) != maxAutoHandoffDone {
+		t.Errorf("expected Done capped at %d, got %d", maxAutoHandoffDone, len(done))
+	}
+	// Should keep the LAST entries (most recent).
+	last := logs[len(logs)-1].Message
+	if done[len(done)-1] != last {
+		t.Errorf("expected most recent log retained, got %q want %q", done[len(done)-1], last)
+	}
+}
+
 func TestReviewPreservesExistingHandoff(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1532,7 +1762,7 @@ func TestReviewPreservesExistingHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionID := "ses_test123"
 
@@ -1594,7 +1824,7 @@ func TestReviewWithWorkSessionTaggedIssue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	sessionID := "ses_test123"
 
@@ -1685,7 +1915,7 @@ func TestApproveAutoUnblocksDependents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Create blocker (in_review, ready to be approved)
 	blocker := &models.Issue{
@@ -1693,19 +1923,27 @@ func TestApproveAutoUnblocksDependents(t *testing.T) {
 		Status:             models.StatusInReview,
 		ImplementerSession: "ses_impl",
 	}
-	database.CreateIssue(blocker)
+	if err := database.CreateIssue(blocker); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create dependent (blocked, depends on blocker)
 	dependent := &models.Issue{
 		Title:  "Dependent",
 		Status: models.StatusBlocked,
 	}
-	database.CreateIssue(dependent)
-	database.AddDependency(dependent.ID, blocker.ID, "depends_on")
+	if err := database.CreateIssue(dependent); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDependency(dependent.ID, blocker.ID, "depends_on"); err != nil {
+		t.Fatal(err)
+	}
 
 	// Simulate approve: close the blocker then cascade unblock
 	blocker.Status = models.StatusClosed
-	database.UpdateIssue(blocker)
+	if err := database.UpdateIssue(blocker); err != nil {
+		t.Fatal(err)
+	}
 	database.CascadeUnblockDependents(blocker.ID, "ses_reviewer")
 
 	// Verify dependent is now open
@@ -1721,24 +1959,32 @@ func TestCloseAutoUnblocksDependents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	blocker := &models.Issue{
 		Title:  "Blocker",
 		Status: models.StatusOpen,
 	}
-	database.CreateIssue(blocker)
+	if err := database.CreateIssue(blocker); err != nil {
+		t.Fatal(err)
+	}
 
 	dependent := &models.Issue{
 		Title:  "Dependent",
 		Status: models.StatusBlocked,
 	}
-	database.CreateIssue(dependent)
-	database.AddDependency(dependent.ID, blocker.ID, "depends_on")
+	if err := database.CreateIssue(dependent); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDependency(dependent.ID, blocker.ID, "depends_on"); err != nil {
+		t.Fatal(err)
+	}
 
 	// Simulate close: set closed then cascade unblock
 	blocker.Status = models.StatusClosed
-	database.UpdateIssue(blocker)
+	if err := database.UpdateIssue(blocker); err != nil {
+		t.Fatal(err)
+	}
 	database.CascadeUnblockDependents(blocker.ID, "ses_closer")
 
 	updated, _ := database.GetIssue(dependent.ID)
@@ -1753,7 +1999,7 @@ func TestApproveAutoUnblockPartialDeps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	a1 := &models.Issue{
 		Title:              "A1",
@@ -1768,15 +2014,27 @@ func TestApproveAutoUnblockPartialDeps(t *testing.T) {
 		Title:  "Dependent",
 		Status: models.StatusBlocked,
 	}
-	database.CreateIssue(a1)
-	database.CreateIssue(a2)
-	database.CreateIssue(dependent)
-	database.AddDependency(dependent.ID, a1.ID, "depends_on")
-	database.AddDependency(dependent.ID, a2.ID, "depends_on")
+	if err := database.CreateIssue(a1); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateIssue(a2); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateIssue(dependent); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDependency(dependent.ID, a1.ID, "depends_on"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDependency(dependent.ID, a2.ID, "depends_on"); err != nil {
+		t.Fatal(err)
+	}
 
 	// Approve only A1
 	a1.Status = models.StatusClosed
-	database.UpdateIssue(a1)
+	if err := database.UpdateIssue(a1); err != nil {
+		t.Fatal(err)
+	}
 	database.CascadeUnblockDependents(a1.ID, "ses_reviewer")
 
 	// Dependent should still be blocked (A2 not closed)

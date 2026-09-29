@@ -24,6 +24,8 @@ Supported actions:
   - start: Reverts issue to open status
   - review: Reverts issue to in_progress status
   - approve/reject: Reverts issue to in_review status
+  - review_approve / review_changes_requested: Rolls back recorded review row
+  - close_after_review: Re-opens a delegated-close issue to in_review
 
 Use 'td undo --list' to see recent undoable actions.`,
 	GroupID: "system",
@@ -35,7 +37,7 @@ Use 'td undo --list' to see recent undoable actions.`,
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		// Run migrations to ensure action_log table exists
 		if _, err := database.RunMigrations(); err != nil {
@@ -93,10 +95,13 @@ Use 'td undo --list' to see recent undoable actions.`,
 			return err
 		}
 
-		// Mark action as undone
-		if err := database.MarkActionUndone(action.ID); err != nil {
-			output.Error("failed to mark action undone: %v", err)
-			return err
+		// Review-aware issue undo marks the action inside the same transaction
+		// as its review and issue restoration.
+		if !action.Undone {
+			if err := database.MarkActionUndone(action.ID); err != nil {
+				output.Error("failed to mark action undone: %v", err)
+				return err
+			}
 		}
 
 		fmt.Printf("UNDONE: %s %s %s\n", action.ActionType, action.EntityType, action.EntityID)
@@ -136,7 +141,8 @@ func undoIssueAction(database *db.DB, action *models.ActionLog, sessionID string
 		return database.RestoreIssueLogged(action.EntityID, sessionID)
 
 	case models.ActionUpdate, models.ActionStart, models.ActionReview,
-		models.ActionApprove, models.ActionReject, models.ActionBlock, models.ActionUnblock, models.ActionClose, models.ActionReopen:
+		models.ActionApprove, models.ActionReject, models.ActionBlock, models.ActionUnblock, models.ActionClose, models.ActionReopen,
+		models.ActionReviewApprove, models.ActionReviewChangesRequested, models.ActionCloseAfterReview:
 		// Restore previous state
 		if action.PreviousData == "" {
 			return fmt.Errorf("no previous data to restore")
@@ -145,8 +151,32 @@ func undoIssueAction(database *db.DB, action *models.ActionLog, sessionID string
 		if err := json.Unmarshal([]byte(action.PreviousData), &issue); err != nil {
 			return fmt.Errorf("failed to parse previous data: %w", err)
 		}
-		// Use logged variant to generate sync event
-		return database.UpdateIssueLogged(&issue, sessionID, models.ActionUpdate)
+		// For review-aware actions, NewData carries a ReviewUndoPayload with
+		// the created review id and any prior-active review id that was
+		// superseded. Roll those back before restoring the issue state so
+		// audit history stays consistent.
+		if action.NewData != "" {
+			var payload models.ReviewUndoPayload
+			if err := json.Unmarshal([]byte(action.NewData), &payload); err == nil {
+				if payload.CreatedReviewID != "" || payload.PriorActiveReviewID != "" {
+					if err := database.UndoReviewAwareIssueActionLogged(
+						action.ID,
+						&issue,
+						payload.CreatedReviewID,
+						payload.PriorActiveReviewID,
+						sessionID,
+					); err != nil {
+						return fmt.Errorf("undo review-aware issue action: %w", err)
+					}
+					action.Undone = true
+					return nil
+				}
+			}
+		}
+		// Use unconditional variant: undo intentionally restores an older
+		// snapshot regardless of what changed since, so it must not be
+		// rejected by the staleness guard UpdateIssueLogged applies.
+		return database.UpdateIssueLoggedUnconditional(&issue, sessionID, models.ActionUpdate)
 
 	default:
 		return fmt.Errorf("cannot undo action type: %s", action.ActionType)
@@ -341,7 +371,7 @@ var lastCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		// Run migrations to ensure action_log table exists
 		if _, err := database.RunMigrations(); err != nil {
@@ -364,6 +394,10 @@ var lastCmd = &cobra.Command{
 		if err != nil {
 			output.Error("failed to get actions: %v", err)
 			return err
+		}
+
+		if jsonMode(cmd) {
+			return output.JSON(jsonList(actions))
 		}
 
 		if len(actions) == 0 {

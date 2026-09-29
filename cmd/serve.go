@@ -62,7 +62,7 @@ func runHTTPServer(cmd *cobra.Command, browser bool) error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	// Limit connections for long-running server process
 	database.SetMaxOpenConns(1)
@@ -111,7 +111,7 @@ func runHTTPServer(cmd *cobra.Command, browser bool) error {
 	// Generate instance ID for port file
 	instanceID, err := serve.GenerateInstanceID()
 	if err != nil {
-		ln.Close()
+		_ = ln.Close()
 		return fmt.Errorf("generate instance id: %w", err)
 	}
 
@@ -123,7 +123,7 @@ func runHTTPServer(cmd *cobra.Command, browser bool) error {
 		InstanceID: instanceID,
 	}
 	if err := serve.WritePortFile(dir, portInfo); err != nil {
-		ln.Close()
+		_ = ln.Close()
 		return fmt.Errorf("write port file: %w", err)
 	}
 	defer func() {

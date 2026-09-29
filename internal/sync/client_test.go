@@ -20,9 +20,22 @@ CREATE TABLE issues (
     title TEXT,
     status TEXT,
     priority TEXT,
+    parent_id TEXT DEFAULT '',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     deleted_at DATETIME
+);
+CREATE TABLE work_sessions (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    worktree_id TEXT DEFAULT '',
+    worktree_root TEXT DEFAULT '',
+    repo_root TEXT DEFAULT '',
+    started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ended_at DATETIME,
+    start_sha TEXT DEFAULT '',
+    end_sha TEXT DEFAULT ''
 );
 CREATE TABLE action_log (
     id TEXT PRIMARY KEY,
@@ -48,7 +61,7 @@ func setupClientDB(t *testing.T) *sql.DB {
 	if _, err := db.Exec(clientTestSchema); err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
@@ -83,7 +96,7 @@ func TestGetPendingEvents_Basic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	events, err := GetPendingEvents(tx, "device1", "sync-sess")
 	if err != nil {
@@ -142,6 +155,28 @@ func TestGetPendingEvents_Basic(t *testing.T) {
 	}
 }
 
+func TestGetPendingEventsScrubsWorkSessionLocalMetadata(t *testing.T) {
+	db := setupClientDB(t)
+
+	insertActionLog(t, db, "al-00000001", "sess1", "create", "work_sessions", "ws-local",
+		`{"id":"ws-local","name":"Local","session_id":"sess1","worktree_id":"wt-local","worktree_root":"/tmp/local-worktree","repo_root":"/tmp/local-repo"}`,
+		`{"id":"ws-local","name":"Old","session_id":"sess1","worktree_id":"wt-old","worktree_root":"/tmp/old-worktree","repo_root":"/tmp/old-repo"}`,
+		0, "")
+
+	tx, _ := db.Begin()
+	defer func() { _ = tx.Rollback() }()
+
+	events, err := GetPendingEvents(tx, "device1", "sync-sess")
+	if err != nil {
+		t.Fatalf("GetPendingEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+
+	assertWrappedWorkSessionPayloadOmitsLocalFields(t, events[0].Payload)
+}
+
 func TestGetPendingEvents_SkipsUndone(t *testing.T) {
 	db := setupClientDB(t)
 
@@ -153,7 +188,7 @@ func TestGetPendingEvents_SkipsUndone(t *testing.T) {
 		`{"title":"Also keep"}`, `{"title":"Keep"}`, 0, "")
 
 	tx, _ := db.Begin()
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	events, err := GetPendingEvents(tx, "d1", "s1")
 	if err != nil {
@@ -176,7 +211,7 @@ func TestGetPendingEvents_SkipsSynced(t *testing.T) {
 		`{"title":"Pending"}`, `{}`, 0, "")
 
 	tx, _ := db.Begin()
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	events, err := GetPendingEvents(tx, "d1", "s1")
 	if err != nil {
@@ -225,7 +260,7 @@ func TestGetPendingEvents_ActionTypeMapping(t *testing.T) {
 	}
 
 	tx, _ := db.Begin()
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	events, err := GetPendingEvents(tx, "d1", "s1")
 	if err != nil {
@@ -260,7 +295,7 @@ func TestGetPendingEvents_EntityTypeNormalization(t *testing.T) {
 		`{"foo":"bar"}`, `{}`, 0, "")
 
 	tx, _ := db.Begin()
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	events, err := GetPendingEvents(tx, "d1", "s1")
 	if err != nil {
@@ -283,6 +318,143 @@ func TestGetPendingEvents_EntityTypeNormalization(t *testing.T) {
 	}
 	if events[4].EntityType != "issue_files" {
 		t.Errorf("file_link normalize: got %q, want issue_files", events[4].EntityType)
+	}
+}
+
+// --- GetPendingEventsPreserveSession ---------------------------------------
+
+func TestGetPendingEventsPreserveSession_PerRowSession(t *testing.T) {
+	db := setupClientDB(t)
+
+	insertActionLog(t, db, "al-00000001", "twu_alice", "create", "issues", "i1",
+		`{"title":"Alice","status":"open"}`, `{}`, 0, "")
+	insertActionLog(t, db, "al-00000002", "twu_bob", "create", "issues", "i2",
+		`{"title":"Bob","status":"open"}`, `{}`, 0, "")
+	insertActionLog(t, db, "al-00000003", "twa_carol_as_dave", "update", "issues", "i1",
+		`{"title":"Carol-as-Dave","status":"open"}`, `{"title":"Alice","status":"open"}`, 0, "")
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	events, err := GetPendingEventsPreserveSession(tx, "td_watch_server")
+	if err != nil {
+		t.Fatalf("GetPendingEventsPreserveSession: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("got %d events, want 3", len(events))
+	}
+
+	wantSessions := []string{"twu_alice", "twu_bob", "twa_carol_as_dave"}
+	for i, want := range wantSessions {
+		if events[i].SessionID != want {
+			t.Errorf("event[%d] session_id: got %q, want %q", i, events[i].SessionID, want)
+		}
+		if events[i].DeviceID != "td_watch_server" {
+			t.Errorf("event[%d] device_id: got %q, want td_watch_server", i, events[i].DeviceID)
+		}
+		if events[i].ClientActionID <= 0 {
+			t.Errorf("event[%d] ClientActionID should be positive rowid, got %d", i, events[i].ClientActionID)
+		}
+	}
+}
+
+func TestGetPendingEventsPreserveSession_SkipsSyncedAndUndone(t *testing.T) {
+	db := setupClientDB(t)
+
+	insertActionLog(t, db, "al-00000001", "twu_a", "create", "issues", "i1",
+		`{"title":"Synced"}`, `{}`, 0, "2025-01-01 00:00:00")
+	insertActionLog(t, db, "al-00000002", "twu_b", "create", "issues", "i2",
+		`{"title":"Undone"}`, `{}`, 1, "")
+	insertActionLog(t, db, "al-00000003", "twu_c", "create", "issues", "i3",
+		`{"title":"Pending"}`, `{}`, 0, "")
+
+	tx, _ := db.Begin()
+	defer func() { _ = tx.Rollback() }()
+
+	events, err := GetPendingEventsPreserveSession(tx, "td_watch_server")
+	if err != nil {
+		t.Fatalf("GetPendingEventsPreserveSession: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	if events[0].EntityID != "i3" || events[0].SessionID != "twu_c" {
+		t.Errorf("got entity=%q session=%q, want i3/twu_c", events[0].EntityID, events[0].SessionID)
+	}
+}
+
+func TestGetPendingEventsPreserveSession_PayloadShape(t *testing.T) {
+	db := setupClientDB(t)
+
+	insertActionLog(t, db, "al-00000001", "twu_a", "create", "issues", "i1",
+		`{"title":"Hello"}`, `{}`, 0, "")
+
+	tx, _ := db.Begin()
+	defer func() { _ = tx.Rollback() }()
+
+	events, err := GetPendingEventsPreserveSession(tx, "td_watch_server")
+	if err != nil {
+		t.Fatalf("GetPendingEventsPreserveSession: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	for _, k := range []string{"schema_version", "new_data", "previous_data"} {
+		if _, ok := payload[k]; !ok {
+			t.Errorf("payload missing %q", k)
+		}
+	}
+}
+
+func TestGetPendingEventsPreserveSessionScrubsWorkSessionLocalMetadata(t *testing.T) {
+	db := setupClientDB(t)
+
+	insertActionLog(t, db, "al-00000001", "twu_a", "create", "work_sessions", "ws-local",
+		`{"id":"ws-local","name":"Local","session_id":"twu_a","worktree_id":"wt-local","worktree_root":"/tmp/local-worktree","repo_root":"/tmp/local-repo"}`,
+		`{"id":"ws-local","name":"Old","session_id":"twu_a","worktree_id":"wt-old","worktree_root":"/tmp/old-worktree","repo_root":"/tmp/old-repo"}`,
+		0, "")
+
+	tx, _ := db.Begin()
+	defer func() { _ = tx.Rollback() }()
+
+	events, err := GetPendingEventsPreserveSession(tx, "td_watch_server")
+	if err != nil {
+		t.Fatalf("GetPendingEventsPreserveSession: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+
+	assertWrappedWorkSessionPayloadOmitsLocalFields(t, events[0].Payload)
+}
+
+func assertWrappedWorkSessionPayloadOmitsLocalFields(t *testing.T, raw json.RawMessage) {
+	t.Helper()
+
+	var wrapper struct {
+		NewData      map[string]any `json:"new_data"`
+		PreviousData map[string]any `json:"previous_data"`
+	}
+	if err := json.Unmarshal(raw, &wrapper); err != nil {
+		t.Fatalf("unmarshal wrapped payload: %v", err)
+	}
+	for label, fields := range map[string]map[string]any{
+		"new_data":      wrapper.NewData,
+		"previous_data": wrapper.PreviousData,
+	} {
+		for _, key := range []string{"worktree_id", "worktree_root", "repo_root"} {
+			if _, ok := fields[key]; ok {
+				t.Fatalf("%s leaked %s in %v", label, key, fields)
+			}
+		}
 	}
 }
 
@@ -318,7 +490,9 @@ func TestApplyRemoteEvents_Basic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyRemoteEvents: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if result.Applied != 3 {
 		t.Fatalf("Applied: got %d, want 3", result.Applied)
@@ -344,6 +518,154 @@ func TestApplyRemoteEvents_Basic(t *testing.T) {
 	}
 	if title != "Second" || status != "open" {
 		t.Errorf("i2: title=%q status=%q", title, status)
+	}
+}
+
+func TestApplyRemoteEventsScrubsWorkSessionLocalMetadata(t *testing.T) {
+	db := setupClientDB(t)
+
+	events := []Event{
+		{
+			ServerSeq:  1,
+			ActionType: "create",
+			EntityType: "work_sessions",
+			EntityID:   "ws-remote",
+			Payload: []byte(`{
+				"schema_version": 1,
+				"new_data": {
+					"id": "ws-remote",
+					"name": "Remote work session",
+					"session_id": "ses-remote",
+					"worktree_id": "wt-remote",
+					"worktree_root": "/tmp/remote-worktree",
+					"repo_root": "/tmp/remote-repo",
+					"start_sha": "abc123"
+				},
+				"previous_data": {}
+			}`),
+		},
+	}
+
+	tx, _ := db.Begin()
+	result, err := ApplyRemoteEvents(tx, events, "my-device", testValidator, nil)
+	if err != nil {
+		t.Fatalf("ApplyRemoteEvents: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	if result.Applied != 1 {
+		t.Fatalf("Applied: got %d, want 1", result.Applied)
+	}
+
+	var worktreeID, worktreeRoot, repoRoot string
+	if err := db.QueryRow(`
+		SELECT worktree_id, worktree_root, repo_root FROM work_sessions WHERE id = ?
+	`, "ws-remote").Scan(&worktreeID, &worktreeRoot, &repoRoot); err != nil {
+		t.Fatalf("read work_session: %v", err)
+	}
+	if worktreeID != "" || worktreeRoot != "" || repoRoot != "" {
+		t.Fatalf("remote metadata populated local fields: id=%q root=%q repo=%q", worktreeID, worktreeRoot, repoRoot)
+	}
+}
+
+func TestApplyRemoteEventsScrubsWorkSessionConflictData(t *testing.T) {
+	db := setupClientDB(t)
+
+	_, err := db.Exec(`
+		INSERT INTO work_sessions (id, name, session_id, worktree_id, worktree_root, repo_root, start_sha)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, "ws-conflict", "Local work session", "ses-local", "wt-local", "/tmp/local-worktree", "/tmp/local-repo", "local-sha")
+	if err != nil {
+		t.Fatalf("seed work_session: %v", err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"new_data": map[string]any{
+			"id":            "ws-conflict",
+			"name":          "Remote work session",
+			"session_id":    "ses-remote",
+			"worktree_id":   "wt-remote",
+			"worktree_root": "/tmp/remote-worktree",
+			"repo_root":     "/tmp/remote-repo",
+			"start_sha":     "remote-sha",
+		},
+		"previous_data": map[string]any{
+			"id":            "ws-conflict",
+			"name":          "Old remote work session",
+			"session_id":    "ses-remote",
+			"worktree_id":   "wt-old",
+			"worktree_root": "/tmp/old-worktree",
+			"repo_root":     "/tmp/old-repo",
+			"start_sha":     "old-sha",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	events := []Event{{
+		ServerSeq:  88,
+		DeviceID:   "other-device",
+		ActionType: "create",
+		EntityType: "work_sessions",
+		EntityID:   "ws-conflict",
+		Payload:    payload,
+	}}
+
+	tx := beginTx(t, db)
+	result, err := ApplyRemoteEvents(tx, events, "my-device", testValidator, &farPast)
+	if err != nil {
+		t.Fatalf("ApplyRemoteEvents: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	if result.Overwrites != 1 {
+		t.Fatalf("Overwrites=%d, want 1", result.Overwrites)
+	}
+	if len(result.Conflicts) != 1 {
+		t.Fatalf("Conflicts=%d, want 1", len(result.Conflicts))
+	}
+
+	c := result.Conflicts[0]
+	var remote map[string]any
+	if err := json.Unmarshal(c.RemoteData, &remote); err != nil {
+		t.Fatalf("unmarshal RemoteData: %v", err)
+	}
+	for _, key := range []string{"worktree_id", "worktree_root", "repo_root"} {
+		if _, ok := remote[key]; ok {
+			t.Fatalf("RemoteData leaked %s: %s", key, c.RemoteData)
+		}
+	}
+	if remote["name"] != "Remote work session" {
+		t.Fatalf("RemoteData name=%v, want Remote work session", remote["name"])
+	}
+
+	var local map[string]any
+	if err := json.Unmarshal(c.LocalData, &local); err != nil {
+		t.Fatalf("unmarshal LocalData: %v", err)
+	}
+	for _, key := range []string{"worktree_id", "worktree_root", "repo_root"} {
+		if _, ok := local[key]; ok {
+			t.Fatalf("LocalData leaked %s: %s", key, c.LocalData)
+		}
+	}
+	if local["name"] != "Local work session" {
+		t.Fatalf("LocalData name=%v, want Local work session", local["name"])
+	}
+
+	var worktreeID, worktreeRoot, repoRoot string
+	if err := db.QueryRow(`
+		SELECT worktree_id, worktree_root, repo_root FROM work_sessions WHERE id = ?
+	`, "ws-conflict").Scan(&worktreeID, &worktreeRoot, &repoRoot); err != nil {
+		t.Fatalf("read work_session: %v", err)
+	}
+	if worktreeID != "" || worktreeRoot != "" || repoRoot != "" {
+		t.Fatalf("remote metadata populated local fields: id=%q root=%q repo=%q", worktreeID, worktreeRoot, repoRoot)
 	}
 }
 
@@ -379,7 +701,9 @@ func TestApplyRemoteEvents_PartialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyRemoteEvents: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if result.Applied != 2 {
 		t.Fatalf("Applied: got %d, want 2", result.Applied)
@@ -396,7 +720,9 @@ func TestApplyRemoteEvents_PartialFailure(t *testing.T) {
 
 	// Verify good entities exist
 	var count int
-	db.QueryRow("SELECT COUNT(*) FROM issues").Scan(&count)
+	if err := db.QueryRow("SELECT COUNT(*) FROM issues").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
 	if count != 2 {
 		t.Fatalf("issues count: got %d, want 2", count)
 	}
@@ -411,7 +737,9 @@ func TestApplyRemoteEvents_ConflictTracking(t *testing.T) {
 	if _, err := upsertEntity(tx, "issues", "i1", p1); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Apply remote event that overwrites
 	remotePayload, _ := json.Marshal(map[string]any{
@@ -432,7 +760,9 @@ func TestApplyRemoteEvents_ConflictTracking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if result.Overwrites != 1 {
 		t.Fatalf("expected 1 overwrite, got %d", result.Overwrites)
@@ -479,7 +809,9 @@ func TestApplyRemoteEvents_MultipleOverwritesProduceConflicts(t *testing.T) {
 	if _, err := upsertEntity(tx, "issues", "i2", p2); err != nil {
 		t.Fatalf("seed i2: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Apply batch of remote events that overwrite both
 	makePayload := func(title, status string) []byte {
@@ -500,7 +832,9 @@ func TestApplyRemoteEvents_MultipleOverwritesProduceConflicts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if result.Applied != 2 {
 		t.Fatalf("Applied=%d, want 2", result.Applied)
@@ -534,7 +868,9 @@ func TestApplyRemoteEvents_DeleteDoesNotProduceConflict(t *testing.T) {
 	if _, err := upsertEntity(tx, "issues", "i1", p); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Apply a delete event from remote
 	deletePayload, _ := json.Marshal(map[string]any{
@@ -550,7 +886,9 @@ func TestApplyRemoteEvents_DeleteDoesNotProduceConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if result.Applied != 1 {
 		t.Fatalf("Applied=%d, want 1", result.Applied)
@@ -564,7 +902,9 @@ func TestApplyRemoteEvents_DeleteDoesNotProduceConflict(t *testing.T) {
 
 	// Verify row is actually deleted
 	var count int
-	db.QueryRow("SELECT COUNT(*) FROM issues WHERE id = ?", "i1").Scan(&count)
+	if err := db.QueryRow("SELECT COUNT(*) FROM issues WHERE id = ?", "i1").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
 	if count != 0 {
 		t.Fatal("row should be deleted")
 	}
@@ -583,7 +923,9 @@ func TestApplyRemoteEvents_ConflictDataCorrectness(t *testing.T) {
 	if _, err := upsertEntity(tx, "issues", "i1", localFields); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Remote overwrites with different data
 	remoteFields := map[string]any{
@@ -605,7 +947,9 @@ func TestApplyRemoteEvents_ConflictDataCorrectness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if len(result.Conflicts) != 1 {
 		t.Fatalf("expected 1 conflict, got %d", len(result.Conflicts))
@@ -660,7 +1004,9 @@ func TestApplyRemoteEvents_NoConflictWhenUnchangedSinceSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	// lastSyncAt is AFTER the local row's updated_at → no conflict expected
 	syncTime := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
@@ -679,7 +1025,9 @@ func TestApplyRemoteEvents_NoConflictWhenUnchangedSinceSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if result.Applied != 1 {
 		t.Fatalf("Applied=%d, want 1", result.Applied)
@@ -703,7 +1051,9 @@ func TestApplyRemoteEvents_ConflictWhenModifiedAfterSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	// lastSyncAt is BEFORE the local row's updated_at → conflict expected
 	syncTime := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
@@ -722,13 +1072,67 @@ func TestApplyRemoteEvents_ConflictWhenModifiedAfterSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if result.Overwrites != 1 {
 		t.Fatalf("Overwrites=%d, want 1 (local was modified after sync)", result.Overwrites)
 	}
 	if len(result.Conflicts) != 1 {
 		t.Fatalf("Conflicts=%d, want 1", len(result.Conflicts))
+	}
+}
+
+// A sync pulls back the client's own just-pushed events. Replaying them must
+// not register as a conflict even when the local row was modified after the
+// last sync, because a self-authored event (ev.DeviceID == myDeviceID) is a
+// replay of the client's own intent, not a concurrent edit from another device.
+func TestApplyRemoteEvents_NoConflictWhenSelfAuthored(t *testing.T) {
+	db := setupClientDB(t)
+
+	// Create a local row with updated_at AFTER lastSyncAt — the same setup that
+	// produces a conflict in TestApplyRemoteEvents_ConflictWhenModifiedAfterSync.
+	tx := beginTx(t, db)
+	recentTime := "2025-07-01T00:00:00Z"
+	_, err := tx.Exec(`INSERT INTO issues (id, title, status, updated_at) VALUES (?, ?, ?, ?)`,
+		"i1", "modified-locally", "open", recentTime)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	syncTime := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	remotePayload, _ := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"new_data":       map[string]any{"title": "remote", "status": "closed"},
+	})
+	// DeviceID matches myDeviceID below → self-authored replay, no conflict.
+	events := []Event{{
+		ServerSeq: 1, DeviceID: "my-device", ActionType: "update",
+		EntityType: "issues", EntityID: "i1", Payload: remotePayload,
+	}}
+
+	tx = beginTx(t, db)
+	result, err := ApplyRemoteEvents(tx, events, "my-device", testValidator, &syncTime)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Applied != 1 {
+		t.Fatalf("Applied=%d, want 1", result.Applied)
+	}
+	if result.Overwrites != 0 {
+		t.Fatalf("Overwrites=%d, want 0 (self-authored replay is not a conflict)", result.Overwrites)
+	}
+	if len(result.Conflicts) != 0 {
+		t.Fatalf("Conflicts=%d, want 0 (self-authored replay is not a conflict)", len(result.Conflicts))
 	}
 }
 
@@ -741,7 +1145,9 @@ func TestApplyRemoteEvents_NilLastSyncAtSkipsConflicts(t *testing.T) {
 	if _, err := upsertEntity(tx, "issues", "i1", p); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Apply remote overwrite with nil lastSyncAt (bootstrap scenario)
 	remotePayload, _ := json.Marshal(map[string]any{
@@ -758,7 +1164,9 @@ func TestApplyRemoteEvents_NilLastSyncAtSkipsConflicts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if result.Overwrites != 0 {
 		t.Fatalf("Overwrites=%d, want 0 (nil lastSyncAt = no conflicts)", result.Overwrites)
@@ -777,8 +1185,12 @@ func TestMarkEventsSynced(t *testing.T) {
 
 	// Get rowids for first two rows
 	var rowid1, rowid2 int64
-	db.QueryRow("SELECT rowid FROM action_log WHERE id = ?", "al-00000001").Scan(&rowid1)
-	db.QueryRow("SELECT rowid FROM action_log WHERE id = ?", "al-00000002").Scan(&rowid2)
+	if err := db.QueryRow("SELECT rowid FROM action_log WHERE id = ?", "al-00000001").Scan(&rowid1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT rowid FROM action_log WHERE id = ?", "al-00000002").Scan(&rowid2); err != nil {
+		t.Fatal(err)
+	}
 
 	acks := []Ack{
 		{ClientActionID: rowid1, ServerSeq: 100},
@@ -789,13 +1201,17 @@ func TestMarkEventsSynced(t *testing.T) {
 	if err := MarkEventsSynced(tx, acks); err != nil {
 		t.Fatalf("MarkEventsSynced: %v", err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Verify synced rows
 	var syncedAt sql.NullString
 	var serverSeq sql.NullInt64
 
-	db.QueryRow("SELECT synced_at, server_seq FROM action_log WHERE id = ?", "al-00000001").Scan(&syncedAt, &serverSeq)
+	if err := db.QueryRow("SELECT synced_at, server_seq FROM action_log WHERE id = ?", "al-00000001").Scan(&syncedAt, &serverSeq); err != nil {
+		t.Fatal(err)
+	}
 	if !syncedAt.Valid {
 		t.Error("al-00000001: synced_at should be set")
 	}
@@ -803,7 +1219,9 @@ func TestMarkEventsSynced(t *testing.T) {
 		t.Errorf("al-00000001: server_seq got %v, want 100", serverSeq)
 	}
 
-	db.QueryRow("SELECT synced_at, server_seq FROM action_log WHERE id = ?", "al-00000002").Scan(&syncedAt, &serverSeq)
+	if err := db.QueryRow("SELECT synced_at, server_seq FROM action_log WHERE id = ?", "al-00000002").Scan(&syncedAt, &serverSeq); err != nil {
+		t.Fatal(err)
+	}
 	if !syncedAt.Valid {
 		t.Error("al-00000002: synced_at should be set")
 	}
@@ -812,7 +1230,9 @@ func TestMarkEventsSynced(t *testing.T) {
 	}
 
 	// Verify unsynced row
-	db.QueryRow("SELECT synced_at, server_seq FROM action_log WHERE id = ?", "al-00000003").Scan(&syncedAt, &serverSeq)
+	if err := db.QueryRow("SELECT synced_at, server_seq FROM action_log WHERE id = ?", "al-00000003").Scan(&syncedAt, &serverSeq); err != nil {
+		t.Fatal(err)
+	}
 	if syncedAt.Valid {
 		t.Error("al-00000003: synced_at should NOT be set")
 	}
@@ -822,7 +1242,7 @@ func TestMarkEventsSynced(t *testing.T) {
 
 	// Verify GetPendingEvents now only returns the unsynced one
 	tx, _ = db.Begin()
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	events, err := GetPendingEvents(tx, "d1", "s1")
 	if err != nil {
 		t.Fatalf("GetPendingEvents: %v", err)
@@ -853,7 +1273,7 @@ func TestGetPendingEvents_NullID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	events, err := GetPendingEvents(tx, "device1", "sync-sess")
 	if err != nil {
@@ -890,7 +1310,7 @@ func TestGetPendingEvents_RealActionTypesIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	events, err := GetPendingEvents(tx, "device-int", "sess-int")
 	if err != nil {

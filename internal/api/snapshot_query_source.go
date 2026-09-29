@@ -27,24 +27,28 @@ var _ query.QuerySource = (*SnapshotQuerySource)(nil)
 
 // issueColumns is the SELECT column list matching the scan order used throughout.
 const issueColumns = `id, title, description, status, type, priority, points, labels, parent_id, acceptance, sprint,
-       implementer_session, creator_session, reviewer_session, created_at, updated_at, closed_at, deleted_at, minor, created_branch,
+       implementer_session, creator_session, reviewer_session, review_requested_by_session, closed_by_session,
+       created_at, updated_at, reviewed_at, closed_at, deleted_at, minor, created_branch,
        defer_until, due_date, defer_count`
 
 // scanIssue scans a single issue row using the standard column order.
 func scanIssue(scanner interface{ Scan(dest ...any) error }) (models.Issue, error) {
 	var issue models.Issue
-	var labels string
-	var closedAt, deletedAt sql.NullTime
+	// NullString for every TEXT DEFAULT '' column — see internal/db/issues.go GetIssue.
+	var description, labels sql.NullString
+	var closedAt, deletedAt, reviewedAt sql.NullTime
 	var parentID, acceptance, sprint sql.NullString
 	var implSession, creatorSession, reviewerSession sql.NullString
+	var reviewRequestedBy, closedBy sql.NullString
 	var createdBranch sql.NullString
 	var pointsNull sql.NullInt64
 	var deferUntil, dueDate sql.NullString
 
 	err := scanner.Scan(
-		&issue.ID, &issue.Title, &issue.Description, &issue.Status, &issue.Type, &issue.Priority,
+		&issue.ID, &issue.Title, &description, &issue.Status, &issue.Type, &issue.Priority,
 		&pointsNull, &labels, &parentID, &acceptance, &sprint,
-		&implSession, &creatorSession, &reviewerSession, &issue.CreatedAt, &issue.UpdatedAt, &closedAt, &deletedAt, &issue.Minor, &createdBranch,
+		&implSession, &creatorSession, &reviewerSession, &reviewRequestedBy, &closedBy,
+		&issue.CreatedAt, &issue.UpdatedAt, &reviewedAt, &closedAt, &deletedAt, &issue.Minor, &createdBranch,
 		&deferUntil, &dueDate, &issue.DeferCount,
 	)
 	if err != nil {
@@ -52,8 +56,12 @@ func scanIssue(scanner interface{ Scan(dest ...any) error }) (models.Issue, erro
 	}
 
 	issue.Points = int(pointsNull.Int64)
-	if labels != "" {
-		issue.Labels = strings.Split(labels, ",")
+	issue.Description = description.String
+	if labels.Valid && labels.String != "" {
+		issue.Labels = strings.Split(labels.String, ",")
+	}
+	if reviewedAt.Valid {
+		issue.ReviewedAt = &reviewedAt.Time
 	}
 	if closedAt.Valid {
 		issue.ClosedAt = &closedAt.Time
@@ -67,6 +75,8 @@ func scanIssue(scanner interface{ Scan(dest ...any) error }) (models.Issue, erro
 	issue.ImplementerSession = implSession.String
 	issue.CreatorSession = creatorSession.String
 	issue.ReviewerSession = reviewerSession.String
+	issue.ReviewRequestedBySession = reviewRequestedBy.String
+	issue.ClosedBySession = closedBy.String
 	issue.CreatedBranch = createdBranch.String
 	if deferUntil.Valid {
 		issue.DeferUntil = &deferUntil.String
@@ -163,9 +173,34 @@ func (s *SnapshotQuerySource) ListIssues(opts db.ListIssuesOptions) ([]models.Is
 		args = append(args, opts.Reviewer)
 	}
 
-	// ReviewableBy filter
+	// ReviewableBy filter — delegated through the shared mode-aware composer
+	// so snapshot-backed reads return the same issues as the live DB path.
 	if opts.ReviewableBy != "" {
-		fragment, fargs := db.ReviewableByFilter(opts.ReviewableBy, opts.BalancedReviewPolicy)
+		mode := opts.ReviewPolicyMode
+		if mode == "" {
+			if opts.BalancedReviewPolicy {
+				mode = "balanced"
+			} else {
+				mode = "strict"
+			}
+		}
+		fragment, fargs := db.ReviewableByFilterForMode(opts.ReviewableBy, mode)
+		q += fragment
+		args = append(args, fargs...)
+	}
+
+	// ReadyToCloseBy filter — Step-2 entry point; under strict/balanced the
+	// composer returns `0=1` so this is effectively a no-op today.
+	if opts.ReadyToCloseBy != "" {
+		mode := opts.ReviewPolicyMode
+		if mode == "" {
+			if opts.BalancedReviewPolicy {
+				mode = "balanced"
+			} else {
+				mode = "strict"
+			}
+		}
+		fragment, fargs := db.ReadyToCloseByFilter(opts.ReadyToCloseBy, mode)
 		q += fragment
 		args = append(args, fargs...)
 	}
@@ -256,7 +291,7 @@ func (s *SnapshotQuerySource) ListIssues(opts db.ListIssuesOptions) ([]models.Is
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var issues []models.Issue
 	for rows.Next() {
@@ -305,7 +340,7 @@ func (s *SnapshotQuerySource) GetLogs(issueID string, limit int) ([]models.Log, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var logs []models.Log
 	for rows.Next() {
@@ -333,7 +368,7 @@ func (s *SnapshotQuerySource) GetComments(issueID string) ([]models.Comment, err
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var comments []models.Comment
 	for rows.Next() {
@@ -391,7 +426,7 @@ func (s *SnapshotQuerySource) GetLinkedFiles(issueID string) ([]models.IssueFile
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var files []models.IssueFile
 	for rows.Next() {
@@ -412,7 +447,7 @@ func (s *SnapshotQuerySource) GetDependencies(issueID string) ([]string, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var deps []string
 	for rows.Next() {
@@ -445,7 +480,7 @@ func (s *SnapshotQuerySource) GetRejectedInProgressIssueIDs() (map[string]bool, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make(map[string]bool)
 	for rows.Next() {
@@ -471,7 +506,7 @@ func (s *SnapshotQuerySource) GetIssuesWithOpenDeps() (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make(map[string]bool)
 	for rows.Next() {
@@ -508,13 +543,13 @@ func (s *SnapshotQuerySource) getDescendants(parentID string) ([]string, error) 
 		for rows.Next() {
 			var childID string
 			if err := rows.Scan(&childID); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, err
 			}
 			children = append(children, childID)
 			descendants = append(descendants, childID)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		queue = append(queue, children...)
 	}

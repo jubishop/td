@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/workflow"
 )
@@ -26,13 +26,13 @@ func (m Model) openNewIssueForm() (tea.Model, tea.Cmd) {
 	}
 
 	// Create form state
-	m.FormState = NewFormState(FormModeCreate, parentID)
+	m.FormState = newFormStateWithTheme(FormModeCreate, parentID, m.themeOrDefault())
 	m.FormOpen = true
 	m.FormScrollOffset = 0
 
 	// Set form width for text wrapping (subtract modal horizontal padding)
 	modalWidth, _ := m.formModalDimensions()
-	formWidth := modalWidth - 4
+	formWidth := modalInnerWidth(modalWidth)
 	m.FormState.Width = formWidth
 	m.FormState.Form.WithWidth(formWidth)
 
@@ -61,7 +61,7 @@ func (m Model) openEditIssueForm() (tea.Model, tea.Cmd) {
 	}
 
 	// Create form state with issue data
-	m.FormState = NewFormStateForEdit(issue)
+	m.FormState = newFormStateForEditWithTheme(issue, m.themeOrDefault())
 	m.FormOpen = true
 	m.FormScrollOffset = 0
 
@@ -74,7 +74,7 @@ func (m Model) openEditIssueForm() (tea.Model, tea.Cmd) {
 
 	// Set form width for text wrapping (subtract modal horizontal padding)
 	modalWidth, _ := m.formModalDimensions()
-	formWidth := modalWidth - 4
+	formWidth := modalInnerWidth(modalWidth)
 	m.FormState.Width = formWidth
 	m.FormState.Form.WithWidth(formWidth)
 
@@ -99,7 +99,8 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 	issue := m.FormState.ToIssue()
 	deps := m.FormState.GetDependencies()
 
-	if m.FormState.Mode == FormModeCreate {
+	switch m.FormState.Mode {
+	case FormModeCreate:
 		// Create new issue with all fields
 		issue.Status = models.StatusOpen
 		if err := m.DB.CreateIssueLogged(issue, m.SessionID); err != nil {
@@ -113,6 +114,7 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 				_ = m.DB.AddDependencyLogged(issue.ID, depID, "depends_on", m.SessionID)
 			}
 		}
+		m.wakeSync()
 
 		m.closeForm()
 		if m.TaskListMode == TaskListModeBoard && m.BoardMode.Board != nil {
@@ -120,7 +122,7 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 		}
 		return m, m.fetchData()
 
-	} else if m.FormState.Mode == FormModeEdit {
+	case FormModeEdit:
 		// Update existing issue
 		existingIssue, err := m.DB.GetIssue(m.FormState.IssueID)
 		if err != nil || existingIssue == nil {
@@ -227,6 +229,7 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 				_ = m.DB.RecordSessionAction(existingIssue.ID, m.SessionID, sessionAction)
 			}
 		}
+		m.wakeSync()
 
 		m.closeForm()
 
@@ -278,15 +281,15 @@ func (m Model) openExternalEditor() (tea.Model, tea.Cmd) {
 	// Write current description content to temp file
 	content := m.FormState.Description
 	if _, err := tmpFile.WriteString(content); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpFile.Name())
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
 		m.StatusMessage = "Failed to write temp file: " + err.Error()
 		m.StatusIsError = true
 		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 			return ClearStatusMsg{}
 		})
 	}
-	tmpFile.Close()
+	_ = tmpFile.Close()
 
 	tmpPath := tmpFile.Name()
 
@@ -297,7 +300,7 @@ func (m Model) openExternalEditor() (tea.Model, tea.Cmd) {
 	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
 		// Read content from temp file
 		data, readErr := os.ReadFile(tmpPath)
-		os.Remove(tmpPath) // Clean up temp file
+		_ = os.Remove(tmpPath) // Clean up temp file
 
 		if err != nil {
 			return EditorFinishedMsg{
@@ -394,14 +397,14 @@ func (m Model) formScrollForFocusedField() int {
 
 	// Build full inner content (mirrors renderFormModal)
 	modalWidth, _ := m.formModalDimensions()
-	formWidth := modalWidth - 4
+	formWidth := modalInnerWidth(modalWidth)
 	if formWidth > 0 {
 		m.FormState.Form.WithWidth(formWidth)
 	}
 
 	submitFocused := m.FormState.ButtonFocus == formButtonFocusSubmit
 	cancelFocused := m.FormState.ButtonFocus == formButtonFocusCancel
-	buttons := renderButtonPair("Submit", "Cancel", submitFocused, cancelFocused, false, false, false, false)
+	buttons := m.renderButtonPair("Submit", "Cancel", submitFocused, cancelFocused, false, false, false, false)
 	inner := lipgloss.JoinVertical(lipgloss.Left, formView, "", buttons)
 
 	allLines := strings.Split(inner, "\n")
@@ -507,13 +510,13 @@ func (m Model) formScrollToBottom() int {
 	}
 
 	modalWidth, _ := m.formModalDimensions()
-	formWidth := modalWidth - 4
+	formWidth := modalInnerWidth(modalWidth)
 	if formWidth > 0 {
 		m.FormState.Form.WithWidth(formWidth)
 	}
 
 	formView := m.FormState.Form.View()
-	buttons := renderButtonPair("Submit", "Cancel", true, false, false, false, false, false)
+	buttons := m.renderButtonPair("Submit", "Cancel", true, false, false, false, false, false)
 	inner := lipgloss.JoinVertical(lipgloss.Left, formView, "", buttons)
 
 	allLines := strings.Split(inner, "\n")

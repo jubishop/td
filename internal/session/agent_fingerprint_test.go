@@ -78,7 +78,7 @@ func TestGetAgentFingerprintWithExplicitOverride(t *testing.T) {
 
 func TestGetAgentFingerprintWithCursorEnv(t *testing.T) {
 	// Clear explicit override
-	os.Unsetenv("TD_SESSION_ID")
+	_ = os.Unsetenv("TD_SESSION_ID")
 	// Set Cursor agent env var
 	t.Setenv("CURSOR_AGENT", "1")
 
@@ -95,8 +95,8 @@ func TestGetAgentFingerprintWithCursorEnv(t *testing.T) {
 
 func TestGetAgentFingerprintFallback(t *testing.T) {
 	// Clear all agent-related env vars
-	os.Unsetenv("TD_SESSION_ID")
-	os.Unsetenv("CURSOR_AGENT")
+	_ = os.Unsetenv("TD_SESSION_ID")
+	_ = os.Unsetenv("CURSOR_AGENT")
 
 	fp := GetAgentFingerprint()
 
@@ -141,7 +141,7 @@ func TestGetTerminalSessionID(t *testing.T) {
 		"KONSOLE_DBUS_SESSION",
 		"GNOME_TERMINAL_SCREEN",
 	} {
-		os.Unsetenv(env)
+		_ = os.Unsetenv(env)
 	}
 
 	// Should return empty when no terminal vars set
@@ -212,8 +212,8 @@ func TestExplicitIDOverridesAutoDetection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Clear all env vars first
-			os.Unsetenv("TD_SESSION_ID")
-			os.Unsetenv("CURSOR_AGENT")
+			_ = os.Unsetenv("TD_SESSION_ID")
+			_ = os.Unsetenv("CURSOR_AGENT")
 
 			// Set explicit ID
 			t.Setenv("TD_SESSION_ID", tt.sessionID)
@@ -241,9 +241,9 @@ func TestExplicitIDOverridesAutoDetection(t *testing.T) {
 // TestMultipleExplicitIDValues verifies different fingerprints with different ExplicitIDs
 func TestMultipleExplicitIDValues(t *testing.T) {
 	tests := []struct {
-		name       string
-		sessionID1 string
-		sessionID2 string
+		name         string
+		sessionID1   string
+		sessionID2   string
 		shouldDiffer bool
 	}{
 		{
@@ -290,11 +290,11 @@ func TestMultipleExplicitIDValues(t *testing.T) {
 // TestEmptyVsPopulatedExplicitID verifies behavior with empty vs populated ExplicitID
 func TestEmptyVsPopulatedExplicitID(t *testing.T) {
 	tests := []struct {
-		name          string
-		explicit      string
-		explicitType  AgentType
-		pid           int
-		expectedStr   string
+		name         string
+		explicit     string
+		explicitType AgentType
+		pid          int
+		expectedStr  string
 	}{
 		{
 			name:         "empty ExplicitID falls back to PID format",
@@ -344,10 +344,10 @@ func TestEmptyVsPopulatedExplicitID(t *testing.T) {
 // TestExplicitIDWithSpecialCharacters verifies sanitization of special characters
 func TestExplicitIDWithSpecialCharacters(t *testing.T) {
 	tests := []struct {
-		name         string
-		sessionID    string
-		expectedStr  string
-		description  string
+		name        string
+		sessionID   string
+		expectedStr string
+		description string
 	}{
 		{
 			name:        "slashes converted to underscores",
@@ -486,21 +486,21 @@ func TestExplicitIDTruncation(t *testing.T) {
 		description string
 	}{
 		{
-			name:      "very long ID without special chars",
-			sessionID: "abcdefghijklmnopqrstuvwxyz0123456789",
-			maxLen:    32,
+			name:        "very long ID without special chars",
+			sessionID:   "abcdefghijklmnopqrstuvwxyz0123456789",
+			maxLen:      32,
 			description: "long alphanumeric",
 		},
 		{
-			name:      "very long ID with special chars",
-			sessionID: "session-with-very-long-name-containing-special-chars-!@#$%^&*()",
-			maxLen:    32,
+			name:        "very long ID with special chars",
+			sessionID:   "session-with-very-long-name-containing-special-chars-!@#$%^&*()",
+			maxLen:      32,
 			description: "long with special chars",
 		},
 		{
-			name:      "UUID-like long ID",
-			sessionID: "550e8400-e29b-41d4-a716-446655440000-extra-long-suffix",
-			maxLen:    32,
+			name:        "UUID-like long ID",
+			sessionID:   "550e8400-e29b-41d4-a716-446655440000-extra-long-suffix",
+			maxLen:      32,
 			description: "long UUID",
 		},
 	}
@@ -529,26 +529,26 @@ func TestExplicitIDTruncation(t *testing.T) {
 // TestExplicitIDEnvironmentVarPriority verifies TD_SESSION_ID env var handling
 func TestExplicitIDEnvironmentVarPriority(t *testing.T) {
 	tests := []struct {
-		name              string
-		sessionID         string
+		name               string
+		sessionID          string
 		shouldHaveExplicit bool
 	}{
 		{
-			name:              "non-empty TD_SESSION_ID is used",
-			sessionID:         "env-session-id",
+			name:               "non-empty TD_SESSION_ID is used",
+			sessionID:          "env-session-id",
 			shouldHaveExplicit: true,
 		},
 		{
-			name:              "whitespace-only TD_SESSION_ID treated as empty",
-			sessionID:         "   ",
+			name:               "whitespace-only TD_SESSION_ID treated as empty",
+			sessionID:          "   ",
 			shouldHaveExplicit: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			os.Unsetenv("TD_SESSION_ID")
-			os.Unsetenv("CURSOR_AGENT")
+			_ = os.Unsetenv("TD_SESSION_ID")
+			_ = os.Unsetenv("CURSOR_AGENT")
 
 			if tt.sessionID != "" {
 				t.Setenv("TD_SESSION_ID", tt.sessionID)
@@ -571,10 +571,10 @@ func TestExplicitIDEnvironmentVarPriority(t *testing.T) {
 // TestExplicitIDEdgeCases tests various edge cases for ExplicitID
 func TestExplicitIDEdgeCases(t *testing.T) {
 	tests := []struct {
-		name       string
-		sessionID  string
-		pidValue   int
-		typeValue  AgentType
+		name        string
+		sessionID   string
+		pidValue    int
+		typeValue   AgentType
 		expectedLen int
 		description string
 	}{

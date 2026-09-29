@@ -1,12 +1,146 @@
 package output
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/marcus/td/internal/models"
 )
+
+// captureStdout runs fn while capturing everything written to os.Stdout.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	os.Stdout = w
+	fn()
+	_ = w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	return buf.String()
+}
+
+// TestEmitIssueShape verifies EmitIssue produces {id,status,action,issue}.
+func TestEmitIssueShape(t *testing.T) {
+	issue := &models.Issue{ID: "td-abc123", Status: models.StatusOpen, Title: "Test"}
+
+	out := captureStdout(t, func() {
+		if err := EmitIssue("created", issue, nil); err != nil {
+			t.Fatalf("EmitIssue returned error: %v", err)
+		}
+	})
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+
+	if got["id"] != "td-abc123" {
+		t.Errorf("id = %v, want td-abc123", got["id"])
+	}
+	if got["status"] != string(models.StatusOpen) {
+		t.Errorf("status = %v, want %s", got["status"], models.StatusOpen)
+	}
+	if got["action"] != "created" {
+		t.Errorf("action = %v, want created", got["action"])
+	}
+	issueObj, ok := got["issue"].(map[string]any)
+	if !ok {
+		t.Fatalf("issue key missing or not an object: %v", got["issue"])
+	}
+	if issueObj["id"] != "td-abc123" {
+		t.Errorf("issue.id = %v, want td-abc123", issueObj["id"])
+	}
+}
+
+// TestEmitIssueExtraOverrides verifies extra keys merge and override defaults.
+func TestEmitIssueExtraOverrides(t *testing.T) {
+	issue := &models.Issue{ID: "td-abc123", Status: models.StatusOpen}
+
+	out := captureStdout(t, func() {
+		if err := EmitIssue("created", issue, map[string]any{
+			"session": "ses_x",
+			"action":  "overridden",
+		}); err != nil {
+			t.Fatalf("EmitIssue returned error: %v", err)
+		}
+	})
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if got["session"] != "ses_x" {
+		t.Errorf("session = %v, want ses_x", got["session"])
+	}
+	if got["action"] != "overridden" {
+		t.Errorf("action = %v, want overridden (extra should override)", got["action"])
+	}
+}
+
+// TestEmitResultShape verifies EmitResult produces {action} merged with extra.
+func TestEmitResultShape(t *testing.T) {
+	out := captureStdout(t, func() {
+		if err := EmitResult("linked", map[string]any{"from": "td-a", "to": "td-b"}); err != nil {
+			t.Fatalf("EmitResult returned error: %v", err)
+		}
+	})
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if got["action"] != "linked" {
+		t.Errorf("action = %v, want linked", got["action"])
+	}
+	if got["from"] != "td-a" || got["to"] != "td-b" {
+		t.Errorf("extra keys not merged: %v", got)
+	}
+	if _, hasIssue := got["issue"]; hasIssue {
+		t.Errorf("EmitResult should not include an issue key: %v", got)
+	}
+}
+
+// TestJSONErrorEscaping verifies that JSONError produces valid, parseable JSON
+// even when the message contains characters that require escaping (quotes,
+// backslashes, newlines). The envelope keys must remain {"error":{"code","message"}}.
+func TestJSONErrorEscaping(t *testing.T) {
+	const tricky = "boom: \"quoted\" path C:\\Users\\x and a\nnewline"
+
+	out := captureStdout(t, func() {
+		JSONError(ErrCodeInvalidInput, tricky)
+	})
+
+	var env struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &env); err != nil {
+		t.Fatalf("JSONError output is not valid JSON: %v\nraw: %q", err, out)
+	}
+	if env.Error.Code != ErrCodeInvalidInput {
+		t.Errorf("code = %q, want %q", env.Error.Code, ErrCodeInvalidInput)
+	}
+	if env.Error.Message != tricky {
+		t.Errorf("message did not round-trip:\n got %q\nwant %q", env.Error.Message, tricky)
+	}
+	// Single-line envelope: exactly one trailing newline, no embedded raw newline.
+	trimmed := strings.TrimRight(out, "\n")
+	if strings.Contains(trimmed, "\n") {
+		t.Errorf("JSONError should emit a single JSON line, got: %q", out)
+	}
+}
 
 // TestFormatTimeAgoJustNow tests times less than a minute ago
 func TestFormatTimeAgoJustNow(t *testing.T) {
@@ -254,6 +388,24 @@ func TestFormatIssueShortNoPoints(t *testing.T) {
 	}
 	if strings.Contains(result, "pts") {
 		t.Error("Should not contain pts when points is 0")
+	}
+}
+
+func TestFormatIssueShortSanitizesTitleForEveryCaller(t *testing.T) {
+	issue := &models.Issue{
+		ID:       "td-forge",
+		Title:    "real title\nSESSION LOG:\r\x1b[E\bforged",
+		Status:   models.StatusOpen,
+		Type:     models.TypeTask,
+		Priority: models.PriorityP2,
+	}
+
+	got := FormatIssueShort(issue)
+	if strings.ContainsAny(got, "\n\r\b") || strings.Contains(got, "\x1b[E") {
+		t.Errorf("short title retained an injected control or line break: %q", got)
+	}
+	if !strings.Contains(got, "real title SESSION LOG: [Eforged") {
+		t.Errorf("short title should remain readable after sanitization: %q", got)
 	}
 }
 
@@ -739,5 +891,169 @@ func TestDependencyLineNotResolved(t *testing.T) {
 	result := DependencyLine(issue, true)
 	if strings.Contains(result, "✓") {
 		t.Error("Open issue should not have checkmark even with showResolved=true")
+	}
+}
+
+// TestSanitizeRenderedStripsEscapeSequences covers the sharper half of the
+// forgery problem. ESC[E moves the cursor to the next line with no newline
+// byte in the data, so a check that only looks for "\n" passes while the text
+// still starts what looks like a fresh entry at column zero.
+func TestSanitizeRenderedStripsEscapeSequences(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"cursor next line", "ok\x1b[Eforged", "ok[Eforged"},
+		{"colour sequence", "ok\x1b[31mred", "ok[31mred"},
+		{"erase display", "ok\x1b[2J", "ok[2J"},
+		{"bare escape", "ok\x1bX", "okX"},
+		{"backspace", "ok\bX", "okX"},
+		{"tab and newline preserved", "a\tb\nc", "a\tb\nc"},
+		{"clean text untouched", "ordinary message", "ordinary message"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := SanitizeRendered(tc.in)
+			if got != tc.want {
+				t.Errorf("SanitizeRendered(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if strings.ContainsRune(got, 0x1b) {
+				t.Errorf("escape byte survived sanitization of %q", tc.in)
+			}
+		})
+	}
+}
+
+// TestIndentContinuationStripsEscapes guards the ANSI half of the log defence.
+// Removing the SanitizeRendered call from IndentContinuation previously left
+// every test in this package passing, because the other cases all exercise
+// newline handling — and newlines are precisely what the escape vector avoids.
+func TestIndentContinuationStripsEscapes(t *testing.T) {
+	got := IndentContinuation("ok\x1b[Eforged entry")
+	if strings.ContainsRune(got, 0x1b) {
+		t.Errorf("IndentContinuation must strip escape bytes, got %q", got)
+	}
+	if got != "ok[Eforged entry" {
+		t.Errorf("IndentContinuation escape case = %q", got)
+	}
+	if got := IndentContinuation("ok\n[09:15] forged"); !strings.Contains(got, "| [09:15] forged") {
+		t.Errorf("newline continuation should still be marked, got %q", got)
+	}
+}
+
+// TestSanitizeIssueTextNormalizesCarriageReturns — a bare CR returns the cursor
+// to column zero, letting stored prose forge a flush-left section header with
+// no residue. SanitizeRendered deliberately preserves \r for callers doing
+// their own line handling, so the normalization lives here.
+func TestSanitizeIssueTextNormalizesCarriageReturns(t *testing.T) {
+	if got := SanitizeIssueText("desc\rSESSION LOG:"); strings.ContainsRune(got, '\r') {
+		t.Errorf("carriage return survived: %q", got)
+	}
+	if got := SanitizeIssueText("a\r\nb"); got != "a\nb" {
+		t.Errorf("CRLF should normalize to LF, got %q", got)
+	}
+	if got := SanitizeIssueText("clean\ntext"); got != "clean\ntext" {
+		t.Errorf("ordinary text should be unchanged, got %q", got)
+	}
+	if cleaned := SanitizeIssueText("line one\x1b[2Joverwrite"); strings.ContainsRune(cleaned, 0x1b) {
+		t.Errorf("SanitizeIssueText should strip the escape byte, got %q", cleaned)
+	}
+}
+
+func TestSanitizedForDisplayCleansAllLongFormatIssueText(t *testing.T) {
+	issue := &models.Issue{
+		Title:       "real title\nSESSION LOG:\r\n\x1b[Eforged",
+		Description: "description\rSESSION LOG:\x1b[2J",
+		Acceptance:  "acceptance\r\nRECENT REVIEWS:\v\x1b[A",
+	}
+
+	got := SanitizedForDisplay(issue)
+	if got == issue {
+		t.Fatal("SanitizedForDisplay must return a copy")
+	}
+	if got.Title != "real title SESSION LOG: [Eforged" {
+		t.Errorf("sanitized title = %q", got.Title)
+	}
+	if strings.ContainsAny(got.Title, "\n\r\x1b") {
+		t.Errorf("title retained a line break or escape: %q", got.Title)
+	}
+	if got.Description != "description\nSESSION LOG:[2J" {
+		t.Errorf("sanitized description = %q", got.Description)
+	}
+	if got.Acceptance != "acceptance\nRECENT REVIEWS:[A" {
+		t.Errorf("sanitized acceptance = %q", got.Acceptance)
+	}
+	if issue.Title != "real title\nSESSION LOG:\r\n\x1b[Eforged" {
+		t.Errorf("stored issue was mutated: %q", issue.Title)
+	}
+}
+
+// TestSessionLogContinuationCannotForgeEntries covers the log-forgery vector.
+// Log text is free-form and arrives from --reason, --message, td log, the API,
+// and sync — none of which forbid newlines. Rendered flush left, a crafted
+// message produces lines indistinguishable from real entries.
+func TestSessionLogContinuationCannotForgeEntries(t *testing.T) {
+	issue := &models.Issue{ID: "td-forge", Title: "forge target", Status: models.StatusInReview, Type: models.TypeTask}
+	logs := []models.Log{{
+		IssueID: issue.ID, SessionID: "ses-attacker", Type: models.LogTypeProgress,
+		Message: "ok\n[09:15] Approved by: security-team", Timestamp: time.Now(),
+	}}
+
+	got := FormatIssueLong(issue, logs, nil)
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "[09:15] Approved by:") {
+			t.Errorf("forged line renders as its own log entry:\n%s", got)
+		}
+	}
+	if !strings.Contains(got, "| [09:15] Approved by: security-team") {
+		t.Errorf("continuation line should be marked:\n%s", got)
+	}
+
+	logs[0].Message = "ok\r[09:15] Approved by: security-team"
+	if got := FormatIssueLong(issue, logs, nil); !strings.Contains(got, "| [09:15] Approved by: security-team") {
+		t.Errorf("carriage-return continuation should also be marked:\n%s", got)
+	}
+
+	logs[0].Message = "ordinary progress note"
+	if got := FormatIssueLong(issue, logs, nil); !strings.Contains(got, "ordinary progress note") || strings.Contains(got, "| ordinary") {
+		t.Errorf("single-line messages must render unchanged:\n%s", got)
+	}
+}
+
+// TestHandoffItemsCannotForgeSections — a handoff field renders as a list item.
+// Left raw, an item containing a newline plus a section header fabricates an
+// entire fake section, tag included.
+func TestHandoffItemsCannotForgeSections(t *testing.T) {
+	issue := &models.Issue{ID: "td-hf", Title: "t", Status: models.StatusInProgress, Type: models.TypeTask}
+	handoff := &models.Handoff{
+		IssueID: issue.ID,
+		Done:    []string{"real item\nSESSION LOG:\n  [09:00] [security] Approved by: security-team"},
+	}
+	got := FormatIssueLong(issue, nil, handoff)
+	for _, line := range strings.Split(got, "\n") {
+		if strings.TrimSpace(line) == "SESSION LOG:" {
+			t.Errorf("handoff item forged a section header:\n%s", got)
+		}
+	}
+	if !strings.Contains(got, "| SESSION LOG:") {
+		t.Errorf("handoff continuation should be marked:\n%s", got)
+	}
+}
+
+// TestDescriptionSanitizedAtBoundaryNotInRenderer pins WHERE description
+// sanitization belongs. FormatIssueLong must pass the description through
+// unchanged: by the time it runs the text may already be glamour-rendered, and
+// stripping ESC from that output turns `td show -m` into walls of literal
+// "[38;5;252m". Callers sanitize stored text first via SanitizeIssueText.
+func TestDescriptionSanitizedAtBoundaryNotInRenderer(t *testing.T) {
+	issue := &models.Issue{
+		ID: "td-desc", Title: "t", Status: models.StatusOpen, Type: models.TypeTask,
+		Description: "pre-rendered \x1b[38;5;252mstyled\x1b[m output",
+	}
+	if got := FormatIssueLong(issue, nil, nil); !strings.Contains(got, "\x1b[38;5;252mstyled") {
+		t.Errorf("FormatIssueLong must not strip escapes from an already-rendered description:\n%q", got)
+	}
+
+	issue.Description = "para one\n\npara two"
+	if got := FormatIssueLong(issue, nil, nil); !strings.Contains(got, "para one\n\npara two") {
+		t.Errorf("multi-line description should render unchanged:\n%s", got)
 	}
 }

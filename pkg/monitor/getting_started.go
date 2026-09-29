@@ -16,35 +16,47 @@ func (m *Model) createGettingStartedModal() *modal.Modal {
 		fileName = filepath.Base(m.AgentFilePath)
 	}
 
-	md := modal.New("Welcome to td!", modal.WithWidth(60), modal.WithHints(false))
+	md := m.newModal("", ModalTypeHelp, modal.WithWidth(60), modal.WithHints(false))
 
-	md.AddSection(modal.Text("Task management for AI agents."))
+	// Centered title and subtitle with no blank line in between
+	md.AddSection(modal.CenteredTitle("Welcome to td!"))
+	md.AddSection(modal.CenteredMuted("Task management for AI agents."))
 	md.AddSection(modal.Spacer())
 
-	if m.AgentFileHasTD {
-		md.AddSection(modal.Text("\u2713 Agent instructions installed"))
+	// Agent prompt guidance
+	md.AddSection(modal.Text("To use td, just prompt your agent:"))
+	md.AddSection(modal.Text(`"Use td to plan my feature and implement it."`))
+	md.AddSection(modal.Spacer())
+
+	// Guidance install instruction right above the buttons
+	if m.AgentFileTDNeedsUpdate {
+		md.AddSection(modal.Text("Updated td guidance is available for " + fileName))
+	} else if m.AgentFileHasTD {
+		md.AddSection(modal.Text("\u2713 td guidance installed"))
 	} else {
-		md.AddSection(modal.Text("Press I to install td instructions to " + fileName))
+		md.AddSection(modal.Text("Press I to add compact td guidance to " + fileName))
 	}
 	md.AddSection(modal.Spacer())
 
-	md.AddSection(modal.Text("PROMPT: \"Use td to plan my feature and implement it.\""))
-	md.AddSection(modal.Spacer())
-
-	md.AddSection(modal.Text("Press ? for help · H to reopen this modal"))
-	md.AddSection(modal.Spacer())
-
-	// Only show Install button if not already installed
-	if m.AgentFileHasTD {
+	// Action buttons
+	if m.AgentFileHasTD && !m.AgentFileTDNeedsUpdate {
 		md.AddSection(modal.Buttons(
 			modal.Btn(" Close ", "close"),
 		))
 	} else {
+		actionLabel := " [I]nstall "
+		if m.AgentFileTDNeedsUpdate {
+			actionLabel = " [I] Update "
+		}
 		md.AddSection(modal.Buttons(
-			modal.Btn(" [I]nstall ", "install"),
+			modal.Btn(actionLabel, "install"),
 			modal.Btn(" Close ", "close"),
 		))
 	}
+	md.AddSection(modal.Spacer())
+
+	// Help and reopen hints below the buttons
+	md.AddSection(modal.CenteredMuted("Press ? for help · H to reopen this modal"))
 
 	return md
 }

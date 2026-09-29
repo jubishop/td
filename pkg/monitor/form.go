@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/marcus/td/internal/models"
 )
 
@@ -72,10 +72,19 @@ type FormState struct {
 	Autofill      *AutofillState // Active dropdown state (nil when not showing)
 	AutofillEpics []AutofillItem // Cached epics (for parent field, type=epic only)
 	AutofillAll   []AutofillItem // Cached all open issues (for dependencies field)
+
+	// theme is retained across the few form rebuilds needed for toggling fields
+	// and autocomplete selection. A zero value preserves the historical
+	// standalone Dracula appearance.
+	theme Theme
 }
 
 // NewFormState creates a new form state for creating an issue
 func NewFormState(mode FormMode, parentID string) *FormState {
+	return newFormStateWithTheme(mode, parentID, Theme{})
+}
+
+func newFormStateWithTheme(mode FormMode, parentID string, theme Theme) *FormState {
 	state := &FormState{
 		Mode:        mode,
 		ParentID:    parentID,
@@ -85,6 +94,7 @@ func NewFormState(mode FormMode, parentID string) *FormState {
 		Points:      "0",
 		ButtonFocus: formButtonFocusForm,
 		ButtonHover: 0,
+		theme:       theme,
 	}
 	state.buildForm()
 	return state
@@ -92,6 +102,10 @@ func NewFormState(mode FormMode, parentID string) *FormState {
 
 // NewFormStateForEdit creates a form state populated with existing issue data
 func NewFormStateForEdit(issue *models.Issue) *FormState {
+	return newFormStateForEditWithTheme(issue, Theme{})
+}
+
+func newFormStateForEditWithTheme(issue *models.Issue, theme Theme) *FormState {
 	state := &FormState{
 		Mode:        FormModeEdit,
 		IssueID:     issue.ID,
@@ -107,6 +121,7 @@ func NewFormStateForEdit(issue *models.Issue) *FormState {
 		Minor:       issue.Minor,
 		ButtonFocus: formButtonFocusForm,
 		ButtonHover: 0,
+		theme:       theme,
 	}
 	state.buildForm()
 	return state
@@ -250,12 +265,94 @@ func (fs *FormState) buildForm() {
 	}
 
 	// Configure form appearance
-	fs.Form.WithTheme(huh.ThemeDracula())
+	fs.Form.WithTheme(fs.huhTheme())
 
 	// Apply width if set (ensures text wrapping works after form rebuild)
 	if fs.Width > 0 {
 		fs.Form.WithWidth(fs.Width)
 	}
+}
+
+// huhTheme is installed once on every Huh field and resolves fs.theme lazily.
+// Huh fields intentionally ignore a second WithTheme call, so a stable wrapper
+// is required for live retheme without rebuilding the form.
+func (fs *FormState) huhTheme() huh.Theme {
+	return huh.ThemeFunc(func(isDark bool) *huh.Styles {
+		return formStyles(fs.theme, isDark)
+	})
+}
+
+// setTheme rebuilds the Huh fields after changing the retained theme. Most Huh
+// fields resolve the stable theme wrapper lazily, but Select snapshots its
+// private filter text input styles on the first WithTheme call. Rebuilding is
+// the only public, reflection-free way to refresh that snapshot.
+//
+// All durable form state is bound to FormState and therefore survives the
+// rebuild. The focused field/page and current validation error are restored.
+// Huh does not expose a select's filter query, so an active transient filter is
+// deliberately closed while its selected value and field focus are retained.
+func (fs *FormState) setTheme(theme Theme) {
+	if fs == nil {
+		return
+	}
+
+	focusedKey := fs.focusedFieldKey()
+	var focusedErr error
+	if fs.Form != nil {
+		if field := fs.Form.GetFocusedField(); field != nil {
+			focusedErr = field.Error()
+		}
+	}
+
+	fs.theme = theme
+	if fs.Form != nil {
+		fs.buildForm()
+		_ = fs.Form.Init()
+		fs.restoreFocusedField(focusedKey)
+
+		field := fs.Form.GetFocusedField()
+		if field == nil {
+			return
+		}
+		if focusedErr != nil || fs.ButtonFocus != formButtonFocusForm {
+			// Blur re-runs field validation against the retained bound value.
+			_ = field.Blur()
+		}
+		if fs.ButtonFocus == formButtonFocusForm {
+			_ = field.Focus()
+		}
+	}
+}
+
+func (fs *FormState) restoreFocusedField(key string) {
+	group, field, ok := formFieldPosition(key)
+	if !ok || fs.Form == nil {
+		return
+	}
+	for range group {
+		_ = fs.Form.NextGroup()
+	}
+	for range field {
+		_ = fs.Form.NextField()
+	}
+}
+
+func formFieldPosition(key string) (group, field int, ok bool) {
+	positions := map[string][2]int{
+		formKeyTitle:        {0, 0},
+		formKeyType:         {0, 1},
+		formKeyPriority:     {0, 2},
+		formKeyDescription:  {0, 3},
+		formKeyLabels:       {0, 4},
+		formKeyParent:       {1, 0},
+		formKeyPoints:       {1, 1},
+		formKeyAcceptance:   {1, 2},
+		formKeyMinor:        {2, 0},
+		formKeyDependencies: {2, 1},
+		formKeyStatus:       {2, 2},
+	}
+	position, ok := positions[key]
+	return position[0], position[1], ok
 }
 
 // ToggleExtended toggles the extended fields visibility and rebuilds the form

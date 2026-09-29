@@ -10,8 +10,11 @@ import (
 )
 
 const (
-	lockFileName   = "db.lock"
-	defaultTimeout = 500 * time.Millisecond
+	lockFileName = "db.lock"
+	// Matches the SQLite busy_timeout. Rollback-journal writes (journal
+	// create + fsync per transaction) queue noticeably longer than WAL
+	// writes did, and concurrent agent sessions routinely burst past 500ms.
+	defaultTimeout = 5 * time.Second
 	initialBackoff = 5 * time.Millisecond
 	maxBackoff     = 50 * time.Millisecond
 )
@@ -28,6 +31,18 @@ func newWriteLocker(baseDir string) *writeLocker {
 	return &writeLocker{
 		lockPath: filepath.Join(baseDir, ".todos", lockFileName),
 	}
+}
+
+// WithMaintenanceLock runs fn while holding the same cross-process lock used
+// by normal CLI writes. It is intended for database-file maintenance (such as
+// snapshot replacement) that cannot safely overlap another td writer.
+func WithMaintenanceLock(baseDir string, fn func() error) error {
+	locker := newWriteLocker(ResolveBaseDir(baseDir))
+	if err := locker.acquire(5 * time.Second); err != nil {
+		return err
+	}
+	defer func() { _ = locker.release() }()
+	return fn()
 }
 
 // acquire attempts to get an exclusive write lock with the given timeout.
@@ -55,7 +70,7 @@ func (l *writeLocker) acquire(timeout time.Duration) error {
 		// Check timeout
 		if time.Now().After(deadline) {
 			holder := l.readHolder()
-			l.lockFile.Close()
+			_ = l.lockFile.Close()
 			l.lockFile = nil
 			return fmt.Errorf("write lock timeout after %v\n  holder: %s\n  try again or check if holder process is stuck", timeout, holder)
 		}
@@ -83,7 +98,7 @@ func (l *writeLocker) release() error {
 	// Release lock (platform-specific)
 	l.unlock()
 
-	l.lockFile.Close()
+	_ = l.lockFile.Close()
 	l.lockFile = nil
 
 	return nil
@@ -96,7 +111,7 @@ func (l *writeLocker) writeHolder() {
 	}
 	_ = l.lockFile.Truncate(0)
 	_, _ = l.lockFile.Seek(0, 0)
-	fmt.Fprintf(l.lockFile, "pid:%d\ntime:%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
+	_, _ = fmt.Fprintf(l.lockFile, "pid:%d\ntime:%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
 	_ = l.lockFile.Sync()
 }
 

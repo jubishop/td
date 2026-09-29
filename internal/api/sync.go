@@ -191,10 +191,52 @@ func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply accepted events to project.db (live state). Same machinery the
+	// pool's bootstrap replay uses (tdsync.ApplyRemoteEvents). Plan §7.2.
+	//
+	// Failure handling: events.db is already committed above, so the next push
+	// (or a CLI retry) will see these events again and reapply via the
+	// idempotent cursor logic in applyAcceptedEventsToProjectDB. We surface
+	// 500 here so the client retries; meanwhile project.db is behind for this
+	// project. buildSnapshot remains the recovery valve per plan §7.2.
+	if s.projectLivePool != nil && result.Accepted > 0 {
+		if err := applyAcceptedEventsToProjectDB(s.projectLivePool, projectID, events, result); err != nil {
+			logFor(r.Context()).Error("apply push to project.db", "project", projectID, "err", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "failed to apply events to project state")
+			return
+		}
+
+		// A sync push may contain many heterogeneous changes. Notify live clients
+		// once, after the complete accepted batch is visible through project.db,
+		// so browser consumers can refetch a coherent state.
+		s.broadcastProjectRefresh(projectID)
+	}
+
 	// Update cached event count in server.db
 	if result.Accepted > 0 {
 		if err := s.store.UpdateProjectEventCount(projectID, result.Accepted, time.Now().UTC()); err != nil {
 			logFor(r.Context()).Warn("update project event count", "project", projectID, "err", err)
+		}
+	}
+
+	// Upsert sync cursor for this device. Tracks the device as a "sync client"
+	// for the admin UI and records its last-known server_seq position.
+	// Use max server_seq from acks (or duplicate rejections) so the cursor
+	// never moves backwards even if the client retries already-acked batches.
+	var maxSeq int64
+	for _, a := range result.Acks {
+		if a.ServerSeq > maxSeq {
+			maxSeq = a.ServerSeq
+		}
+	}
+	for _, rj := range result.Rejected {
+		if rj.ServerSeq > maxSeq {
+			maxSeq = rj.ServerSeq
+		}
+	}
+	if maxSeq > 0 {
+		if err := s.store.UpsertSyncCursor(projectID, req.DeviceID, maxSeq); err != nil {
+			logFor(r.Context()).Warn("upsert sync cursor on push", "project", projectID, "device", req.DeviceID, "err", err)
 		}
 	}
 
@@ -270,6 +312,18 @@ func (s *Server) handleSyncPull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = tx.Rollback() // read-only, just release
+
+	// Upsert sync cursor for the pulling device so it shows up in the admin
+	// "Sync Clients" tab. The pull endpoint uses `exclude_client` to carry
+	// the caller's device_id; we treat that as the client_id for the cursor.
+	// Only advance when we know the head — result.LastServerSeq is the
+	// highest server_seq observed by the pull (may be > returned events if
+	// we excluded the caller's own writes).
+	if excludeClient != "" && result.LastServerSeq > 0 {
+		if err := s.store.UpsertSyncCursor(projectID, excludeClient, result.LastServerSeq); err != nil {
+			logFor(r.Context()).Warn("upsert sync cursor on pull", "project", projectID, "device", excludeClient, "err", err)
+		}
+	}
 
 	resp := PullResponse{
 		LastServerSeq: result.LastServerSeq,
@@ -380,10 +434,10 @@ func (s *Server) handleSyncSnapshot(w http.ResponseWriter, r *http.Request) {
 			return "", fmt.Errorf("create temp file: %w", err)
 		}
 		tmpPath := tmpFile.Name()
-		tmpFile.Close()
+		_ = tmpFile.Close()
 
 		if err := buildSnapshot(eventsDB, tmpPath, lastSeq); err != nil {
-			os.Remove(tmpPath)
+			_ = os.Remove(tmpPath)
 			return "", fmt.Errorf("build snapshot: %w", err)
 		}
 
@@ -392,7 +446,7 @@ func (s *Server) handleSyncSnapshot(w http.ResponseWriter, r *http.Request) {
 		servePath := tmpPath
 		defer func() {
 			if servePath != tmpPath {
-				os.Remove(tmpPath) // no-op if already renamed away
+				_ = os.Remove(tmpPath) // no-op if already renamed away
 			}
 		}()
 		if err := os.MkdirAll(cacheDir, 0o755); err != nil {
@@ -437,7 +491,7 @@ func serveSnapshotFile(w http.ResponseWriter, r *http.Request, path string, seq 
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to read snapshot")
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	stat, err := f.Stat()
 	if err != nil {
@@ -486,7 +540,7 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	tmpDst := dst + ".tmp"
 	out, err := os.Create(tmpDst)
@@ -495,12 +549,12 @@ func copyFile(src, dst string) error {
 	}
 
 	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		os.Remove(tmpDst)
+		_ = out.Close()
+		_ = os.Remove(tmpDst)
 		return err
 	}
 	if err := out.Close(); err != nil {
-		os.Remove(tmpDst)
+		_ = os.Remove(tmpDst)
 		return err
 	}
 	return os.Rename(tmpDst, dst)
@@ -513,22 +567,28 @@ func buildSnapshot(eventsDB *sql.DB, snapshotPath string, upToSeq int64) error {
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	// Initialize with full schema + all migrations
 	tdb, err := tddb.Initialize(tmpDir)
 	if err != nil {
 		return fmt.Errorf("init snapshot schema: %w", err)
 	}
-	tdb.Close()
+	_ = tdb.Close()
 
-	// Re-open the initialized DB for event replay
+	// Re-open the initialized DB for event replay. FK enforcement is kept
+	// OFF here because replay walks the event log in server_seq order and
+	// may legitimately encounter child rows (e.g. board_issue_positions)
+	// before their parents — events can arrive from multiple devices out of
+	// causal order. The final CLI issues.db (opened via openConn) enforces
+	// FKs on writes; this snapshot DB is a transient mirror we stream to
+	// clients. (td-4846e6)
 	tmpDBPath := filepath.Join(tmpDir, ".todos", "issues.db")
-	snapDB, err := sql.Open("sqlite", tmpDBPath)
+	snapDB, err := tddb.OpenSQLite(tmpDBPath, tddb.OpenOptions{DisableForeignKeys: true})
 	if err != nil {
 		return fmt.Errorf("open snapshot db: %w", err)
 	}
-	defer snapDB.Close()
+	defer func() { _ = snapDB.Close() }()
 
 	validator := func(t string) bool { return isValidEntityType(t) }
 	afterSeq := int64(0)
@@ -580,24 +640,29 @@ func buildSnapshot(eventsDB *sql.DB, snapshotPath string, upToSeq int64) error {
 		}
 	}
 
-	// Checkpoint WAL to flush into main DB file before copy
+	// Checkpoint WAL to flush into main DB file before copy.
+	// TRUNCATE (not PASSIVE) is intentional here: this path immediately
+	// copies the main DB file to snapshotPath, and we want every pending
+	// write merged in — leaving data in the -wal/-shm sidecars would
+	// produce a truncated snapshot. This is the one site that keeps
+	// TRUNCATE; Close() paths (db.go, serverdb.go, dbpool.go) use PASSIVE.
 	if _, err := snapDB.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		slog.Warn("snapshot WAL checkpoint failed", "err", err)
 	}
-	snapDB.Close() // explicit close before copy; defer will no-op
+	_ = snapDB.Close() // explicit close before copy; defer will no-op
 
 	// Copy final DB to snapshot path
 	src, err := os.Open(tmpDBPath)
 	if err != nil {
 		return fmt.Errorf("open temp db for copy: %w", err)
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 
 	dst, err := os.Create(snapshotPath)
 	if err != nil {
 		return fmt.Errorf("create snapshot file: %w", err)
 	}
-	defer dst.Close()
+	defer func() { _ = dst.Close() }()
 
 	if _, err := io.Copy(dst, src); err != nil {
 		return fmt.Errorf("copy snapshot: %w", err)

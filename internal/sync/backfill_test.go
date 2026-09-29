@@ -50,6 +50,18 @@ CREATE TABLE logs (
     is_progress INTEGER DEFAULT 0,
     category TEXT DEFAULT ''
 );
+CREATE TABLE work_sessions (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    worktree_id TEXT DEFAULT '',
+    worktree_root TEXT DEFAULT '',
+    repo_root TEXT DEFAULT '',
+    started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ended_at DATETIME,
+    start_sha TEXT DEFAULT '',
+    end_sha TEXT DEFAULT ''
+);
 CREATE TABLE action_log (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -82,7 +94,7 @@ func setupBackfillDB(t *testing.T) *sql.DB {
 	if _, err := db.Exec(backfillTestSchema); err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
@@ -120,7 +132,7 @@ func TestBackfillOrphanEntities_DetectsOrphans(t *testing.T) {
 
 	// Verify the new_data contains valid JSON with issue fields
 	rows, _ := tx.Query(`SELECT entity_id, new_data FROM action_log WHERE entity_type='issue'`)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var eid, nd string
 		_ = rows.Scan(&eid, &nd)
@@ -235,6 +247,47 @@ func TestBackfillOrphanEntities_BackfillsWhenOnlyUpdateExists(t *testing.T) {
 	}
 }
 
+func TestBackfillOrphanWorkSessionsOmitsWorktreeMetadata(t *testing.T) {
+	db := setupBackfillDB(t)
+
+	_, err := db.Exec(`
+		INSERT INTO work_sessions
+			(id, name, session_id, worktree_id, worktree_root, repo_root, start_sha)
+		VALUES
+			('ws-local', 'Local metadata', 'ses-local', 'wt-local', '/tmp/local-worktree', '/tmp/local-repo', 'abc123')
+	`)
+	if err != nil {
+		t.Fatalf("insert work_session: %v", err)
+	}
+
+	tx, _ := db.Begin()
+	n, err := BackfillOrphanEntities(tx, "ses-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if n != 1 {
+		t.Fatalf("expected 1 backfilled work session, got %d", n)
+	}
+
+	var raw string
+	if err := db.QueryRow(`SELECT new_data FROM action_log WHERE entity_type='work_sessions' AND entity_id='ws-local'`).Scan(&raw); err != nil {
+		t.Fatalf("read backfill payload: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		t.Fatalf("unmarshal backfill payload: %v", err)
+	}
+	for _, key := range []string{"worktree_id", "worktree_root", "repo_root"} {
+		if _, ok := fields[key]; ok {
+			t.Fatalf("backfill leaked %s in %v", key, fields)
+		}
+	}
+}
+
 func TestBackfillStaleIssues_AddsUpdate(t *testing.T) {
 	db := setupBackfillDB(t)
 
@@ -249,14 +302,18 @@ func TestBackfillStaleIssues_AddsUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if n != 1 {
 		t.Fatalf("expected 1 stale backfill, got %d", n)
 	}
 
 	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM action_log WHERE entity_id='td-700' AND action_type='create'`).Scan(&count)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM action_log WHERE entity_id='td-700' AND action_type='create'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
 	if count != 2 {
 		t.Fatalf("expected 2 create entries for td-700 (original + backfill), got %d", count)
 	}
@@ -275,7 +332,9 @@ func TestBackfillStaleIssues_SkipsWhenUpToDate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if n != 0 {
 		t.Fatalf("expected 0 stale updates, got %d", n)
@@ -295,7 +354,9 @@ func TestBackfillStaleIssues_BackfillsInvalidJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if n != 1 {
 		t.Fatalf("expected 1 stale update for invalid JSON, got %d", n)
@@ -314,7 +375,9 @@ func TestBackfillOrphanEntities_MultipleEntityTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if n != 3 {
 		t.Fatalf("expected 3 backfilled, got %d", n)
@@ -323,7 +386,7 @@ func TestBackfillOrphanEntities_MultipleEntityTypes(t *testing.T) {
 	// Check entity types
 	types := map[string]int{}
 	rows, _ := db.Query(`SELECT entity_type FROM action_log WHERE session_id='ses-test'`)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var et string
 		_ = rows.Scan(&et)
@@ -337,6 +400,14 @@ func TestBackfillOrphanEntities_MultipleEntityTypes(t *testing.T) {
 	}
 	if types["logs"] != 1 {
 		t.Errorf("expected 1 logs backfill, got %d", types["logs"])
+	}
+}
+
+func TestSessionStateIsNotBackfilled(t *testing.T) {
+	for _, table := range syncableTables {
+		if table.Table == "session_state" {
+			t.Fatal("session_state must remain local-only and out of sync backfill tables")
+		}
 	}
 }
 
@@ -389,6 +460,60 @@ func TestBackfillOrphanEntities_FullRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBackfillOrphanEntities_IssueReviews(t *testing.T) {
+	db := setupBackfillDB(t)
+	if _, err := db.Exec(`
+		CREATE TABLE issue_reviews (
+			id TEXT PRIMARY KEY,
+			issue_id TEXT NOT NULL,
+			reviewer_session TEXT NOT NULL,
+			decision TEXT NOT NULL,
+			summary TEXT NOT NULL DEFAULT '',
+			requested_by_session TEXT DEFAULT '',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			superseded_at DATETIME,
+			self_review INTEGER NOT NULL DEFAULT 0,
+			reviewed_by TEXT NOT NULL DEFAULT ''
+		);
+		INSERT INTO issue_reviews
+			(id, issue_id, reviewer_session, decision, summary)
+		VALUES ('rv-legacy', 'td-legacy', 'ses-reviewer', 'approved', 'pre-sync review');
+	`); err != nil {
+		t.Fatalf("seed legacy review: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	n, err := BackfillOrphanEntities(tx, "ses-backfill")
+	if err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("backfilled rows = %d, want 1", n)
+	}
+
+	var entityType, actionType, newData string
+	if err := tx.QueryRow(`
+		SELECT entity_type, action_type, new_data
+		FROM action_log WHERE entity_id = 'rv-legacy'
+	`).Scan(&entityType, &actionType, &newData); err != nil {
+		t.Fatalf("read backfill event: %v", err)
+	}
+	if entityType != "issue_reviews" || actionType != "create" {
+		t.Fatalf("backfill event = %s/%s, want issue_reviews/create", entityType, actionType)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(newData), &fields); err != nil {
+		t.Fatalf("unmarshal review payload: %v", err)
+	}
+	if fields["decision"] != "approved" {
+		t.Fatalf("decision = %v, want approved", fields["decision"])
+	}
+}
+
 func TestBackfillOrphanEntities_IncludesSoftDeleted(t *testing.T) {
 	db := setupBackfillDB(t)
 
@@ -400,7 +525,9 @@ func TestBackfillOrphanEntities_IncludesSoftDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if n != 1 {
 		t.Fatalf("expected 1 backfilled (soft-deleted), got %d", n)
@@ -430,7 +557,9 @@ func TestBackfillOrphanEntities_SkipsAfterPull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if n != 0 {
 		t.Fatalf("expected 0 backfilled after pull, got %d", n)
@@ -438,7 +567,9 @@ func TestBackfillOrphanEntities_SkipsAfterPull(t *testing.T) {
 
 	// Verify no action_log entries were created
 	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM action_log`).Scan(&count)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM action_log`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
 	if count != 0 {
 		t.Fatalf("expected 0 action_log rows, got %d", count)
 	}

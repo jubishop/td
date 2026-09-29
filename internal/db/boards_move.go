@@ -84,7 +84,7 @@ func (db *DB) MoveBoardIssueLogged(boardID, issueID, beforeID string, candidates
 		if err != nil {
 			return err
 		}
-		defer tx.Rollback()
+		defer func() { _ = tx.Rollback() }()
 		now := time.Now()
 		for _, id := range order {
 			position := positions[id]

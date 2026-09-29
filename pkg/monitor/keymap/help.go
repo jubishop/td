@@ -4,14 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
-	"github.com/charmbracelet/lipgloss"
 )
-
-// Header style for TDQ help sections
-var tdqHeaderStyle = lipgloss.NewStyle().
-	Bold(true).
-	Foreground(lipgloss.Color("212")) // Primary color (purple/magenta)
 
 // HelpSection represents a group of bindings in help text
 type HelpSection struct {
@@ -44,7 +37,7 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "Enter", Description: "Open issue details"},
 	}
 	for _, b := range navBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nMODALS:\n")
@@ -59,7 +52,7 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "Tab", Description: "Focus epic task list (if epic)"},
 	}
 	for _, b := range modalBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nEPIC TASKS (when focused):\n")
@@ -71,7 +64,7 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "Esc", Description: "Close modal"},
 	}
 	for _, b := range epicBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nCRUD:\n")
@@ -83,7 +76,7 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "O", Description: "Reopen closed issue"},
 	}
 	for _, b := range crudBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nCONFIRMATION DIALOGS:\n")
@@ -96,7 +89,7 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "Click", Description: "Click buttons directly"},
 	}
 	for _, b := range confirmBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nFORM (when editing):\n")
@@ -107,13 +100,14 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "Ctrl+O", Description: "Edit description in $EDITOR"},
 	}
 	for _, b := range formBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nACTIONS:\n")
 	actionBindings := []HelpBinding{
 		{Keys: "r", Description: "Mark for review (Current Work) / Refresh"},
-		{Keys: "a", Description: "Approve issue (Task List reviewable)"},
+		{Keys: "a", Description: "Approve issue (review + close, or close using recorded approval)"},
+		{Keys: "V", Description: "Record approval review without closing (delegated mode)"},
 		{Keys: "s", Description: "Show statistics dashboard"},
 		{Keys: "h", Description: "Show handoffs modal"},
 		{Keys: "S", Description: "Cycle sort (priority/created/updated)"},
@@ -124,16 +118,27 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "q / Ctrl+C", Description: "Quit"},
 	}
 	for _, b := range actionBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
+	}
+
+	sb.WriteString("\nREVIEW BUCKETS (Task List):\n")
+	reviewBucketLines := []HelpBinding{
+		{Keys: "Reviewable", Description: "You can review these (independent session, no active approval)"},
+		{Keys: "Ready to Close", Description: "Approval already recorded; ready for delegated close"},
+		{Keys: "Pending Review", Description: "Your implementations waiting on someone else to review"},
+		{Keys: "Pending Other", Description: "Someone else's work waiting on a reviewer who is not you"},
+	}
+	for _, b := range reviewBucketLines {
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nGETTING STARTED:\n")
 	gettingStartedBindings := []HelpBinding{
 		{Keys: "H", Description: "Open getting started guide"},
-		{Keys: "I", Description: "Install td instructions to agent file"},
+		{Keys: "I", Description: "Add td guidance to agent file"},
 	}
 	for _, b := range gettingStartedBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nHANDOFFS MODAL:\n")
@@ -144,7 +149,7 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "r", Description: "Refresh handoffs"},
 	}
 	for _, b := range handoffBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nBOARDS:\n")
@@ -160,7 +165,7 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "F", Description: "Cycle status filter"},
 	}
 	for _, b := range boardBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nSEARCH (TDQ Query Language):\n")
@@ -171,7 +176,7 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "?", Description: "Show TDQ syntax help"},
 	}
 	for _, b := range searchBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nMOUSE:\n")
@@ -181,7 +186,7 @@ func (r *Registry) GenerateHelp() string {
 		{Keys: "Scroll wheel", Description: "Scroll hovered panel"},
 	}
 	for _, b := range mouseBindings {
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-20s %s\n", b.Keys, b.Description)
 	}
 
 	sb.WriteString("\nPress ? to close help\n")
@@ -193,10 +198,10 @@ func (r *Registry) GenerateHelp() string {
 func (r *Registry) GenerateTDQHelp() string {
 	var sb strings.Builder
 
-	sb.WriteString("\n" + tdqHeaderStyle.Render("TDQ QUERY LANGUAGE - Search Syntax") + "\n")
+	sb.WriteString("\nTDQ QUERY LANGUAGE - Search Syntax\n")
 	sb.WriteString("═══════════════════════════════════\n\n")
 
-	sb.WriteString(tdqHeaderStyle.Render("BASIC OPERATORS:") + "\n")
+	sb.WriteString("BASIC OPERATORS:\n")
 	ops := []HelpBinding{
 		{Keys: "field = value", Description: "Exact match"},
 		{Keys: "field != value", Description: "Not equal"},
@@ -207,10 +212,10 @@ func (r *Registry) GenerateTDQHelp() string {
 		{Keys: "field >= value", Description: "Greater than or equal"},
 	}
 	for _, b := range ops {
-		sb.WriteString(fmt.Sprintf("  %-22s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-22s %s\n", b.Keys, b.Description)
 	}
 
-	sb.WriteString("\n" + tdqHeaderStyle.Render("BOOLEAN LOGIC:") + "\n")
+	sb.WriteString("\nBOOLEAN LOGIC:\n")
 	bools := []HelpBinding{
 		{Keys: "expr AND expr", Description: "Both must match"},
 		{Keys: "expr OR expr", Description: "Either matches"},
@@ -218,10 +223,10 @@ func (r *Registry) GenerateTDQHelp() string {
 		{Keys: "(expr)", Description: "Grouping"},
 	}
 	for _, b := range bools {
-		sb.WriteString(fmt.Sprintf("  %-22s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-22s %s\n", b.Keys, b.Description)
 	}
 
-	sb.WriteString("\n" + tdqHeaderStyle.Render("FIELDS:") + "\n")
+	sb.WriteString("\nFIELDS:\n")
 	fields := []HelpBinding{
 		{Keys: "status", Description: "open, in_progress, blocked, in_review, closed"},
 		{Keys: "type", Description: "bug, feature, task, epic, chore"},
@@ -233,10 +238,10 @@ func (r *Registry) GenerateTDQHelp() string {
 		{Keys: "implementer / reviewer", Description: "session IDs"},
 	}
 	for _, b := range fields {
-		sb.WriteString(fmt.Sprintf("  %-22s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-22s %s\n", b.Keys, b.Description)
 	}
 
-	sb.WriteString("\n" + tdqHeaderStyle.Render("FUNCTIONS:") + "\n")
+	sb.WriteString("\nFUNCTIONS:\n")
 	funcs := []HelpBinding{
 		{Keys: "has(field)", Description: "Field is not empty"},
 		{Keys: "is(status)", Description: "Shorthand status check"},
@@ -244,10 +249,10 @@ func (r *Registry) GenerateTDQHelp() string {
 		{Keys: "descendant_of(id)", Description: "Children of epic"},
 	}
 	for _, b := range funcs {
-		sb.WriteString(fmt.Sprintf("  %-22s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-22s %s\n", b.Keys, b.Description)
 	}
 
-	sb.WriteString("\n" + tdqHeaderStyle.Render("CROSS-ENTITY:") + "\n")
+	sb.WriteString("\nCROSS-ENTITY:\n")
 	cross := []HelpBinding{
 		{Keys: `log.message ~ "x"`, Description: "Search log messages"},
 		{Keys: "log.type = blocker", Description: "Filter by log type"},
@@ -255,20 +260,20 @@ func (r *Registry) GenerateTDQHelp() string {
 		{Keys: "file.role = test", Description: "Linked file role"},
 	}
 	for _, b := range cross {
-		sb.WriteString(fmt.Sprintf("  %-22s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-22s %s\n", b.Keys, b.Description)
 	}
 
-	sb.WriteString("\n" + tdqHeaderStyle.Render("SPECIAL VALUES:") + "\n")
+	sb.WriteString("\nSPECIAL VALUES:\n")
 	special := []HelpBinding{
 		{Keys: "@me", Description: "Current session"},
 		{Keys: "today / -7d", Description: "Relative dates"},
 		{Keys: "EMPTY", Description: "Empty/null field"},
 	}
 	for _, b := range special {
-		sb.WriteString(fmt.Sprintf("  %-22s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-22s %s\n", b.Keys, b.Description)
 	}
 
-	sb.WriteString("\n" + tdqHeaderStyle.Render("SORTING:") + "\n")
+	sb.WriteString("\nSORTING:\n")
 	sortOps := []HelpBinding{
 		{Keys: "sort:priority", Description: "Sort by priority (default)"},
 		{Keys: "sort:-created", Description: "Newest first"},
@@ -276,10 +281,10 @@ func (r *Registry) GenerateTDQHelp() string {
 		{Keys: "sort:created", Description: "Oldest first"},
 	}
 	for _, b := range sortOps {
-		sb.WriteString(fmt.Sprintf("  %-22s %s\n", b.Keys, b.Description))
+		fmt.Fprintf(&sb, "  %-22s %s\n", b.Keys, b.Description)
 	}
 
-	sb.WriteString("\n" + tdqHeaderStyle.Render("EXAMPLES:") + "\n")
+	sb.WriteString("\nEXAMPLES:\n")
 	examples := []string{
 		`  type = bug AND priority <= P1`,
 		`  status = open AND created >= -7d`,
@@ -299,7 +304,7 @@ func (r *Registry) GenerateTDQHelp() string {
 // FooterHelp generates a compact help string for the footer
 func (r *Registry) FooterHelp() string {
 	// Grouped: actions | view controls | search/nav
-	return "n:new e:edit x:del a:approve r:review  S:sort T:type c:closed b:boards  /:search s:stats tab:panel ?:help"
+	return "n:new e:edit x:del a:approve r:review V:record  S:sort T:type c:closed b:boards  /:search s:stats tab:panel ?:help"
 }
 
 // BoardFooterHelp generates help text for board mode footer
@@ -364,7 +369,9 @@ func CommandHelp(cmd Command) string {
 	case CmdMarkForReview:
 		return "Mark issue for review"
 	case CmdApprove:
-		return "Approve a reviewable issue"
+		return "Approve: review + close, or close using a recorded approval"
+	case CmdRecordReview:
+		return "Record an approval review without closing (delegated mode)"
 	case CmdDelete:
 		return "Delete an issue"
 	case CmdFocusTaskSection:
@@ -412,7 +419,7 @@ func CommandHelp(cmd Command) string {
 	case CmdOpenGettingStarted:
 		return "Open the getting started guide"
 	case CmdInstallInstructions:
-		return "Install td instructions to agent file"
+		return "Add td guidance to agent file"
 	default:
 		return string(cmd)
 	}
@@ -478,7 +485,7 @@ func AllCommands() []Command {
 		CmdScrollDown, CmdScrollUp, CmdSelect, CmdBack, CmdClose,
 		CmdNavigatePrev, CmdNavigateNext,
 		CmdOpenDetails, CmdOpenStats, CmdOpenHandoffs, CmdSearch, CmdToggleClosed, CmdCycleSortMode, CmdCycleTypeFilter,
-		CmdMarkForReview, CmdApprove, CmdDelete, CmdConfirm, CmdCancel,
+		CmdMarkForReview, CmdApprove, CmdRecordReview, CmdDelete, CmdConfirm, CmdCancel,
 		CmdSearchConfirm, CmdSearchCancel, CmdSearchClear, CmdSearchBackspace, CmdSearchInput,
 		CmdFocusTaskSection, CmdOpenEpicTask, CmdOpenParentEpic, CmdCopyToClipboard, CmdCopyIDToClipboard,
 		CmdNewIssue, CmdEditIssue, CmdFormSubmit, CmdFormCancel, CmdFormToggleExtend, CmdFormOpenEditor,

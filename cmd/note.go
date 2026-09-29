@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/marcus/td/internal/db"
+	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -29,6 +30,13 @@ Examples:
   td note add "Design doc"                # opens editor for content`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		isJSON := jsonMode(cmd)
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
+
 		title := args[0]
 		content, _ := cmd.Flags().GetString("content")
 
@@ -36,7 +44,7 @@ Examples:
 		if !cmd.Flags().Changed("content") {
 			edited, err := openEditorForContent("")
 			if err != nil {
-				output.Error("editor failed: %v", err)
+				emitErr("editor failed: %v", err)
 				return err
 			}
 			content = edited
@@ -44,15 +52,22 @@ Examples:
 
 		database, err := db.Open(getBaseDir())
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		note, err := database.CreateNote(title, content)
 		if err != nil {
-			output.Error("failed to create note: %v", err)
+			emitErr("failed to create note: %v", err)
 			return err
+		}
+
+		if isJSON {
+			return output.EmitResult("note_created", map[string]any{
+				"id":   note.ID,
+				"note": note,
+			})
 		}
 
 		fmt.Printf("CREATED %s %s\n", note.ID, note.Title)
@@ -70,7 +85,8 @@ Examples:
   td note list --pinned         # show only pinned notes
   td note list --archived       # show only archived notes
   td note list --all            # include archived notes
-  td note list --search "api"   # search by title/content`,
+  td note list --search "api"   # search by title/content
+  td note list --deleted        # show only soft-deleted notes`,
 	Aliases: []string{"ls"},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		database, err := db.Open(getBaseDir())
@@ -78,13 +94,14 @@ Examples:
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		opts := db.ListNotesOptions{}
 		opts.Limit, _ = cmd.Flags().GetInt("limit")
 		opts.Search, _ = cmd.Flags().GetString("search")
 
 		showAll, _ := cmd.Flags().GetBool("all")
+		deletedOnly, _ := cmd.Flags().GetBool("deleted")
 
 		if pinned, _ := cmd.Flags().GetBool("pinned"); pinned {
 			b := true
@@ -94,10 +111,19 @@ Examples:
 		if archived, _ := cmd.Flags().GetBool("archived"); archived {
 			b := true
 			opts.Archived = &b
-		} else if !showAll {
+		} else if !showAll && !deletedOnly {
 			// Default: exclude archived
 			b := false
 			opts.Archived = &b
+		}
+
+		opts.IncludeDeleted = deletedOnly
+
+		// The deleted-only filter runs after the query, so the SQL LIMIT
+		// must not truncate the candidate set; re-apply the limit below.
+		requestedLimit := opts.Limit
+		if deletedOnly {
+			opts.Limit = 0
 		}
 
 		notes, err := database.ListNotes(opts)
@@ -106,12 +132,25 @@ Examples:
 			return err
 		}
 
+		if deletedOnly {
+			kept := notes[:0]
+			for _, n := range notes {
+				if n.DeletedAt != nil {
+					kept = append(kept, n)
+				}
+			}
+			notes = kept
+			if requestedLimit > 0 && len(notes) > requestedLimit {
+				notes = notes[:requestedLimit]
+			}
+		}
+
 		// JSON output
-		if jsonOut, _ := cmd.Flags().GetBool("json"); jsonOut {
-			return output.JSON(notes)
+		if jsonMode(cmd) {
+			return output.JSON(jsonList(notes))
 		}
 		if format, _ := cmd.Flags().GetString("output"); format == "json" {
-			return output.JSON(notes)
+			return output.JSON(jsonList(notes))
 		}
 
 		if len(notes) == 0 {
@@ -145,7 +184,8 @@ var noteShowCmd = &cobra.Command{
 
 Examples:
   td note show nt-abc123
-  td note show nt-abc123 --json`,
+  td note show nt-abc123 --json
+  td note show nt-abc123 --include-deleted`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		database, err := db.Open(getBaseDir())
@@ -153,15 +193,20 @@ Examples:
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
-		note, err := database.GetNote(args[0])
+		var note *models.Note
+		if includeDeleted, _ := cmd.Flags().GetBool("include-deleted"); includeDeleted {
+			note, err = database.GetNoteIncludingDeleted(args[0])
+		} else {
+			note, err = database.GetNote(args[0])
+		}
 		if err != nil {
 			output.Error("%v", err)
 			return err
 		}
 
-		if jsonOut, _ := cmd.Flags().GetBool("json"); jsonOut {
+		if jsonMode(cmd) {
 			return output.JSON(note)
 		}
 
@@ -193,16 +238,23 @@ Examples:
   td note edit nt-abc123                              # opens editor`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		isJSON := jsonMode(cmd)
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
+
 		database, err := db.Open(getBaseDir())
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		note, err := database.GetNote(args[0])
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
 
@@ -220,16 +272,23 @@ Examples:
 		if !cmd.Flags().Changed("title") && !cmd.Flags().Changed("content") {
 			edited, err := openEditorForContent(note.Content)
 			if err != nil {
-				output.Error("editor failed: %v", err)
+				emitErr("editor failed: %v", err)
 				return err
 			}
 			newContent = edited
 		}
 
-		_, err = database.UpdateNote(note.ID, newTitle, newContent)
+		updated, err := database.UpdateNote(note.ID, newTitle, newContent)
 		if err != nil {
-			output.Error("failed to update note: %v", err)
+			emitErr("failed to update note: %v", err)
 			return err
+		}
+
+		if isJSON {
+			return output.EmitResult("note_updated", map[string]any{
+				"id":   note.ID,
+				"note": updated,
+			})
 		}
 
 		fmt.Printf("UPDATED %s\n", note.ID)
@@ -242,19 +301,69 @@ var noteDeleteCmd = &cobra.Command{
 	Short: "Delete a note (soft-delete)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		isJSON := jsonMode(cmd)
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
+
 		database, err := db.Open(getBaseDir())
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		if err := database.DeleteNote(args[0]); err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
+		}
+
+		if isJSON {
+			return output.EmitResult("note_deleted", map[string]any{
+				"id": args[0],
+			})
 		}
 
 		fmt.Printf("DELETED %s\n", args[0])
+		return nil
+	},
+}
+
+var noteRestoreCmd = &cobra.Command{
+	Use:   "restore <id>",
+	Short: "Restore a soft-deleted note",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		isJSON := jsonMode(cmd)
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
+
+		database, err := db.Open(getBaseDir())
+		if err != nil {
+			emitErr("%v", err)
+			return err
+		}
+		defer func() { _ = database.Close() }()
+
+		note, err := database.RestoreNote(args[0])
+		if err != nil {
+			emitErr("%v", err)
+			return err
+		}
+
+		if isJSON {
+			return output.EmitResult("note_restored", map[string]any{
+				"id":   note.ID,
+				"note": note,
+			})
+		}
+
+		fmt.Printf("RESTORED %s\n", note.ID)
 		return nil
 	},
 }
@@ -269,7 +378,7 @@ var notePinCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		if err := database.PinNote(args[0]); err != nil {
 			output.Error("%v", err)
@@ -291,7 +400,7 @@ var noteUnpinCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		if err := database.UnpinNote(args[0]); err != nil {
 			output.Error("%v", err)
@@ -313,7 +422,7 @@ var noteArchiveCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		if err := database.ArchiveNote(args[0]); err != nil {
 			output.Error("%v", err)
@@ -335,7 +444,7 @@ var noteUnarchiveCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		if err := database.UnarchiveNote(args[0]); err != nil {
 			output.Error("%v", err)
@@ -359,15 +468,15 @@ func openEditorForContent(initial string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create temp file: %w", err)
 	}
-	defer os.Remove(tmpFile.Name())
+	defer func() { _ = os.Remove(tmpFile.Name()) }()
 
 	if initial != "" {
 		if _, err := tmpFile.WriteString(initial); err != nil {
-			tmpFile.Close()
+			_ = tmpFile.Close()
 			return "", fmt.Errorf("write temp file: %w", err)
 		}
 	}
-	tmpFile.Close()
+	_ = tmpFile.Close()
 
 	// Split editor command in case it includes args (e.g. "code --wait")
 	parts := strings.Fields(editor)
@@ -396,6 +505,7 @@ func init() {
 	noteCmd.AddCommand(noteShowCmd)
 	noteCmd.AddCommand(noteEditCmd)
 	noteCmd.AddCommand(noteDeleteCmd)
+	noteCmd.AddCommand(noteRestoreCmd)
 	noteCmd.AddCommand(notePinCmd)
 	noteCmd.AddCommand(noteUnpinCmd)
 	noteCmd.AddCommand(noteArchiveCmd)
@@ -411,10 +521,10 @@ func init() {
 	noteListCmd.Flags().StringP("search", "s", "", "Search title/content")
 	noteListCmd.Flags().IntP("limit", "n", 50, "Max results")
 	noteListCmd.Flags().StringP("output", "o", "table", "Output format (table, json)")
-	noteListCmd.Flags().Bool("json", false, "JSON output")
+	noteListCmd.Flags().Bool("deleted", false, "Show only soft-deleted notes")
 
 	// noteShowCmd flags
-	noteShowCmd.Flags().Bool("json", false, "JSON output")
+	noteShowCmd.Flags().Bool("include-deleted", false, "Allow showing a soft-deleted note")
 
 	// noteEditCmd flags
 	noteEditCmd.Flags().StringP("title", "t", "", "New title")

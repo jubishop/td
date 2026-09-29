@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/git"
 	"github.com/marcus/td/internal/models"
@@ -12,6 +11,11 @@ import (
 	"github.com/marcus/td/internal/workflow"
 	"github.com/spf13/cobra"
 )
+
+// errStartAllFailed signals that every non-idempotent named start failed. Each
+// failure is emitted in the per-issue path; the sentinel only sets the process
+// exit status without adding Cobra usage or a second JSON envelope.
+var errStartAllFailed = fmt.Errorf("no issues started: %w", errSilentExit)
 
 var startCmd = &cobra.Command{
 	Use:     "start [issue-id...]",
@@ -25,27 +29,46 @@ Examples:
 	GroupID: "workflow",
 	Args:    cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Args have already validated; from here every error is operational
+		// and carries its own message, so Cobra's usage block would be noise.
+		// Genuine usage errors (bad arg count, unknown flag) are reported
+		// before RunE runs and still print usage.
+		cmd.SilenceUsage = true
+
 		baseDir := getBaseDir()
+		isJSON := jsonMode(cmd)
+
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
+		emitWarn := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Warning(format, args...)
+			}
+		}
 
 		database, err := db.Open(baseDir)
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
+		scope := currentStateScope(baseDir, sess)
 
 		// Check for too many in-progress issues
 		inProgress, _ := database.ListIssues(db.ListIssuesOptions{
 			Status:      []models.Status{models.StatusInProgress},
 			Implementer: sess.ID,
 		})
-		if len(inProgress) > 4 {
+		if len(inProgress) > 4 && !isJSON {
 			fmt.Println()
 			output.Warning("You have %d issues in progress!", len(inProgress))
 			fmt.Println("  Before starting new work, move completed issues to review:")
@@ -65,13 +88,52 @@ Examples:
 		gitState, gitErr := git.GetState()
 
 		started := 0
-		skipped := 0
+		failed := 0
+		noop := 0
 
 		for _, issueID := range args {
 			issue, err := database.GetIssue(issueID)
 			if err != nil {
-				output.Warning("issue not found: %s", issueID)
-				skipped++
+				if isJSON {
+					output.JSONError(output.ErrCodeNotFound, err.Error())
+				} else {
+					emitWarn("issue not found: %s", issueID)
+				}
+				failed++
+				continue
+			}
+
+			if issue.Status == models.StatusInProgress {
+				if issue.ImplementerSession == sess.ID {
+					message := fmt.Sprintf("already started %s", issueID)
+					if isJSON {
+						if err := output.JSON(map[string]interface{}{
+							"id":      issueID,
+							"status":  string(issue.Status),
+							"action":  "already started",
+							"message": message,
+						}); err != nil {
+							output.JSONError(output.ErrCodeDatabaseError, err.Error())
+						}
+					} else {
+						emitWarn("%s", message)
+					}
+					noop++
+					continue
+				}
+
+				message := fmt.Sprintf("cannot start %s: already in_progress", issueID)
+				if issue.ImplementerSession == "" {
+					message += " with no recorded implementer"
+				} else {
+					message += fmt.Sprintf(" under session %s", issue.ImplementerSession)
+				}
+				if isJSON {
+					output.JSONError(output.ErrCodeInvalidInput, message)
+				} else {
+					emitWarn("%s", message)
+				}
+				failed++
 				continue
 			}
 
@@ -87,15 +149,23 @@ Examples:
 			}
 
 			if !sm.IsValidTransition(issue.Status, models.StatusInProgress) {
-				output.Warning("cannot start %s: invalid transition from %s", issueID, issue.Status)
-				skipped++
+				if isJSON {
+					output.JSONError(output.ErrCodeInvalidInput, fmt.Sprintf("cannot start %s: invalid transition from %s", issueID, issue.Status))
+				} else {
+					emitWarn("cannot start %s: invalid transition from %s", issueID, issue.Status)
+				}
+				failed++
 				continue
 			}
 
 			// Check if blocked without force (preserving existing behavior)
 			if issue.Status == models.StatusBlocked && !force {
-				output.Warning("cannot start blocked issue: %s (use --force to override)", issueID)
-				skipped++
+				if isJSON {
+					output.JSONError(output.ErrCodeInvalidInput, fmt.Sprintf("cannot start blocked issue: %s (use --force to override)", issueID))
+				} else {
+					emitWarn("cannot start blocked issue: %s (use --force to override)", issueID)
+				}
+				failed++
 				continue
 			}
 
@@ -103,7 +173,7 @@ Examples:
 			if results, _ := sm.Validate(ctx); len(results) > 0 {
 				for _, r := range results {
 					if !r.Passed {
-						output.Warning("%s: %s", issueID, r.Message)
+						emitWarn("%s: %s", issueID, r.Message)
 					}
 				}
 			}
@@ -113,14 +183,19 @@ Examples:
 			issue.ImplementerSession = sess.ID
 
 			if err := database.UpdateIssueLogged(issue, sess.ID, models.ActionStart); err != nil {
-				output.Warning("failed to update %s: %v", issueID, err)
-				skipped++
+				message := describeIssueWriteFailure(database, "start", issueID, err)
+				if isJSON {
+					output.JSONError(output.ErrCodeDatabaseError, message)
+				} else {
+					emitWarn("%s", message)
+				}
+				failed++
 				continue
 			}
 
 			// Record session action for bypass prevention
 			if err := database.RecordSessionAction(issueID, sess.ID, models.ActionSessionStarted); err != nil {
-				output.Warning("failed to record session history: %v", err)
+				emitWarn("failed to record session history: %v", err)
 			}
 
 			// Log the start
@@ -129,7 +204,7 @@ Examples:
 				logMsg = reason
 			}
 
-			database.AddLog(&models.Log{
+			_ = database.AddLog(&models.Log{
 				IssueID:   issueID,
 				SessionID: sess.ID,
 				Message:   logMsg,
@@ -138,7 +213,7 @@ Examples:
 
 			// Record git snapshot
 			if gitErr == nil {
-				database.AddGitSnapshot(&models.GitSnapshot{
+				_ = database.AddGitSnapshot(&models.GitSnapshot{
 					IssueID:    issueID,
 					Event:      "start",
 					CommitSHA:  gitState.CommitSHA,
@@ -147,17 +222,39 @@ Examples:
 				})
 			}
 
-			fmt.Printf("STARTED %s (session: %s)\n", issueID, sess.ID)
+			if isJSON {
+				// Re-fetch the persisted record and emit one JSON object per id
+				// (NDJSON in the bulk case), mirroring the review family.
+				started2, ferr := database.GetIssue(issueID)
+				if ferr != nil {
+					started2 = issue
+				}
+				extra := map[string]any{"session": sess.ID}
+				if gitErr == nil {
+					extra["git"] = map[string]any{
+						"commit_sha": gitState.CommitSHA,
+						"branch":     gitState.Branch,
+						"is_clean":   gitState.IsClean,
+						"modified":   gitState.Modified,
+						"untracked":  gitState.Untracked,
+					}
+				}
+				if err := output.EmitIssue("started", started2, extra); err != nil {
+					return err
+				}
+			} else {
+				fmt.Printf("STARTED %s (session: %s)\n", issueID, sess.ID)
+			}
 			started++
 		}
 
 		// Set focus to first issue if single issue, or clear if multiple
 		if len(args) == 1 && started == 1 {
-			config.SetFocus(baseDir, args[0])
+			_ = database.SetFocus(scope, args[0])
 		}
 
 		// Show git state once at the end
-		if gitErr == nil && started > 0 {
+		if gitErr == nil && started > 0 && !isJSON {
 			stateStr := "clean"
 			if !gitState.IsClean {
 				stateStr = fmt.Sprintf("%d modified, %d untracked", gitState.Modified, gitState.Untracked)
@@ -169,8 +266,16 @@ Examples:
 			}
 		}
 
-		if len(args) > 1 {
-			fmt.Printf("\nStarted %d, skipped %d\n", started, skipped)
+		if len(args) > 1 && !isJSON {
+			fmt.Printf("\nStarted %d, skipped %d\n", started, failed+noop)
+		}
+
+		// A named batch succeeds when at least one issue started, and an
+		// already-in-progress retry succeeds as an idempotent no-op. If no
+		// issue started and any true failure occurred, report failure even
+		// when the same batch also contained no-ops.
+		if started == 0 && failed > 0 {
+			return errStartAllFailed
 		}
 
 		return nil

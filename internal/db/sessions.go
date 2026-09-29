@@ -16,34 +16,66 @@ type SessionRow struct {
 	Branch            string
 	AgentType         string
 	AgentPID          int
-	ContextID         string
+	ContextID         string // audit-only execution-context fingerprint
+	MatchContextID    string // participates in the session identity key (TD_CONTEXT_ID)
+	WorktreeID        string
+	WorktreeRoot      string
+	RepoRoot          string
 	PreviousSessionID string
 	StartedAt         time.Time
 	LastActivity      time.Time
 }
 
 const sessionSelectCols = `id, name, branch, agent_type, agent_pid, context_id,
-	previous_session_id, started_at, last_activity`
+	match_context_id, worktree_id, worktree_root, repo_root, previous_session_id,
+	started_at, last_activity`
 
 // UpsertSession inserts or replaces a session in the database
 func (db *DB) UpsertSession(sess *SessionRow) error {
 	return db.withWriteLock(func() error {
 		_, err := db.conn.Exec(`INSERT OR REPLACE INTO sessions
-			(id, name, branch, agent_type, agent_pid, context_id, previous_session_id, started_at, last_activity)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, name, branch, agent_type, agent_pid, context_id, match_context_id,
+			 worktree_id, worktree_root, repo_root, previous_session_id, started_at, last_activity)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			sess.ID, sess.Name, sess.Branch, sess.AgentType, sess.AgentPID,
-			sess.ContextID, sess.PreviousSessionID, sess.StartedAt, sess.LastActivity)
+			sess.ContextID, sess.MatchContextID, sess.WorktreeID, sess.WorktreeRoot,
+			sess.RepoRoot, sess.PreviousSessionID, sess.StartedAt, sess.LastActivity)
 		return err
 	})
 }
 
-// GetSessionByBranchAgent looks up a session by branch + agent type + agent PID.
+// GetSessionByIdentity looks up a session by its full identity key:
+// branch + agent type + agent PID + match context ID + worktree ID.
+//
+// The match context ID (sourced from TD_CONTEXT_ID) lets distinct sub-agent
+// contexts that share one process/branch/checkout map to distinct sessions.
+// When contextID is empty (the normal interactive case), this matches rows
+// whose match_context_id is empty, preserving the historical behavior where
+// the key was just branch + agent_type + agent_pid.
+//
+// If worktreeID is set and no exact row exists, this does one legacy fallback
+// lookup for rows with an empty worktree_id. That keeps pre-v34 session rows
+// usable for one release while new rows are keyed by worktree.
+//
 // Returns nil, nil if not found.
-func (db *DB) GetSessionByBranchAgent(branch, agentType string, agentPID int) (*SessionRow, error) {
+func (db *DB) GetSessionByIdentity(branch, agentType string, agentPID int, contextID, worktreeID string) (*SessionRow, error) {
 	row := db.conn.QueryRow(`SELECT `+sessionSelectCols+`
-		FROM sessions WHERE branch = ? AND agent_type = ? AND agent_pid = ?
+		FROM sessions
+		WHERE branch = ? AND agent_type = ? AND agent_pid = ?
+			AND match_context_id = ? AND COALESCE(worktree_id, '') = ?
 		ORDER BY COALESCE(last_activity, started_at) DESC LIMIT 1`,
-		branch, agentType, agentPID)
+		branch, agentType, agentPID, contextID, worktreeID)
+	found, err := scanSessionRow(row)
+	if err != nil || found != nil || worktreeID == "" {
+		return found, err
+	}
+
+	row = db.conn.QueryRow(`SELECT `+sessionSelectCols+`
+		FROM sessions
+		WHERE branch = ? AND agent_type = ? AND agent_pid = ?
+			AND match_context_id = ? AND COALESCE(worktree_id, '') = ''
+		ORDER BY COALESCE(last_activity, started_at) DESC LIMIT 1`,
+		branch, agentType, agentPID, contextID)
 	return scanSessionRow(row)
 }
 
@@ -58,6 +90,18 @@ func (db *DB) GetSessionByID(id string) (*SessionRow, error) {
 func (db *DB) UpdateSessionActivity(id string, t time.Time) error {
 	return db.withWriteLock(func() error {
 		_, err := db.conn.Exec(`UPDATE sessions SET last_activity = ? WHERE id = ?`, t, id)
+		return err
+	})
+}
+
+// UpdateSessionWorktreeMetadata backfills worktree metadata on legacy session
+// rows that were created before worktree identity participated in the key.
+func (db *DB) UpdateSessionWorktreeMetadata(id, worktreeID, worktreeRoot, repoRoot string) error {
+	return db.withWriteLock(func() error {
+		_, err := db.conn.Exec(`UPDATE sessions
+			SET worktree_id = ?, worktree_root = ?, repo_root = ?
+			WHERE id = ?`,
+			worktreeID, worktreeRoot, repoRoot, id)
 		return err
 	})
 }
@@ -77,7 +121,7 @@ func (db *DB) ListAllSessions() ([]SessionRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var sessions []SessionRow
 	for rows.Next() {
@@ -107,21 +151,33 @@ func (db *DB) DeleteStaleSessions(before time.Time) (int64, error) {
 
 func scanSessionRow(row *sql.Row) (*SessionRow, error) {
 	var s SessionRow
-	var lastActivity sql.NullTime
+	var startedAt, lastActivity lenientTime
 	err := row.Scan(&s.ID, &s.Name, &s.Branch, &s.AgentType, &s.AgentPID,
-		&s.ContextID, &s.PreviousSessionID, &s.StartedAt, &lastActivity)
+		&s.ContextID, &s.MatchContextID, &s.WorktreeID, &s.WorktreeRoot,
+		&s.RepoRoot, &s.PreviousSessionID, &startedAt, &lastActivity)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	applySessionTimes(&s, startedAt, lastActivity)
+	return &s, nil
+}
+
+// applySessionTimes assigns started_at/last_activity from lenient scans,
+// tolerating rows written by older builds in an unparseable Go time.Time.String()
+// format. A malformed last_activity falls back to started_at; a malformed
+// started_at falls back to the zero time rather than failing the whole lookup.
+func applySessionTimes(s *SessionRow, startedAt, lastActivity lenientTime) {
+	if startedAt.Valid {
+		s.StartedAt = startedAt.Time
+	}
 	if lastActivity.Valid {
 		s.LastActivity = lastActivity.Time
 	} else {
 		s.LastActivity = s.StartedAt
 	}
-	return &s, nil
 }
 
 // fileSession mirrors the JSON format of filesystem session files
@@ -242,10 +298,10 @@ func (db *DB) MigrateFileSystemSessions(baseDir string) error {
 		// Only clean up filesystem if all inserts succeeded
 		if !insertFailed {
 			if sessErr == nil {
-				os.RemoveAll(sessionsPath)
+				_ = os.RemoveAll(sessionsPath)
 			}
 			if legErr == nil {
-				os.Remove(legacyPath)
+				_ = os.Remove(legacyPath)
 			}
 		}
 
@@ -255,16 +311,13 @@ func (db *DB) MigrateFileSystemSessions(baseDir string) error {
 
 func scanSessionRows(rows *sql.Rows) (*SessionRow, error) {
 	var s SessionRow
-	var lastActivity sql.NullTime
+	var startedAt, lastActivity lenientTime
 	err := rows.Scan(&s.ID, &s.Name, &s.Branch, &s.AgentType, &s.AgentPID,
-		&s.ContextID, &s.PreviousSessionID, &s.StartedAt, &lastActivity)
+		&s.ContextID, &s.MatchContextID, &s.WorktreeID, &s.WorktreeRoot,
+		&s.RepoRoot, &s.PreviousSessionID, &startedAt, &lastActivity)
 	if err != nil {
 		return nil, err
 	}
-	if lastActivity.Valid {
-		s.LastActivity = lastActivity.Time
-	} else {
-		s.LastActivity = s.StartedAt
-	}
+	applySessionTimes(&s, startedAt, lastActivity)
 	return &s, nil
 }

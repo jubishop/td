@@ -120,20 +120,91 @@ Auto-sync runs push+pull silently in the background. Enable it in config:
 
 All auto-sync operations are silent (`slog.Debug` only) and use a 5s HTTP timeout.
 
+### Enabling autosync: the per-project model
+
+**Autosync is enabled per project by setting the project up for sync.** Once a project is configured — it has a usable `sync_state` row (a `project_id`, not marked disabled), which `td login` + `td sync init` / `td sync link` give it — autosync just works. There is **no feature flag to flip** to turn sync on; the per-project configuration *is* the control. Most users never touch any of the overrides below.
+
+The `sync_autosync` feature flag and the `config.json` global switch are **optional overrides / a global kill-switch**, not how you turn sync on.
+
+#### Gate precedence
+
+For each command, td decides whether to run the autosync hooks in this exact order (see `cmd/feature_gate.go:autosyncGateOpen`):
+
+1. **Global kill-switch (highest priority).** If the global autosync override resolves to an explicit `false` — `config.json` `sync.autosync: false`, or the env vars `TD_FEATURE_SYNC_AUTOSYNC=false` / `TD_SYNC_AUTO=false` — the gate is **closed everywhere**, regardless of per-project config. An explicit `true` only *clears* the kill (it does **not** force-enable an unconfigured project); an absent value means "no global override, let the lower tiers decide".
+2. **Explicit `sync_autosync` feature flag.** If `sync_autosync` is set explicitly (env `TD_FEATURE_SYNC_AUTOSYNC` or project feature config), its value decides outright.
+3. **Per-project configured (default).** With no explicit override, a project that is actually configured for sync autosyncs; an unconfigured project does not. **This is the normal path.**
+
+#### Global kill-switch: `td sync enable` / `td sync disable`
+
+These write the tri-state `sync.autosync` field in `~/.config/td/config.json` and are always reachable even when the rest of the sync CLI is gated:
+
+```bash
+td sync disable   # sets sync.autosync=false — kills autosync in EVERY project
+td sync enable    # sets sync.autosync=true — clears the kill; per-project config decides again
+```
+
+Tri-state semantics of `sync.autosync`:
+
+| Value | Meaning |
+|---|---|
+| absent (field not present) | No global override — per-project config decides |
+| `false` | Global kill-switch engaged — autosync suppressed everywhere |
+| `true` | Kill cleared — per-project config decides (does **not** force-enable an unconfigured project) |
+
+Because it lives in `config.json`, the kill-switch is **shell-independent**: every td process reads it regardless of which shell init files were sourced (unlike `TD_*` env vars — see the cautionary note below).
+
+#### `TD_FEATURE_SYNC_AUTOSYNC` is an override, not the on-switch
+
+`TD_FEATURE_SYNC_AUTOSYNC` used to be how you turned sync on. **It is now only an override** (tier 1/2 above) and normal use should **not** depend on it — rely on per-project setup instead.
+
+If you *do* set it, put it in **`~/.zshenv`** (sourced by every shell, including non-interactive ones), **not `~/.zshrc`** (interactive shells only). An env var set only in `.zshrc` is invisible to non-interactive agent subshells, so those processes silently fall through to a different gate decision and **strand local changes with no error**. This exact bug once stranded 11 unsynced events in a project for hours. Prefer per-project setup (or the `config.json` kill-switch) precisely so you never have to reason about shell-init semantics.
+
+### When sync seems stuck: `td sync status`
+
+`td sync status` is **always available** — it works even when the rest of the sync CLI is gated off — and is the first thing to run when sync looks stuck. It reports:
+
+- **Gate** state (`ON` / `OFF` / `KILLED`) and **GateSource** (`global-kill-switch`, `explicit-env`, `explicit-config`, or `derived-per-project`) — so you can see *which* tier decided
+- **Configured** (does the project have a usable `sync_state`?) and the `project_id`
+- **Authenticated** and the server URL
+- **PendingEvents** (unsynced action-log rows; `-1` means it could not be counted)
+- **LastSyncAt**
+
+```bash
+td sync status            # human-readable
+td sync status --json     # machine-readable SyncStatusReport
+```
+
+`td doctor` also surfaces sync health as part of its broader checks.
+
+### Migration / upgrade notes
+
+- **Legacy `sync.enabled: false` does NOT affect the gate.** The autosync gate reads only the new `sync.autosync` field, never the legacy `sync.enabled`. Production configs historically carried `sync.enabled: false` while the user actually wanted sync on, so the gate intentionally ignores it — a stale `enabled: false` will **not** silently kill your sync. (To globally kill autosync, use `td sync disable`, which sets `sync.autosync`.)
+- **Already-authenticated projects are automatically "configured."** If a project already has a `sync_state` (you ran `td login` + linked before this change), it is treated as configured under the per-project model with **no re-login or re-link required**. Autosync resumes working without any action on your part.
+
 ### 2. Authenticate
 
 ```bash
 td auth login
 ```
 
-This starts the device auth flow:
+This starts the email-approval device flow (PKCE):
 
 1. You enter your email
-2. The CLI requests a device code from the server
-3. A verification URL and 6-character code are displayed
-4. Open the URL in a browser and enter the code
-5. The CLI polls until verification completes
-6. An API key is saved to `~/.config/td/auth.json` (file permissions: 0600)
+2. The CLI generates a local PKCE `code_verifier` and sends only its S256
+   `code_challenge` to the server (the verifier never leaves your machine until
+   the final poll)
+3. The server emails you a one-time approval link — nothing to copy, and no
+   code is shown in the terminal
+4. You open your email and click the link to approve the login from this device
+5. The CLI polls until you approve, then verifies the PKCE challenge and
+   completes
+6. An API key (valid ~365 days) is saved to `~/.config/td/auth.json` (file
+   permissions: 0600)
+
+The login cannot be completed without clicking the emailed link, and a
+different process that observed the request but lacks your local verifier cannot
+complete it either. If you do not approve within ~15 minutes the request
+expires; just run `td auth login` again.
 
 If the server has `SYNC_ALLOW_SIGNUP=true`, new users are created automatically on first login.
 
@@ -257,14 +328,14 @@ Server:
 
 All member commands operate on the currently linked project.
 
-**Invite a member** (owner only):
+**Add a member** (owner only):
 
 ```bash
 td sync-project invite alice@example.com          # defaults to writer role
 td sync-project invite bob@example.com reader      # read-only access
 ```
 
-The invited user must have an account on the server (created via `td auth login`).
+This CLI command creates direct project membership for an account that already exists on the sync server. td-watch web invitations are pending email invites with an accept/decline flow.
 
 **List members:**
 
@@ -325,6 +396,68 @@ If a conflict overwrote data you need, the `local_data` field in `sync_conflicts
 ```bash
 sqlite3 .todos/issues.db "SELECT local_data FROM sync_conflicts WHERE entity_id='abc123'"
 ```
+
+## Skipped Events
+
+A remote event that **cannot** be applied is skipped and recorded rather than
+retried forever. Before this existed, one unappliable event halted a peer's sync
+permanently: the batch rolled back with the sync cursor preserved, so every
+later pull replayed the same batch, failed on the same event, and rolled back
+again — and no event behind it ever applied.
+
+### The rule: permanent vs. transient
+
+Only a **permanent** failure is skipped. The distinction is whether a retry
+could ever succeed:
+
+| | Examples | Behaviour |
+|---|---|---|
+| **Permanent** | FK / UNIQUE / NOT NULL / CHECK constraint violation, unknown entity or action type, undecodable payload, missing column | Recorded in `sync_skipped_events`; the cursor advances past it so the rest of the stream keeps flowing |
+| **Transient** | `database is locked`, disk I/O error, disk full, timeout, cancelled context | Batch rolls back, cursor is preserved, retried on the next pull — exactly as before |
+
+Anything unrecognised is treated as **transient**. The peer stalls loudly rather
+than silently skipping an event whose nature could not be established;
+quarantine is opt-in per error class, never a catch-all. See
+`IsPermanentApplyError` in `internal/sync/permanent.go`.
+
+### Skip reasons
+
+- **`orphaned_parent`** — a create whose `ON DELETE CASCADE` parent no longer
+  exists locally. This is a **deliberate drop, not an error**. Cascade means the
+  schema itself says the child must not outlive the parent, so there is no state
+  in which applying it is correct, and every other peer replaying the same
+  stream in order also ends without the row. Dropping it is what makes peers
+  agree. Only cascade FKs qualify: a plain FK carries no such guarantee, so a
+  violation there is quarantined instead of dropped.
+- **`quarantined`** — the event failed to apply with an error that cannot
+  succeed on retry. Stepping over it keeps the stream moving.
+
+### Inspecting skipped events
+
+Nothing is discarded silently. Every skip is durably recorded with its
+`server_seq`, entity, and error, and surfaced by `td sync status`:
+
+```bash
+td sync status
+# Skipped events ........ 2 (orphaned_parent=1, quarantined=1)
+#   seq 88  quarantined  create issues/td-z
+#       constraint failed: NOT NULL constraint failed
+#   seq 71  orphaned_parent  create board_issue_positions/bip_x
+#       orphaned board_issue_positions/bip_x: board_id references missing boards/bd-y
+
+td sync status --json   # skipped_events + recent_skipped
+```
+
+The full payload is retained, so a skipped event can always be inspected or
+replayed by hand:
+
+```bash
+sqlite3 .todos/issues.db "SELECT server_seq, reason, error, payload FROM sync_skipped_events"
+```
+
+A non-zero `quarantined` count is worth investigating: it usually means schema
+skew between peers or a genuinely malformed event. An `orphaned_parent` count is
+normal background noise when boards are created and deleted concurrently.
 
 ## Observability
 
@@ -581,7 +714,7 @@ A unique device identifier is generated automatically on first use and stored in
 ## Command Reference
 
 ```
-td auth login              # Start device auth flow
+td auth login              # Start email-approval device flow (click emailed link)
 td auth logout             # Clear local credentials
 td auth status             # Show current auth state
 

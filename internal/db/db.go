@@ -4,6 +4,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,35 @@ import (
 	"github.com/marcus/td/internal/workdir"
 	_ "modernc.org/sqlite"
 )
+
+// ErrDatabaseUnavailable marks every failure to open the project database:
+// no database yet, an unusable file, a failed migration. Callers that need to
+// classify a failure (notably the CLI's top-level JSON error envelope) match
+// on this instead of every RunE having to tag its own db.Open call — the
+// classification belongs to the store, not to 150 call sites.
+var ErrDatabaseUnavailable = errors.New("database unavailable")
+
+// ErrIssueNotFound marks a lookup for an issue ID that is not in the database,
+// so "that id does not exist" is distinguishable from a storage failure
+// without matching on message text.
+var ErrIssueNotFound = errors.New("issue not found")
+
+// openFailure tags an Open error with ErrDatabaseUnavailable while leaving the
+// error itself — message included — exactly as it was. Reporting both through
+// Unwrap keeps errors.Is/As working for the original error too.
+type openFailure struct{ err error }
+
+func (e *openFailure) Error() string { return e.err.Error() }
+
+func (e *openFailure) Unwrap() []error { return []error{e.err, ErrDatabaseUnavailable} }
+
+// unavailable marks err as a database-availability failure.
+func unavailable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &openFailure{err: err}
+}
 
 // QueryValidator is set by main to validate TDQ queries without import cycle.
 // Returns nil if valid, error describing parse failure otherwise.
@@ -35,33 +65,12 @@ func ResolveBaseDir(baseDir string) string {
 }
 
 // openConn opens a SQLite connection with safe defaults for multi-process access.
+//
+// FK enforcement (PRAGMA foreign_keys=ON) is the default from OpenSQLite.
+// Migration 30 (td-4846e6) cleans up pre-existing orphans and adds
+// ON DELETE CASCADE to child tables before this was flipped on.
 func openConn(dbPath string) (*sql.DB, error) {
-	conn, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
-	}
-
-	// Pin to a single connection — SQLite only supports one writer,
-	// and this prevents the pool from opening extra connections that
-	// could corrupt the WAL/SHM files under concurrent multi-process access.
-	conn.SetMaxOpenConns(1)
-
-	// Enable WAL mode for concurrent reads while writes are serialized
-	if _, err := conn.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("enable WAL mode: %w", err)
-	}
-
-	// Set busy timeout for multi-process contention
-	if _, err := conn.Exec("PRAGMA busy_timeout=5000"); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("set busy timeout: %w", err)
-	}
-
-	// Slightly faster writes, still safe with WAL
-	_, _ = conn.Exec("PRAGMA synchronous=NORMAL")
-
-	return conn, nil
+	return OpenSQLite(dbPath, OpenOptions{})
 }
 
 // Open opens the database and runs any pending migrations
@@ -72,20 +81,20 @@ func Open(baseDir string) (*DB, error) {
 
 	// Check if db exists
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("database not found: run 'td init' first")
+		return nil, unavailable(fmt.Errorf("database not found: run 'td init' first"))
 	}
 
 	conn, err := openConn(dbPath)
 	if err != nil {
-		return nil, err
+		return nil, unavailable(err)
 	}
 
 	db := &DB{conn: conn, baseDir: baseDir}
 
 	// Run any pending migrations
 	if _, err := db.RunMigrations(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("run migrations: %w", err)
+		_ = conn.Close()
+		return nil, unavailable(fmt.Errorf("run migrations: %w", err))
 	}
 
 	return db, nil
@@ -109,7 +118,7 @@ func Initialize(baseDir string) (*DB, error) {
 
 	// Run schema
 	if _, err := conn.Exec(schema); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
@@ -117,20 +126,32 @@ func Initialize(baseDir string) (*DB, error) {
 
 	// Run migrations
 	if _, err := db.RunMigrations(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
 	return db, nil
 }
 
+// NewWithConn wraps an already-opened *sql.DB and a base directory in a *DB.
+// This exists for callers that own the file layout (e.g., the td-sync API
+// server, which keeps per-project DBs at non-standard paths like
+// `{projectDir}/project.db`) and have already opened the connection via
+// OpenSQLite. The returned *DB participates in the same DB API surface
+// (Conn, BaseDir, etc.) as Open/Initialize.
+func NewWithConn(conn *sql.DB, baseDir string) *DB {
+	return &DB{conn: conn, baseDir: baseDir}
+}
+
 // Close closes the database connection.
-// It performs a TRUNCATE checkpoint first to flush the WAL back into the main
-// DB file and remove the -wal/-shm files. This prevents stale shared-memory
-// files from corrupting the database when another process opens it later.
+// It performs a PASSIVE checkpoint first to flush the WAL into the main DB
+// file where possible without blocking readers/writers in other processes.
+// TRUNCATE was avoided here because it can fail or stall when another td
+// process still holds the -shm; SQLite autocheckpoints at 1000 pages so the
+// aggressive variant is unnecessary on exit.
 func (db *DB) Close() error {
 	// Best-effort checkpoint — ignore errors (DB might already be in a bad state)
-	_, _ = db.conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	_, _ = db.conn.Exec("PRAGMA wal_checkpoint(PASSIVE)")
 	return db.conn.Close()
 }
 
@@ -146,8 +167,17 @@ func (db *DB) BaseDir() string {
 	return db.baseDir
 }
 
-// withWriteLock executes fn while holding an exclusive write lock.
-// This prevents concurrent writes from multiple processes.
+// withWriteLock serializes writes across concurrent td CLI processes on
+// .todos/issues.db using a file lock at .todos/db.lock.
+//
+// Scope: this lock ONLY coordinates writers to the CLI's issues.db. It does
+// NOT coordinate with the API server (internal/api/dbpool.go and
+// internal/serverdb), which writes to separate databases —
+// {dataDir}/server.db and {dataDir}/{projectID}/events.db — and relies on
+// SQLite's internal locking. If you add a new writer to .todos/issues.db
+// from outside the CLI, you must also go through this lock (or an
+// equivalent flock on .todos/db.lock); otherwise cross-process writes can
+// race despite SQLite's own locking, which is optimistic under WAL.
 func (db *DB) withWriteLock(fn func() error) error {
 	locker := newWriteLocker(db.baseDir)
 	if err := locker.acquire(defaultTimeout); err != nil {

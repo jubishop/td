@@ -2,11 +2,13 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -66,9 +68,13 @@ func initLogFile() *os.File {
 }
 
 // Execute runs the root command
+// errSilentExit marks an error whose message has already been delivered by the
+// command itself. Execute sets the exit code and prints nothing further.
+var errSilentExit = errors.New("td: silent exit")
+
 func Execute() {
 	if f := initLogFile(); f != nil {
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 	}
 
 	cmdStartTime = time.Now()
@@ -82,8 +88,31 @@ func Execute() {
 	if err != nil {
 		args := os.Args[1:]
 
+		// Some commands report their failure fully through their own output
+		// (per-issue errors, JSON envelopes) and return a sentinel purely to
+		// set the exit code. Printing anything more would emit a second JSON
+		// envelope — making --json output unparseable — or repeat a message the
+		// command already tailored.
+		if errors.Is(err, errSilentExit) {
+			os.Exit(1)
+		}
+
 		// Log agent error for analysis
 		logAgentError(args, err.Error())
+
+		// JSON callers always get a JSON error envelope. Check the parsed
+		// persistent flag, falling back to a raw os.Args scan in case flag
+		// parsing itself failed on an unknown flag. This must run before the
+		// unknown-flag/workflow-hint handling so json callers never get the
+		// human-oriented hint text.
+		//
+		// The envelope reports the error's own code when it carries one (see
+		// withErrorCode); invalid_input is the fallback for uncoded errors,
+		// which are dominated by cobra usage failures.
+		if jsonErrorRequested() {
+			emitTopLevelJSONError(err)
+			os.Exit(1)
+		}
 
 		// Check if this is an unknown flag error and provide suggestions
 		if handleUnknownFlagError(err.Error(), args) {
@@ -98,6 +127,17 @@ func Execute() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// jsonErrorRequested reports whether the top-level error path should emit a
+// JSON error envelope. It prefers the parsed persistent --json flag but falls
+// back to scanning os.Args, since flag parsing may have failed before the flag
+// was recorded (e.g. when the error is itself an unknown flag).
+func jsonErrorRequested() bool {
+	if jsonRequested, err := rootCmd.PersistentFlags().GetBool("json"); err == nil && jsonRequested {
+		return true
+	}
+	return slices.Contains(os.Args, "--json")
 }
 
 // logAnalytics logs command usage analytics once after execution completes
@@ -152,11 +192,11 @@ func logAgentError(args []string, errMsg string) {
 		if sess, err := session.Get(database); err == nil {
 			sessionID = sess.ID
 		}
-		database.Close()
+		_ = database.Close()
 	}
 
 	// Log the error (silently fails if project not initialized)
-	db.LogAgentError(dir, args, errMsg, sessionID)
+	_ = db.LogAgentError(dir, args, errMsg, sessionID)
 }
 
 // handleUnknownFlagError checks if error is an unknown flag and suggests alternatives
@@ -262,6 +302,7 @@ func nameWithAliases(cmd *cobra.Command) string {
 func init() {
 	cobra.OnInitialize(initBaseDir)
 	rootCmd.PersistentFlags().StringVarP(&workDirFlag, "work-dir", "w", "", "project directory (resolves .td-root and git worktrees from this path)")
+	rootCmd.PersistentFlags().Bool("json", false, "Output result as JSON")
 
 	// Add custom template function for showing aliases
 	cobra.AddTemplateFunc("nameWithAliases", nameWithAliases)
@@ -394,7 +435,7 @@ func showWorkflowHint(attempted, suggested, hint string) {
 	fmt.Fprintf(os.Stderr, "  1. td start <id>     - Begin work\n")
 	fmt.Fprintf(os.Stderr, "  2. td handoff <id>   - Capture state (required)\n")
 	fmt.Fprintf(os.Stderr, "  3. td review <id>    - Submit for review\n")
-	fmt.Fprintf(os.Stderr, "  4. td approve <id>   - Complete (different session)\n\n")
+	fmt.Fprintf(os.Stderr, "  4. td approve <id>   - Complete (independent reviewer records approval)\n\n")
 	fmt.Fprintf(os.Stderr, "%s\n\n", hint)
 	fmt.Fprintf(os.Stderr, "Run 'td usage -q' for full reference.\n")
 }
@@ -428,7 +469,7 @@ func buildCommandEvent(cmd *cobra.Command, err error) db.CommandUsageEvent {
 			if sess, err := session.Get(database); err == nil {
 				event.SessionID = sess.ID
 			}
-			database.Close()
+			_ = database.Close()
 		}
 	}
 

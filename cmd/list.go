@@ -5,7 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/output"
@@ -27,7 +26,7 @@ var listCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		// Handle --filter flag (TDQ query expression)
 		filterQuery, _ := cmd.Flags().GetString("filter")
@@ -77,9 +76,9 @@ var listCmd = &cobra.Command{
 
 			// Output format
 			format, _ := cmd.Flags().GetString("format")
-			jsonOutput, _ := cmd.Flags().GetBool("json")
+			jsonOutput := jsonMode(cmd)
 			if format == "json" || jsonOutput {
-				return output.JSON(results)
+				return output.JSON(jsonList(results))
 			}
 
 			long, _ := cmd.Flags().GetBool("long")
@@ -87,7 +86,10 @@ var listCmd = &cobra.Command{
 				for _, issue := range results {
 					logs, _ := database.GetLogs(issue.ID, 5)
 					handoff, _ := database.GetLatestHandoff(issue.ID)
-					fmt.Print(output.FormatIssueLong(&issue, logs, handoff))
+					// Same pre-render sanitization as `td show`: this renders the
+					// identical block from the identical function, so it carries
+					// the identical forgery vectors.
+					fmt.Print(output.FormatIssueLong(output.SanitizedForDisplay(&issue), logs, handoff))
 					fmt.Println("---")
 				}
 				return nil
@@ -198,6 +200,9 @@ var listCmd = &cobra.Command{
 		}
 
 		// Reviewable filter
+		var reviewableMode bool
+		var reviewableIncludeApproved bool
+		var reviewableSessionID string
 		if reviewable, _ := cmd.Flags().GetBool("reviewable"); reviewable {
 			sess, err := session.GetOrCreate(database)
 			if err != nil {
@@ -207,7 +212,14 @@ var listCmd = &cobra.Command{
 			reviewOpts := reviewableByOptions(getBaseDir(), sess.ID)
 			opts.ReviewableBy = reviewOpts.ReviewableBy
 			opts.BalancedReviewPolicy = reviewOpts.BalancedReviewPolicy
+			opts.ReviewPolicyMode = reviewOpts.ReviewPolicyMode
+			reviewableMode = true
+			reviewableIncludeApproved, _ = cmd.Flags().GetBool("include-approved")
+			reviewableSessionID = sess.ID
 		}
+		_ = reviewableMode
+		_ = reviewableIncludeApproved
+		_ = reviewableSessionID
 
 		// Mine filter (issues where current session is implementer)
 		if mine, _ := cmd.Flags().GetBool("mine"); mine {
@@ -271,9 +283,9 @@ var listCmd = &cobra.Command{
 
 		// Output format (supports --json, --long, --short, and --format)
 		format, _ := cmd.Flags().GetString("format")
-		jsonOutput, _ := cmd.Flags().GetBool("json")
+		jsonOutput := jsonMode(cmd)
 		if format == "json" || jsonOutput {
-			return output.JSON(issues)
+			return output.JSON(jsonList(issues))
 		}
 
 		long, _ := cmd.Flags().GetBool("long")
@@ -281,13 +293,77 @@ var listCmd = &cobra.Command{
 			for _, issue := range issues {
 				logs, _ := database.GetLogs(issue.ID, 5)
 				handoff, _ := database.GetLatestHandoff(issue.ID)
-				fmt.Print(output.FormatIssueLong(&issue, logs, handoff))
+				fmt.Print(output.FormatIssueLong(output.SanitizedForDisplay(&issue), logs, handoff))
 				fmt.Println("---")
 			}
 			return nil
 		}
 
-		// Short format (default)
+		// Short format (default). Under --reviewable split into awaiting/
+		// ready-to-close buckets.
+		if reviewableMode {
+			awaiting := make([]models.Issue, 0, len(issues))
+			ready := make([]models.Issue, 0)
+			readyReviews := make(map[string]*models.IssueReview)
+			for _, issue := range issues {
+				rev, _ := database.GetActiveApprovalReview(issue.ID)
+				if rev == nil {
+					awaiting = append(awaiting, issue)
+					continue
+				}
+				if reviewableIncludeApproved && closerAllowed(&issue, reviewableSessionID, rev) {
+					ready = append(ready, issue)
+					readyReviews[issue.ID] = rev
+				}
+			}
+			if reviewableIncludeApproved {
+				readyOpts := opts
+				readyOpts.ReviewableBy = ""
+				readyOpts.ReadyToCloseBy = reviewableSessionID
+				readyIssues, err := database.ListIssues(readyOpts)
+				if err != nil {
+					output.Error("failed to list ready-to-close issues: %v", err)
+					return err
+				}
+				seenReady := make(map[string]bool, len(ready))
+				for _, issue := range ready {
+					seenReady[issue.ID] = true
+				}
+				for _, issue := range readyIssues {
+					if seenReady[issue.ID] {
+						continue
+					}
+					rev, _ := database.GetActiveApprovalReview(issue.ID)
+					if rev == nil {
+						continue
+					}
+					ready = append(ready, issue)
+					readyReviews[issue.ID] = rev
+					seenReady[issue.ID] = true
+				}
+			}
+			if len(awaiting) > 0 {
+				fmt.Printf("AWAITING YOUR REVIEW (%d):\n", len(awaiting))
+				for _, issue := range awaiting {
+					fmt.Printf("  %s\n", output.FormatIssueShort(&issue))
+				}
+			}
+			if reviewableIncludeApproved && len(ready) > 0 {
+				if len(awaiting) > 0 {
+					fmt.Println()
+				}
+				fmt.Printf("READY TO CLOSE (%d) — approval already recorded:\n", len(ready))
+				for _, issue := range ready {
+					rev := readyReviews[issue.ID]
+					fmt.Printf("  %s  (reviewed by: %s)\n", output.FormatIssueShort(&issue), rev.ReviewerSession)
+				}
+			}
+			if len(awaiting) == 0 && len(ready) == 0 {
+				fmt.Println("No issues found")
+			}
+			return nil
+		}
+
 		for _, issue := range issues {
 			fmt.Println(output.FormatIssueShort(&issue))
 		}
@@ -314,7 +390,7 @@ func runListShortcut(opts db.ListIssuesOptions) (*listShortcutResult, error) {
 		output.Error("%v", err)
 		return nil, err
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	issues, err := database.ListIssues(opts)
 	if err != nil {
@@ -326,16 +402,32 @@ func runListShortcut(opts db.ListIssuesOptions) (*listShortcutResult, error) {
 }
 
 var reviewableCmd = &cobra.Command{
-	Use:     "reviewable",
-	Short:   "Show issues awaiting review that you can review",
+	Use:   "reviewable",
+	Short: "Show issues awaiting review that you can review",
+	Long: `Show issues the current session can independently review.
+
+An issue is reviewable by the current session when the issue is in_review and
+the session has no implementation involvement on it (no 'started' / 'unstarted'
+history, and it isn't the current implementer).
+
+By default this EXCLUDES issues that already have a recorded approval review —
+those belong in a separate "ready to close" bucket. Pass --include-approved to
+also surface reviewed issues the current session can close. Under
+review_policy_mode=delegated, any session can close after an independent
+approval exists; non-reviewer closes require --reason.
+
+Examples:
+  td reviewable                       # Issues you can review now
+  td reviewable --include-approved    # Also show reviewed issues you can close`,
 	GroupID: "shortcuts",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		database, err := db.Open(getBaseDir())
+		baseDir := getBaseDir()
+		database, err := db.Open(baseDir)
 		if err != nil {
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
@@ -343,20 +435,87 @@ var reviewableCmd = &cobra.Command{
 			return err
 		}
 
-		result, err := runListShortcut(reviewableByOptions(getBaseDir(), sess.ID))
+		includeApproved, _ := cmd.Flags().GetBool("include-approved")
+
+		result, err := runListShortcut(reviewableByOptions(baseDir, sess.ID))
 		if err != nil {
 			return err
 		}
 
+		// Split reviewable issues into "awaiting review"; ready-to-close has
+		// its own query because implementers and review-requesters can be valid
+		// closers even though they are not reviewable reviewers.
+		awaiting := make([]models.Issue, 0, len(result.issues))
 		for _, issue := range result.issues {
-			fmt.Printf("%s  (impl: %s)\n", output.FormatIssueShort(&issue), issue.ImplementerSession)
+			rev, _ := database.GetActiveApprovalReview(issue.ID)
+			if rev == nil {
+				awaiting = append(awaiting, issue)
+				continue
+			}
 		}
 
-		if len(result.issues) == 0 {
-			fmt.Println("No issues awaiting your review")
+		readyToClose := make([]models.Issue, 0)
+		readyReviews := make(map[string]*models.IssueReview)
+		if includeApproved {
+			readyResult, err := runListShortcut(readyToCloseByOptions(baseDir, sess.ID))
+			if err != nil {
+				return err
+			}
+			for _, issue := range readyResult.issues {
+				rev, _ := database.GetActiveApprovalReview(issue.ID)
+				if rev == nil {
+					continue
+				}
+				readyToClose = append(readyToClose, issue)
+				readyReviews[issue.ID] = rev
+			}
+		}
+
+		// Two buckets cannot be a bare array without losing which is which, so
+		// --json emits the same object shape `td status --json` already uses for
+		// its in_review section: named keys whose values are plain issue arrays.
+		if jsonMode(cmd) {
+			return output.JSON(map[string]interface{}{
+				"awaiting":       jsonList(awaiting),
+				"ready_to_close": jsonList(readyToClose),
+			})
+		}
+
+		if len(awaiting) > 0 {
+			fmt.Printf("AWAITING YOUR REVIEW (%d):\n", len(awaiting))
+			for _, issue := range awaiting {
+				fmt.Printf("  %s  (impl: %s)\n", output.FormatIssueShort(&issue), issue.ImplementerSession)
+			}
+		}
+
+		if includeApproved && len(readyToClose) > 0 {
+			if len(awaiting) > 0 {
+				fmt.Println()
+			}
+			fmt.Printf("READY TO CLOSE (%d) — approval already recorded:\n", len(readyToClose))
+			for _, issue := range readyToClose {
+				rev := readyReviews[issue.ID]
+				fmt.Printf("  %s  (impl: %s, reviewed by: %s)\n", output.FormatIssueShort(&issue), issue.ImplementerSession, rev.ReviewerSession)
+			}
+		}
+
+		if len(awaiting) == 0 && len(readyToClose) == 0 {
+			if includeApproved {
+				fmt.Println("No issues awaiting your review or ready to close")
+			} else {
+				fmt.Println("No issues awaiting your review (try --include-approved for reviewed issues you can close)")
+			}
 		}
 		return nil
 	},
+}
+
+// closerAllowed reports whether the issue has the active approval needed for
+// delegated close. This is a lightweight local check used by reviewable /
+// status / context surfaces; the authoritative decision lives in
+// reviewpolicy.EvaluateCloseEligibility.
+func closerAllowed(issue *models.Issue, sessionID string, rev *models.IssueReview) bool {
+	return sessionID != "" && issue != nil && rev != nil
 }
 
 var blockedListCmd = &cobra.Command{
@@ -369,6 +528,10 @@ var blockedListCmd = &cobra.Command{
 		})
 		if err != nil {
 			return err
+		}
+
+		if jsonMode(cmd) {
+			return output.JSON(jsonList(result.issues))
 		}
 
 		for _, issue := range result.issues {
@@ -393,7 +556,7 @@ var inReviewCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
@@ -407,6 +570,15 @@ var inReviewCmd = &cobra.Command{
 		})
 		if err != nil {
 			return err
+		}
+
+		// Bare issue array, identical in shape to `td list --json`. The human
+		// "[reviewable]" marker is deliberately not folded in as a synthetic
+		// field: `td reviewable --json` is the machine-readable answer to that
+		// question, and inventing an issue field here would make an issue from
+		// this command differ from an issue from every other command.
+		if jsonMode(cmd) {
+			return output.JSON(jsonList(result.issues))
 		}
 
 		reviewable, _ := database.ListIssues(reviewableByOptions(getBaseDir(), sess.ID))
@@ -444,6 +616,10 @@ var readyCmd = &cobra.Command{
 			return err
 		}
 
+		if jsonMode(cmd) {
+			return output.JSON(jsonList(result.issues))
+		}
+
 		for _, issue := range result.issues {
 			fmt.Println(output.FormatIssueShort(&issue))
 		}
@@ -468,6 +644,18 @@ var nextCmd = &cobra.Command{
 		})
 		if err != nil {
 			return err
+		}
+
+		// `next` answers a singular question, so --json emits one issue object
+		// (same field names as `td list --json` / `td show --json`) rather than
+		// a one-element array. "no open issues" is null: unlike an empty list
+		// there is nothing to iterate, and null cannot be confused with a
+		// result.
+		if jsonMode(cmd) {
+			if len(result.issues) == 0 {
+				return output.JSON(nil)
+			}
+			return output.JSON(&result.issues[0])
 		}
 
 		if len(result.issues) == 0 {
@@ -495,8 +683,8 @@ var deletedCmd = &cobra.Command{
 			return err
 		}
 
-		if jsonOutput, _ := cmd.Flags().GetBool("json"); jsonOutput {
-			return output.JSON(result.issues)
+		if jsonOutput := jsonMode(cmd); jsonOutput {
+			return output.JSON(jsonList(result.issues))
 		}
 
 		for _, issue := range result.issues {
@@ -602,19 +790,24 @@ func resolveListIssueFilterID(database *db.DB, baseDir, rawID, flagName string) 
 	}
 
 	if trimmedID == "." {
-		focusedID, err := config.GetFocus(baseDir)
+		sess, scope, err := getCurrentStateSession(database, baseDir)
+		if err != nil {
+			return "", fmt.Errorf("resolve --%s . session: %w", flagName, err)
+		}
+
+		focusedID, err := database.GetFocus(scope)
 		if err != nil {
 			return "", fmt.Errorf("resolve --%s .: %w", flagName, err)
 		}
 		if strings.TrimSpace(focusedID) == "" {
 			var resolveErr error
-			if resolvedID, err := resolveListIssueFilterFromSession(database); err == nil && resolvedID != "" {
+			if resolvedID, err := resolveListIssueFilterFromSession(database, sess.ID); err == nil && resolvedID != "" {
 				return resolvedID, nil
 			} else if err != nil {
 				resolveErr = err
 			}
 
-			if resolvedID, err := resolveListIssueFilterFromWorkSession(database, baseDir); err == nil && resolvedID != "" {
+			if resolvedID, err := resolveListIssueFilterFromWorkSession(database, scope); err == nil && resolvedID != "" {
 				return resolvedID, nil
 			} else if err != nil {
 				resolveErr = err
@@ -631,17 +824,12 @@ func resolveListIssueFilterID(database *db.DB, baseDir, rawID, flagName string) 
 	return db.NormalizeIssueID(trimmedID), nil
 }
 
-func resolveListIssueFilterFromSession(database *db.DB) (string, error) {
-	sess, err := session.GetOrCreate(database)
-	if err != nil {
-		return "", err
-	}
-
+func resolveListIssueFilterFromSession(database *db.DB, sessionID string) (string, error) {
 	issues, err := database.ListIssues(db.ListIssuesOptions{
 		// Review-phase work still needs to resolve the epic root when the
 		// current session has already moved the issue into review.
 		Status:      []models.Status{models.StatusInProgress, models.StatusInReview},
-		Implementer: sess.ID,
+		Implementer: sessionID,
 	})
 	if err != nil {
 		return "", err
@@ -652,7 +840,7 @@ func resolveListIssueFilterFromSession(database *db.DB) (string, error) {
 
 	// Fall back to the session's logged issue history so the dot path keeps
 	// working after review transitions have cleared the focused work item.
-	sessionLogIDs, err := database.GetIssueSessionLog(sess.ID)
+	sessionLogIDs, err := database.GetIssueSessionLog(sessionID)
 	if err != nil {
 		return "", err
 	}
@@ -660,8 +848,8 @@ func resolveListIssueFilterFromSession(database *db.DB) (string, error) {
 	return resolveCommonIssueRootAncestorID(database, sessionLogIDs)
 }
 
-func resolveListIssueFilterFromWorkSession(database *db.DB, baseDir string) (string, error) {
-	wsID, err := config.GetActiveWorkSession(baseDir)
+func resolveListIssueFilterFromWorkSession(database *db.DB, scope db.SessionStateScope) (string, error) {
+	wsID, err := database.GetActiveWorkSession(scope)
 	if err != nil || strings.TrimSpace(wsID) == "" {
 		return "", err
 	}
@@ -746,6 +934,8 @@ func init() {
 	listCmd.Flags().String("implementer", "", "Filter by implementer session")
 	listCmd.Flags().String("reviewer", "", "Filter by reviewer session")
 	listCmd.Flags().Bool("reviewable", false, "Show issues you can review")
+	listCmd.Flags().Bool("include-approved", false, "With --reviewable: also show issues with recorded approval that you can close")
+	reviewableCmd.Flags().Bool("include-approved", false, "Also show issues with recorded approval that you can close")
 	listCmd.Flags().String("parent", "", "Filter by parent issue ID")
 	listCmd.Flags().String("epic", "", "Filter by epic (shows all tasks within epic)")
 	listCmd.Flags().BoolP("mine", "m", false, "Show issues where you are the implementer")
@@ -758,10 +948,7 @@ func init() {
 	listCmd.Flags().IntP("limit", "n", 50, "Limit results")
 	listCmd.Flags().Bool("long", false, "Detailed output")
 	listCmd.Flags().Bool("short", false, "Compact output (default)")
-	listCmd.Flags().Bool("json", false, "JSON output")
 	listCmd.Flags().BoolP("all", "a", false, "Include closed and deferred issues")
-
-	deletedCmd.Flags().Bool("json", false, "JSON output")
 
 	listCmd.Flags().Bool("deferred", false, "Show only currently deferred tasks")
 	listCmd.Flags().Bool("overdue", false, "Show tasks past their due date")

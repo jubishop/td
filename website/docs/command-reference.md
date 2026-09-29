@@ -24,15 +24,17 @@ Complete reference for all `td` commands.
 |---------|-------------|
 | `td start <id>` | Begin work (status -> in_progress) |
 | `td unstart <id>` | Revert to open |
+| `td unstart --session <id> [--force]` | Release every `in_progress` claim held by one named session. Exact — no liveness heuristic; the reaper a supervisor should use when it kills a tick. Previews by default; `--force` releases |
+| `td unstart --stale <dur> [--force]` | Backstop: release `in_progress` claims whose holder shows no activity for longer than `<dur>` (e.g. `2h`, `1d`). Liveness is the newest of the holder session's activity, the issue's `updated_at`, and the issue's newest history entry, so a rotated-but-live session is not swept. Previews by default; `--force` releases. No default threshold — it must exceed your longest healthy agent run |
 | `td log "message" [flags]` | Log progress. Flags: `--decision`, `--blocker`, `--hypothesis`, `--tried`, `--result` |
 | `td handoff <id> [flags]` | Capture state. Flags: `--done`, `--remaining`, `--decision`, `--uncertain` |
-| `td review <id>` | Submit for review |
-| `td reviewable` | Show reviewable issues |
-| `td approve <id> [--reason "..."]` | Approve and close. Reason required for creator-exception approvals |
-| `td reject <id> --reason "..."` | Reject back to in_progress |
+| `td review <id>` | Submit for review. Submitting session is recorded as `review_requested_by_session` |
+| `td reviewable [--include-approved]` | Show issues you can review; with `--include-approved`, also show reviewed issues you can close |
+| `td approve <id> [flags]` | Approve and close, record-only review, or close using a recorded approval. Flags: `--reason`, `--reviewed-by "<who>"`, `--self-review`, `--record-only`, `--decision approved\|changes_requested`, `--all` |
+| `td reject <id> --reason "..."` | Reject back to open. Supersedes any active approval review |
 | `td block <id>` | Mark as blocked |
 | `td unblock <id>` | Unblock to open |
-| `td close <id>` | Admin close (not for completed work) |
+| `td close <id>` | Admin close only (duplicates, won't-fix, cleanup). Use `td approve` for reviewed work |
 | `td reopen <id>` | Reopen closed issue |
 | `td comment <id> "text"` | Add comment |
 
@@ -50,6 +52,28 @@ Date formats: `+7d`, `+2w`, `+1m`, `monday`, `tomorrow`, `next-week`, `next-mont
 The `--defer` and `--due` flags are also available on `td create` and `td update`.
 
 **List filters:** `--all` (include deferred), `--deferred`, `--surfacing`, `--overdue`, `--due-soon`
+
+## Review Flag Details
+
+`td approve` operates in three modes under the default `trusted` mode and under
+`delegated`:
+
+| Invocation | Effect |
+|------------|--------|
+| `td approve <id>` | Direct reviewer-close: caller must be an eligible reviewer with no active approval recorded |
+| `td approve <id> --record-only --reason "..."` | Record an approval review without closing. Caller must be an eligible reviewer |
+| `td approve <id> --record-only --decision changes_requested --reason "..."` | Record a non-approving review |
+| `td approve <id> --reason "..."` (with existing approval) | Close using a recorded approval. Any session may close; non-reviewer closes require `--reason`. `--reviewed-by` is rejected here — no new review row is written |
+| `td approve <id> --reviewed-by "<who>"` | Trusted mode: an involved session approves by naming who reviewed the work. No `--reason` required |
+| `td approve <id> --self-review --reason "..."` | Trusted mode: acknowledge reviewing your own work |
+
+`td reviewable --include-approved` surfaces reviewed issues the current session can close — useful for orchestrators that delegated review to a sub-agent.
+
+`--record-only` and `--decision` are available in the default `trusted` mode and
+in `delegated`; `strict` and `balanced` reject them. In every mode an independent
+`td approve` performs review and close in one step, so record-only is for when
+the reviewer and the closer are deliberately different sessions. Trusted mode
+also supports explicit self-review with `--self-review --reason`.
 
 ## Agent-Safe Rich Text Input
 
@@ -115,7 +139,9 @@ cat docs/acceptance.md | td update td-a1b2 --append --acceptance-file -
 | `td status` | Dashboard view |
 | `td focus <id>` | Set focus |
 | `td unfocus` | Clear focus |
-| `td whoami` | Show session identity |
+| `td whoami` | Show session identity. `--json`: session id, started (ISO-8601), issues touched |
+| `td session list` | List sessions with last activity. `--json`: branch, agent, session, `last_activity` (ISO-8601), `age_seconds` |
+| `td session cleanup [--older-than 7d] [--force]` | Preview stale session removal; `--force` deletes. Sessions still holding `in_progress` claims are kept and reported under `held` — release them first with `td unstart --session <id> --force`. `--json`: what would be / was deleted |
 
 ## Work Sessions
 

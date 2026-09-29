@@ -1,5 +1,5 @@
 # Production environment overrides
-# Strict config, required S3 backup, resource limits
+# Strict config, resource limits. S3 backup is OPTIONAL and currently OFF.
 
 services:
   td-sync:
@@ -10,14 +10,31 @@ services:
       - SYNC_RATE_LIMIT_PUSH=${SYNC_RATE_LIMIT_PUSH:-60}
       - SYNC_RATE_LIMIT_PULL=${SYNC_RATE_LIMIT_PULL:-120}
       - SYNC_RATE_LIMIT_OTHER=${SYNC_RATE_LIMIT_OTHER:-300}
+      # Email + secure auth (Phase 1-4). Values come from envs/.env.prod.
+      # SYNC_DEV_EMAIL_INSPECT is intentionally NOT passed here: the dev
+      # last-email endpoint must never be reachable in production.
+      - SYNC_EMAIL_PROVIDER=${SYNC_EMAIL_PROVIDER:-cloudflare}
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
+      - CLOUDFLARE_EMAIL_API_TOKEN=${CLOUDFLARE_EMAIL_API_TOKEN}
+      - CLOUDFLARE_EMAIL_FROM=${CLOUDFLARE_EMAIL_FROM}
+      - CLOUDFLARE_EMAIL_FROM_NAME=${CLOUDFLARE_EMAIL_FROM_NAME}
+      - CLOUDFLARE_EMAIL_REPLY_TO=${CLOUDFLARE_EMAIL_REPLY_TO}
+      - SYNC_EMAIL_BASE_URL=${SYNC_EMAIL_BASE_URL}
+      - SYNC_AUTH_WEB_CALLBACK_URL=${SYNC_AUTH_WEB_CALLBACK_URL}
+      - SYNC_LEGACY_DEVICE_AUTH=${SYNC_LEGACY_DEVICE_AUTH:-false}
       # S3 backup (required)
       - LITESTREAM_S3_BUCKET=${LITESTREAM_S3_BUCKET}
       - LITESTREAM_S3_ENDPOINT=${LITESTREAM_S3_ENDPOINT}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-    volumes:
-      - ./litestream/litestream.prod.yml:/etc/litestream.yml:ro
+    # S3 litestream config (litestream.prod.yml) is intentionally NOT mounted:
+    # backups are OFF (no S3 bucket), and mounting it makes litestream fail with
+    # "bucket required for s3 replica" and crash-loop the container. The image's
+    # default /etc/litestream.yml uses a local file replica and starts cleanly.
+    # To enable S3 backups later: set a real LITESTREAM_S3_BUCKET and re-add:
+    #   volumes:
+    #     - ./litestream/litestream.prod.yml:/etc/litestream.yml:ro
     deploy:
       resources:
         limits:

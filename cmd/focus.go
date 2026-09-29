@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/marcus/td/internal/config"
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/output"
@@ -24,20 +23,33 @@ var focusCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
-		issueID := args[0]
-
-		// Verify issue exists
-		_, err = database.GetIssue(issueID)
+		_, scope, err := getCurrentStateSession(database, baseDir)
 		if err != nil {
 			output.Error("%v", err)
 			return err
 		}
 
-		if err := config.SetFocus(baseDir, issueID); err != nil {
+		issueID := args[0]
+
+		// Verify issue exists
+		issue, err := database.GetIssue(issueID)
+		if err != nil {
+			output.Error("%v", err)
+			return err
+		}
+
+		if err := database.SetFocus(scope, issueID); err != nil {
 			output.Error("failed to set focus: %v", err)
 			return err
+		}
+
+		// focus mutates session state, so it uses the standard mutation
+		// envelope ({"id","status","action","issue"}) the start/block/close
+		// family already emits.
+		if jsonMode(cmd) {
+			return output.EmitIssue("focused", issue, nil)
 		}
 
 		fmt.Printf("FOCUSED %s\n", issueID)
@@ -52,9 +64,34 @@ var unfocusCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		baseDir := getBaseDir()
 
-		if err := config.ClearFocus(baseDir); err != nil {
+		database, err := db.Open(baseDir)
+		if err != nil {
+			output.Error("%v", err)
+			return err
+		}
+		defer func() { _ = database.Close() }()
+
+		_, scope, err := getCurrentStateSession(database, baseDir)
+		if err != nil {
+			output.Error("%v", err)
+			return err
+		}
+
+		// Read the outgoing focus before clearing it so --json can report what
+		// was actually released; the human line says only "UNFOCUSED".
+		previousID, _ := database.GetFocus(scope)
+
+		if err := database.ClearFocus(scope); err != nil {
 			output.Error("failed to clear focus: %v", err)
 			return err
+		}
+
+		if jsonMode(cmd) {
+			// Not tied to an issue when nothing was focused, so this uses the
+			// issue-less mutation envelope ({"action", ...extra}).
+			return output.EmitResult("unfocused", map[string]any{
+				"previous_issue": previousID,
+			})
 		}
 
 		fmt.Println("UNFOCUSED")
@@ -82,7 +119,7 @@ Example in bash: td check-handoff || echo "Don't forget to run td handoff!"`,
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
@@ -91,7 +128,7 @@ Example in bash: td check-handoff || echo "Don't forget to run td handoff!"`,
 		}
 
 		quiet, _ := cmd.Flags().GetBool("quiet")
-		jsonOutput, _ := cmd.Flags().GetBool("json")
+		jsonOutput := jsonMode(cmd)
 
 		// Check for in-progress issues by this session
 		inProgress, _ := database.ListIssues(db.ListIssuesOptions{
@@ -100,10 +137,11 @@ Example in bash: td check-handoff || echo "Don't forget to run td handoff!"`,
 		})
 
 		// Check for active work session
-		wsID, _ := config.GetActiveWorkSession(baseDir)
+		scope := currentStateScope(baseDir, sess)
+		wsID, _ := database.GetActiveWorkSession(scope)
 
 		// Check for any focused issue
-		focusedID, _ := config.GetFocus(baseDir)
+		focusedID, _ := database.GetFocus(scope)
 
 		needsHandoff := len(inProgress) > 0 || wsID != ""
 
@@ -115,13 +153,14 @@ Example in bash: td check-handoff || echo "Don't forget to run td handoff!"`,
 				"active_work_session": wsID,
 				"focused_issue":       focusedID,
 			}
-			if len(inProgress) > 0 {
-				issueIDs := make([]string, len(inProgress))
-				for i, issue := range inProgress {
-					issueIDs[i] = issue.ID
-				}
-				result["in_progress_issues"] = issueIDs
+			// in_progress_issues is unconditional: an absent key is a third
+			// rendering of "nothing" alongside [] and null, and the only one a
+			// caller cannot field-access (KeyError in Python, undefined in JS).
+			issueIDs := make([]string, 0, len(inProgress))
+			for _, issue := range inProgress {
+				issueIDs = append(issueIDs, issue.ID)
 			}
+			result["in_progress_issues"] = jsonList(issueIDs)
 			return output.JSON(result)
 		}
 
@@ -162,5 +201,4 @@ func init() {
 	rootCmd.AddCommand(checkHandoffCmd)
 
 	checkHandoffCmd.Flags().Bool("quiet", false, "Suppress output, only return exit code")
-	checkHandoffCmd.Flags().Bool("json", false, "JSON output")
 }

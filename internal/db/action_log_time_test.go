@@ -28,11 +28,17 @@ func TestActionLogWritesUseCanonicalTimestampFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	issue := &models.Issue{Title: "Test Issue"}
 	if err := db.CreateIssue(issue); err != nil {
 		t.Fatalf("CreateIssue failed: %v", err)
+	}
+	// Create the dependency target so AddDependencyLogged doesn't hit
+	// the FK constraint (td-4846e6 enabled enforcement).
+	dep := &models.Issue{Title: "Dep"}
+	if err := db.CreateIssue(dep); err != nil {
+		t.Fatalf("CreateIssue dep failed: %v", err)
 	}
 
 	if err := db.LogAction(&models.ActionLog{
@@ -46,7 +52,7 @@ func TestActionLogWritesUseCanonicalTimestampFormat(t *testing.T) {
 		t.Fatalf("LogAction failed: %v", err)
 	}
 
-	if err := db.AddDependencyLogged(issue.ID, "td-999", "depends_on", "ses_test"); err != nil {
+	if err := db.AddDependencyLogged(issue.ID, dep.ID, "depends_on", "ses_test"); err != nil {
 		t.Fatalf("AddDependencyLogged failed: %v", err)
 	}
 
@@ -58,7 +64,7 @@ func TestActionLogWritesUseCanonicalTimestampFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query action_log timestamps: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	count := 0
 	for rows.Next() {

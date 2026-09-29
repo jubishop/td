@@ -8,7 +8,88 @@ import (
 	"time"
 
 	"github.com/marcus/td/internal/models"
+	"github.com/marcus/td/internal/reviewpolicy"
 )
+
+// reviewInvalidatingDiff computes an IssueMutation describing which review-
+// relevant fields changed between prev and next. Used by the logged write
+// path to decide whether to supersede any active approval review.
+//
+// Pure-metadata fields (labels, notes, due_date, defer_*) are intentionally
+// excluded so routine bookkeeping updates do not invalidate a pending
+// approval. See plan section "Review freshness" for the full list.
+func reviewInvalidatingDiff(prev, next *models.Issue, cascadedReparent bool) reviewpolicy.IssueMutation {
+	m := reviewpolicy.IssueMutation{}
+	if prev == nil || next == nil {
+		return m
+	}
+	m.DescriptionChanged = prev.Description != next.Description
+	m.TitleChanged = prev.Title != next.Title
+	m.TypeChanged = prev.Type != next.Type
+	m.PriorityChanged = prev.Priority != next.Priority
+	m.MinorChanged = prev.Minor != next.Minor
+	m.ParentIDChanged = prev.ParentID != next.ParentID
+	// status transitions: only flag transitions OUT of in_review that are NOT
+	// going to closed (the normal close path should not supersede its own
+	// approval).
+	if prev.Status == models.StatusInReview &&
+		next.Status != models.StatusInReview &&
+		next.Status != models.StatusClosed {
+		m.StatusChangedFromReviewNotClosing = true
+	}
+	// Reopen is a new review epoch. The leftover approval that justified
+	// the previous close must not make a later in_review look closable.
+	// Reopen is specifically closed -> open, the one edge out of closed in
+	// docs/status-and-review.md. A wider test would also catch the
+	// closed -> in_review that undoing a close-after-review performs, and
+	// re-supersede the very review that undo just restored.
+	if prev.Status == models.StatusClosed && next.Status == models.StatusOpen {
+		m.Reopened = true
+	}
+	m.ReparentCascade = cascadedReparent
+	return m
+}
+
+// supersedeIfReviewInvalidating is a helper that runs reviewInvalidatingDiff
+// and calls SupersedeActiveReviews if the mutation is review-invalidating.
+// Safe to call outside a transaction — SupersedeActiveReviews acquires its
+// own write lock.
+//
+// Dependencies / linked_files / work_session_tags changes arrive through
+// separate side-table mutation paths; those call supersedeApprovalIfLinked
+// directly (see relations_logged.go and work_sessions.go).
+func (db *DB) supersedeIfReviewInvalidating(store reviewSyncStore, prev, next *models.Issue, sessionID string) error {
+	if prev == nil || next == nil {
+		return nil
+	}
+	m := reviewInvalidatingDiff(prev, next, false)
+	if !reviewpolicy.IsReviewInvalidatingMutation(m) {
+		return nil
+	}
+	// This helper runs INSIDE withWriteLock from the caller
+	// (updateIssueAndLog*), so use lock-free variants to avoid deadlocking on
+	// the reentrant flock. Logged review mutations still use their own SQL
+	// transaction so a failed event insert rolls back the review change.
+	if sessionID == "" {
+		if _, err := store.Exec(`
+			UPDATE issue_reviews SET superseded_at = ?
+			WHERE issue_id = ? AND superseded_at IS NULL
+		`, time.Now(), NormalizeIssueID(next.ID)); err != nil {
+			return err
+		}
+	} else {
+		if err := db.supersedeActiveReviewsLogged(store, next.ID, sessionID); err != nil {
+			return err
+		}
+	}
+	if _, err := store.Exec(
+		`UPDATE issues SET reviewer_session = '', reviewed_at = NULL WHERE id = ?`,
+		next.ID,
+	); err != nil {
+		return err
+	}
+	return nil
+}
 
 // StaleIssueStatusError indicates the issue status changed after the caller
 // loaded the issue but before the logged transition was persisted.
@@ -22,6 +103,32 @@ func (e *StaleIssueStatusError) Error() string {
 	return fmt.Sprintf("issue %s status changed from %s to %s", e.IssueID, e.Expected, e.Actual)
 }
 
+// StaleIssueUpdateError indicates some other write persisted between the
+// caller loading the issue and this write applying. Rejecting the write
+// avoids silently reverting whatever the intervening write changed.
+//
+// It is a conflict, not a fault: nothing was written, the intervening change
+// is intact, and the caller's move is to re-read the issue and re-apply. API
+// callers should map it to 409, never 500 (see serve.WriteIssueWriteError).
+//
+// The guard keys off the caller's loaded UpdatedAt, so a caller that never
+// loaded the row — one that builds an Issue from scratch, e.g. `td system
+// import --force` — carries a zero UpdatedAt and is deliberately exempt.
+// TestUpdateIssueLoggedAllowsUnloadedSnapshot pins that exemption; removing it
+// would break import, so change it on purpose or not at all.
+type StaleIssueUpdateError struct {
+	IssueID string
+	Loaded  time.Time
+	Current time.Time
+}
+
+func (e *StaleIssueUpdateError) Error() string {
+	return fmt.Sprintf(
+		"issue %s was modified after it was loaded (loaded updated_at=%s, current updated_at=%s)",
+		e.IssueID, e.Loaded.Format(time.RFC3339Nano), e.Current.Format(time.RFC3339Nano),
+	)
+}
+
 // marshalIssue returns a JSON representation of an issue for action_log storage.
 func marshalIssue(issue *models.Issue) string {
 	data, _ := json.Marshal(issue)
@@ -31,35 +138,49 @@ func marshalIssue(issue *models.Issue) string {
 // scanIssueRow reads a full issue row from the DB within a withWriteLock closure.
 // Returns the issue and any error. Uses the same column set as GetIssue.
 func (db *DB) scanIssueRow(id string) (*models.Issue, error) {
+	return db.scanIssueRowFrom(db.conn, id)
+}
+
+func (db *DB) scanIssueRowFrom(store reviewSyncStore, id string) (*models.Issue, error) {
 	var issue models.Issue
-	var labels string
-	var closedAt, deletedAt sql.NullTime
+	// NullString for every TEXT DEFAULT '' column: old rows or incoming sync
+	// payloads may have written NULL (see internal/sync/events.go). Scanning
+	// NULL into plain string crashes `td monitor` and many CLI commands.
+	var description, labels sql.NullString
+	var closedAt, deletedAt, reviewedAt sql.NullTime
 	var parentID, acceptance, sprint sql.NullString
 	var implSession, creatorSession, reviewerSession sql.NullString
+	var reviewRequestedBy, closedBy sql.NullString
 	var createdBranch sql.NullString
 	var pointsNull sql.NullInt64
 	var deferUntil, dueDate sql.NullString
 
-	err := db.conn.QueryRow(`
+	err := store.QueryRow(`
 		SELECT id, title, description, status, type, priority, points, labels, parent_id, acceptance, sprint,
-		       implementer_session, creator_session, reviewer_session, created_at, updated_at, closed_at, deleted_at, minor, created_branch,
+		       implementer_session, creator_session, reviewer_session, review_requested_by_session, closed_by_session,
+		       created_at, updated_at, reviewed_at, closed_at, deleted_at, minor, created_branch,
 		       defer_until, due_date, defer_count
 		FROM issues WHERE id = ?
 	`, id).Scan(
-		&issue.ID, &issue.Title, &issue.Description, &issue.Status, &issue.Type, &issue.Priority,
+		&issue.ID, &issue.Title, &description, &issue.Status, &issue.Type, &issue.Priority,
 		&pointsNull, &labels, &parentID, &acceptance, &sprint,
-		&implSession, &creatorSession, &reviewerSession, &issue.CreatedAt, &issue.UpdatedAt, &closedAt, &deletedAt, &issue.Minor, &createdBranch,
+		&implSession, &creatorSession, &reviewerSession, &reviewRequestedBy, &closedBy,
+		&issue.CreatedAt, &issue.UpdatedAt, &reviewedAt, &closedAt, &deletedAt, &issue.Minor, &createdBranch,
 		&deferUntil, &dueDate, &issue.DeferCount,
 	)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("issue not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrIssueNotFound, id)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	if labels != "" {
-		issue.Labels = strings.Split(labels, ",")
+	issue.Description = description.String
+	if labels.Valid && labels.String != "" {
+		issue.Labels = strings.Split(labels.String, ",")
+	}
+	if reviewedAt.Valid {
+		issue.ReviewedAt = &reviewedAt.Time
 	}
 	if closedAt.Valid {
 		issue.ClosedAt = &closedAt.Time
@@ -74,6 +195,8 @@ func (db *DB) scanIssueRow(id string) (*models.Issue, error) {
 	issue.ImplementerSession = implSession.String
 	issue.CreatorSession = creatorSession.String
 	issue.ReviewerSession = reviewerSession.String
+	issue.ReviewRequestedBySession = reviewRequestedBy.String
+	issue.ClosedBySession = closedBy.String
 	issue.CreatedBranch = createdBranch.String
 	if deferUntil.Valid {
 		issue.DeferUntil = &deferUntil.String
@@ -167,6 +290,21 @@ func (db *DB) updateIssueAndLog(issue *models.Issue, sessionID string, actionTyp
 }
 
 func (db *DB) updateIssueAndLogFromPrevious(issue, prev *models.Issue, sessionID string, actionType models.ActionType) error {
+	return db.updateIssueAndLogFromPreviousStore(db.conn, issue, prev, sessionID, actionType)
+}
+
+func (db *DB) updateIssueAndLogFromPreviousStore(store reviewSyncStore, issue, prev *models.Issue, sessionID string, actionType models.ActionType) error {
+	// An issue landing on open is unclaimed work: release the implementer
+	// claim here, once, for every surface. See releaseClaimOnOpen.
+	releaseClaimOnOpen(issue)
+
+	// Review invalidation must succeed before the issue mutation. The review
+	// helper commits its row update and sync event atomically; on an injected
+	// action_log failure this returns without changing the issue.
+	if err := db.supersedeIfReviewInvalidating(store, prev, issue, sessionID); err != nil {
+		return fmt.Errorf("supersede invalidated review: %w", err)
+	}
+
 	previousData := marshalIssue(prev)
 
 	// Apply update
@@ -182,17 +320,21 @@ func (db *DB) updateIssueAndLogFromPrevious(issue, prev *models.Issue, sessionID
 		dueDate = sql.NullString{String: *issue.DueDate, Valid: true}
 	}
 
-	_, err := db.conn.Exec(`
+	_, err := store.Exec(`
 		UPDATE issues SET title = ?, description = ?, status = ?, type = ?, priority = ?,
 		                  points = ?, labels = ?, parent_id = ?, acceptance = ?, sprint = ?,
-		                  implementer_session = ?, reviewer_session = ?, updated_at = ?,
+		                  implementer_session = ?, reviewer_session = ?,
+		                  review_requested_by_session = ?, closed_by_session = ?,
+		                  updated_at = ?, reviewed_at = ?,
 		                  closed_at = ?, deleted_at = ?,
 		                  defer_until = ?, due_date = ?, defer_count = ?,
 		                  creator_session = ?, minor = ?, created_branch = ?
 		WHERE id = ?
 	`, issue.Title, issue.Description, issue.Status, issue.Type, issue.Priority,
 		issue.Points, labels, issue.ParentID, issue.Acceptance, issue.Sprint,
-		issue.ImplementerSession, issue.ReviewerSession, issue.UpdatedAt,
+		issue.ImplementerSession, issue.ReviewerSession,
+		issue.ReviewRequestedBySession, issue.ClosedBySession,
+		issue.UpdatedAt, issue.ReviewedAt,
 		issue.ClosedAt, issue.DeletedAt,
 		deferUntil, dueDate, issue.DeferCount,
 		issue.CreatorSession, issue.Minor, issue.CreatedBranch, issue.ID)
@@ -207,7 +349,7 @@ func (db *DB) updateIssueAndLogFromPrevious(issue, prev *models.Issue, sessionID
 	}
 	newData := marshalIssue(issue)
 	actionTS := formatActionLogTimestamp(issue.UpdatedAt)
-	_, err = db.conn.Exec(`INSERT INTO action_log (id, session_id, action_type, entity_type, entity_id, previous_data, new_data, timestamp, undone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+	_, err = store.Exec(`INSERT INTO action_log (id, session_id, action_type, entity_type, entity_id, previous_data, new_data, timestamp, undone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
 		actionID, sessionID, string(actionType), "issue", issue.ID, previousData, newData, actionTS)
 	if err != nil {
 		return fmt.Errorf("log action: %w", err)
@@ -216,45 +358,260 @@ func (db *DB) updateIssueAndLogFromPrevious(issue, prev *models.Issue, sessionID
 	return nil
 }
 
+// insertLogRowWithSyncEvent writes one logs row and the create/logs action_log
+// entry that makes it visible to sync, through the same store — pass a *sql.Tx
+// and the pair is atomic.
+//
+// Every logs producer must go through a helper that does BOTH. The sync engine
+// derives its events exclusively from action_log (internal/sync/client.go
+// GetPendingEvents), so a logs row written without a matching action_log entry
+// exists on the writing client and nowhere else, permanently:
+// sync.BackfillOrphanEntities cannot rescue it because it bails out once
+// last_pulled_server_seq > 0, i.e. after the client's first pull. This has now
+// been fixed twice at two different producers (recordClaimReleaseHistory in
+// claims.go, and addLogEntry below); keeping the two writes inside one helper
+// is what stops there being a third.
+func insertLogRowWithSyncEvent(store reviewSyncStore, log *models.Log) error {
+	if _, err := store.Exec(`
+		INSERT INTO logs (id, issue_id, session_id, work_session_id, message, type, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, log.ID, log.IssueID, log.SessionID, log.WorkSessionID, log.Message, log.Type, log.Timestamp); err != nil {
+		return err
+	}
+
+	actionID, err := generateActionID()
+	if err != nil {
+		return fmt.Errorf("generate log action ID: %w", err)
+	}
+	newData, err := json.Marshal(map[string]any{
+		"id": log.ID, "issue_id": log.IssueID, "session_id": log.SessionID,
+		"work_session_id": log.WorkSessionID, "message": log.Message,
+		"type": log.Type, "timestamp": log.Timestamp,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal log entry: %w", err)
+	}
+	if _, err := store.Exec(`INSERT INTO action_log
+		(id, session_id, action_type, entity_type, entity_id, previous_data, new_data, timestamp, undone)
+		VALUES (?, ?, 'create', 'logs', ?, '', ?, ?, 0)`,
+		actionID, log.SessionID, log.ID, string(newData),
+		formatActionLogTimestamp(log.Timestamp)); err != nil {
+		return fmt.Errorf("log log-entry action: %w", err)
+	}
+	return nil
+}
+
 // addLogEntry inserts a progress log entry WITHOUT acquiring withWriteLock.
 // Caller MUST already hold the write lock.
+//
+// The logs row and its create/logs sync event go in together, in one
+// transaction — see insertLogRowWithSyncEvent for why that pairing is not
+// optional.
 func (db *DB) addLogEntry(issueID, sessionID, message string, logType models.LogType) error {
 	id, err := generateLogID()
 	if err != nil {
 		return fmt.Errorf("generate log ID: %w", err)
 	}
-	now := time.Now()
-	_, err = db.conn.Exec(`
-		INSERT INTO logs (id, issue_id, session_id, work_session_id, message, type, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, id, issueID, sessionID, "", message, logType, now)
-	return err
+	entry := &models.Log{
+		ID:        id,
+		IssueID:   issueID,
+		SessionID: sessionID,
+		Message:   message,
+		Type:      logType,
+		Timestamp: time.Now(),
+	}
+	return db.withReviewSyncTxLocked(func(tx *sql.Tx) error {
+		return insertLogRowWithSyncEvent(tx, entry)
+	})
 }
 
 // UpdateIssueLogged updates an issue and logs the action atomically within a single withWriteLock call.
 // It reads the current DB state for PreviousData before applying the update.
+//
+// Guards against the caller's issue snapshot going stale: if issue.UpdatedAt
+// (set when the caller loaded it, e.g. via GetIssue) no longer matches the
+// persisted updated_at, some other write landed in between and this write is
+// rejected rather than silently reverting it. Callers that intentionally
+// restore an old snapshot regardless of intervening writes (undo) must use
+// UpdateIssueLoggedUnconditional instead.
 func (db *DB) UpdateIssueLogged(issue *models.Issue, sessionID string, actionType models.ActionType) error {
 	return db.withWriteLock(func() error {
-		return db.updateIssueAndLog(issue, sessionID, actionType)
+		return db.withReviewSyncTxLocked(func(tx *sql.Tx) error {
+			prev, err := db.scanIssueRowFrom(tx, issue.ID)
+			if err != nil {
+				return err
+			}
+			if !issue.UpdatedAt.IsZero() && !issue.UpdatedAt.Equal(prev.UpdatedAt) {
+				return &StaleIssueUpdateError{IssueID: issue.ID, Loaded: issue.UpdatedAt, Current: prev.UpdatedAt}
+			}
+			return db.updateIssueAndLogFromPreviousStore(tx, issue, prev, sessionID, actionType)
+		})
 	})
+}
+
+// UpdateIssueLoggedUnconditional updates an issue and logs the action
+// atomically, without the staleness guard UpdateIssueLogged applies. It
+// exists for undo, which intentionally restores an older snapshot over
+// whatever is currently persisted; guarding that write against the very
+// change it means to revert would make undo unusable.
+func (db *DB) UpdateIssueLoggedUnconditional(issue *models.Issue, sessionID string, actionType models.ActionType) error {
+	return db.withWriteLock(func() error {
+		return db.withReviewSyncTxLocked(func(tx *sql.Tx) error {
+			prev, err := db.scanIssueRowFrom(tx, issue.ID)
+			if err != nil {
+				return err
+			}
+			return db.updateIssueAndLogFromPreviousStore(tx, issue, prev, sessionID, actionType)
+		})
+	})
+}
+
+// UpdateIssueLoggedWithReviewMeta performs the same atomic issue update + log
+// as UpdateIssueLoggedIfStatus but records review-undo metadata in the
+// action_log NewData column so cmd/undo.go can roll back issue_reviews
+// side-effects. Used by the delegated-review flow (Step 2) for:
+//   - ActionApprove (direct reviewer close: inserted one review row)
+//   - ActionReviewApprove / ActionReviewChangesRequested (record-only)
+//   - ActionCloseAfterReview (no review row inserted, but may want audit of
+//     prior reviewer/closed-by fields; the Issue JSON in PreviousData already
+//     carries those)
+//
+// createdReviewID and priorActiveReviewID are optional; empty strings are
+// acceptable and produce a bare-Issue NewData (backward compatible).
+func (db *DB) UpdateIssueLoggedWithReviewMeta(
+	issue *models.Issue, expectedStatus models.Status, sessionID string,
+	actionType models.ActionType,
+	createdReviewID, priorActiveReviewID string,
+) error {
+	return db.UpdateIssueLoggedWithReviewMetaIfUnchanged(issue, nil, expectedStatus, sessionID, actionType, createdReviewID, priorActiveReviewID)
+}
+
+// UpdateIssueLoggedWithReviewMetaIfUnchanged also checks an optional task
+// snapshot before changing the issue or its review metadata.
+func (db *DB) UpdateIssueLoggedWithReviewMetaIfUnchanged(
+	issue, expected *models.Issue, expectedStatus models.Status, sessionID string,
+	actionType models.ActionType, createdReviewID, priorActiveReviewID string,
+) error {
+	return db.withWriteLock(func() error {
+		return db.withReviewSyncTxLocked(func(tx *sql.Tx) error {
+			prev, err := db.scanIssueRowFrom(tx, issue.ID)
+			if err != nil {
+				return err
+			}
+			if expected != nil && (prev.DeletedAt != nil || marshalIssue(prev) != marshalIssue(expected)) {
+				return ErrIssueChanged
+			}
+			if prev.Status != expectedStatus {
+				return &StaleIssueStatusError{
+					IssueID: issue.ID, Expected: expectedStatus, Actual: prev.Status,
+				}
+			}
+			return db.updateIssueAndLogFromPreviousWithReviewMetaStore(
+				tx, issue, prev, sessionID, actionType, createdReviewID, priorActiveReviewID,
+			)
+		})
+	})
+}
+
+func (db *DB) updateIssueAndLogFromPreviousWithReviewMetaStore(
+	store reviewSyncStore, issue, prev *models.Issue, sessionID string, actionType models.ActionType,
+	createdReviewID, priorActiveReviewID string,
+) error {
+	// Same invariant as the plain writer: open is unclaimed. See
+	// releaseClaimOnOpen.
+	releaseClaimOnOpen(issue)
+
+	// Approve / close-after-review are NOT review-invalidating: status goes
+	// in_review -> closed, and the approve path intentionally creates the
+	// review row it wants to keep active. All other invalidating mutations
+	// must emit their review update before the issue itself changes.
+	if actionType != models.ActionApprove &&
+		actionType != models.ActionReviewApprove &&
+		actionType != models.ActionReviewChangesRequested &&
+		actionType != models.ActionCloseAfterReview {
+		if err := db.supersedeIfReviewInvalidating(store, prev, issue, sessionID); err != nil {
+			return fmt.Errorf("supersede invalidated review: %w", err)
+		}
+	}
+
+	previousData := marshalIssue(prev)
+
+	issue.UpdatedAt = time.Now()
+	labels := strings.Join(issue.Labels, ",")
+
+	deferUntil := sql.NullString{String: "", Valid: false}
+	if issue.DeferUntil != nil {
+		deferUntil = sql.NullString{String: *issue.DeferUntil, Valid: true}
+	}
+	dueDate := sql.NullString{String: "", Valid: false}
+	if issue.DueDate != nil {
+		dueDate = sql.NullString{String: *issue.DueDate, Valid: true}
+	}
+
+	_, err := store.Exec(`
+		UPDATE issues SET title = ?, description = ?, status = ?, type = ?, priority = ?,
+		                  points = ?, labels = ?, parent_id = ?, acceptance = ?, sprint = ?,
+		                  implementer_session = ?, reviewer_session = ?,
+		                  review_requested_by_session = ?, closed_by_session = ?,
+		                  updated_at = ?, reviewed_at = ?,
+		                  closed_at = ?, deleted_at = ?,
+		                  defer_until = ?, due_date = ?, defer_count = ?,
+		                  creator_session = ?, minor = ?, created_branch = ?
+		WHERE id = ?
+	`, issue.Title, issue.Description, issue.Status, issue.Type, issue.Priority,
+		issue.Points, labels, issue.ParentID, issue.Acceptance, issue.Sprint,
+		issue.ImplementerSession, issue.ReviewerSession,
+		issue.ReviewRequestedBySession, issue.ClosedBySession,
+		issue.UpdatedAt, issue.ReviewedAt,
+		issue.ClosedAt, issue.DeletedAt,
+		deferUntil, dueDate, issue.DeferCount,
+		issue.CreatorSession, issue.Minor, issue.CreatedBranch, issue.ID)
+	if err != nil {
+		return err
+	}
+
+	// Serialize review metadata as an extended ReviewUndoPayload into NewData.
+	// Older undo code expects NewData to be bare Issue JSON; since most undo
+	// code paths only read PreviousData, NewData is a safe place to stash
+	// review metadata. The undo code explicitly parses NewData as
+	// ReviewUndoPayload when handling review-aware actions.
+	payload := models.ReviewUndoPayload{
+		Issue:               issue,
+		CreatedReviewID:     createdReviewID,
+		PriorActiveReviewID: priorActiveReviewID,
+	}
+	newData, _ := json.Marshal(payload)
+
+	actionID, err := generateActionID()
+	if err != nil {
+		return fmt.Errorf("generate action ID: %w", err)
+	}
+	actionTS := formatActionLogTimestamp(issue.UpdatedAt)
+	_, err = store.Exec(`INSERT INTO action_log (id, session_id, action_type, entity_type, entity_id, previous_data, new_data, timestamp, undone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+		actionID, sessionID, string(actionType), "issue", issue.ID, previousData, string(newData), actionTS)
+	if err != nil {
+		return fmt.Errorf("log action: %w", err)
+	}
+
+	return nil
 }
 
 // UpdateIssueLoggedIfStatus updates an issue and logs the action atomically,
 // but only if the current persisted status still matches expectedStatus.
 func (db *DB) UpdateIssueLoggedIfStatus(issue *models.Issue, expectedStatus models.Status, sessionID string, actionType models.ActionType) error {
 	return db.withWriteLock(func() error {
-		prev, err := db.scanIssueRow(issue.ID)
-		if err != nil {
-			return err
-		}
-		if prev.Status != expectedStatus {
-			return &StaleIssueStatusError{
-				IssueID:  issue.ID,
-				Expected: expectedStatus,
-				Actual:   prev.Status,
+		return db.withReviewSyncTxLocked(func(tx *sql.Tx) error {
+			prev, err := db.scanIssueRowFrom(tx, issue.ID)
+			if err != nil {
+				return err
 			}
-		}
-		return db.updateIssueAndLogFromPrevious(issue, prev, sessionID, actionType)
+			if prev.Status != expectedStatus {
+				return &StaleIssueStatusError{
+					IssueID: issue.ID, Expected: expectedStatus, Actual: prev.Status,
+				}
+			}
+			return db.updateIssueAndLogFromPreviousStore(tx, issue, prev, sessionID, actionType)
+		})
 	})
 }
 

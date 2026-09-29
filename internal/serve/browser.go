@@ -43,7 +43,7 @@ func (s *Server) registerBrowserRoutes() {
 		_, _ = w.Write(page)
 	})
 	s.mux.HandleFunc("GET /v1/browser", func(w http.ResponseWriter, r *http.Request) {
-		minTitle, maxTitle := s.titleLengthLimits()
+		minTitle, maxTitle := titleLengthLimitsFor(s.handlerContext())
 		WriteSuccess(w, map[string]interface{}{
 			"name": filepath.Base(s.baseDir), "path": s.baseDir,
 			"session_id":       s.sessionID,

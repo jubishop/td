@@ -26,13 +26,14 @@ type ServeConfig struct {
 
 // Server is the td serve HTTP server.
 type Server struct {
-	db        *db.DB
-	sessionID string
-	baseDir   string
-	config    ServeConfig
-	mux       *http.ServeMux
-	sseHub    *SSEHub
-	http      *http.Server
+	db         *db.DB
+	sessionID  string
+	worktreeID string
+	baseDir    string
+	config     ServeConfig
+	mux        *http.ServeMux
+	sseHub     *SSEHub
+	http       *http.Server
 }
 
 // NewServer creates a new Server, registers all routes, and sets up the
@@ -45,11 +46,12 @@ func NewServer(database *db.DB, baseDir, sessionID string, config ServeConfig) *
 	}
 
 	s := &Server{
-		db:        database,
-		sessionID: sessionID,
-		baseDir:   baseDir,
-		config:    config,
-		mux:       http.NewServeMux(),
+		db:         database,
+		sessionID:  sessionID,
+		worktreeID: worktreeIDForBaseDir(baseDir),
+		baseDir:    baseDir,
+		config:     config,
+		mux:        http.NewServeMux(),
 	}
 
 	// Initialize SSE hub (requires database for change_token polling)
@@ -172,6 +174,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/issues/{id}/start", s.handleStart)
 	s.mux.HandleFunc("POST /v1/issues/{id}/review", s.handleReview)
 	s.mux.HandleFunc("POST /v1/issues/{id}/approve", s.handleApprove)
+	s.mux.HandleFunc("POST /v1/issues/{id}/reviews", s.handleRecordReview)
 	s.mux.HandleFunc("POST /v1/issues/{id}/reject", s.handleReject)
 	s.mux.HandleFunc("POST /v1/issues/{id}/block", s.handleBlock)
 	s.mux.HandleFunc("POST /v1/issues/{id}/unblock", s.handleUnblock)
@@ -203,6 +206,7 @@ func (s *Server) registerRoutes() {
 
 	// Stats (read)
 	s.mux.HandleFunc("GET /v1/stats", s.handleStats)
+	s.mux.HandleFunc("GET /v1/labels", s.handleListLabels)
 
 	// SSE events
 	s.mux.HandleFunc("GET /v1/events", s.handleEvents)

@@ -8,33 +8,67 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/marcus/td/internal/email"
 	"github.com/marcus/td/internal/serverdb"
 	"golang.org/x/sync/singleflight"
 )
 
 // Server is the HTTP API server for td-sync.
 type Server struct {
-	config        Config
-	http          *http.Server
-	store         *serverdb.ServerDB
-	dbPool        *ProjectDBPool
-	metrics       *Metrics
-	rateLimiter   *RateLimiter
-	snapshotGroup singleflight.Group
-	cancel        context.CancelFunc
-	startTime     time.Time
+	config          Config
+	http            *http.Server
+	store           *serverdb.ServerDB
+	dbPool          *ProjectDBPool
+	projectLivePool *ProjectLivePool
+	metrics         *Metrics
+	rateLimiter     *RateLimiter
+	snapshotGroup   singleflight.Group
+	cancel          context.CancelFunc
+	startTime       time.Time
+	emailSender     email.EmailSender
+
+	// sseHubs is the per-project SSE fan-out registry. Initialized in NewServer.
+	sseHubs *SSEHubRegistry
+	// pingInterval controls how often the SSE handler sends keep-alive pings.
+	// Default is defaultPingInterval (15s); tests may inject a shorter value.
+	pingInterval time.Duration
+}
+
+// buildEmailConfig maps the server Config to the provider-neutral email.EmailConfig.
+// NOTE: CloudflareBaseURL is intentionally NOT set from AuthEmailBaseURL — that field
+// is the Cloudflare REST API base (tests only) and must default to api.cloudflare.com.
+// SYNC_EMAIL_BASE_URL is consumed directly by the auth handlers for link generation.
+func buildEmailConfig(cfg Config) email.EmailConfig {
+	return email.EmailConfig{
+		Provider:    cfg.EmailProvider,
+		AccountID:   cfg.CloudflareAccountID,
+		APIToken:    cfg.CloudflareEmailAPIToken,
+		From:        cfg.CloudflareEmailFrom,
+		FromName:    cfg.CloudflareEmailFromName,
+		ReplyTo:     cfg.CloudflareEmailReplyTo,
+		CallbackURL: cfg.AuthWebCallbackURL,
+	}
 }
 
 // NewServer creates a new Server with the given config and store.
 func NewServer(cfg Config, store *serverdb.ServerDB) (*Server, error) {
 	s := &Server{
-		config:      cfg,
-		store:       store,
-		dbPool:      NewProjectDBPool(cfg.ProjectDataDir),
-		metrics:     NewMetrics(),
-		rateLimiter: NewRateLimiter(),
-		startTime:   time.Now(),
+		config:          cfg,
+		store:           store,
+		dbPool:          NewProjectDBPool(cfg.ProjectDataDir),
+		projectLivePool: NewProjectLivePool(cfg.ProjectDataDir),
+		metrics:         NewMetrics(),
+		rateLimiter:     NewRateLimiter(),
+		startTime:       time.Now(),
+		sseHubs:         NewSSEHubRegistry(),
+		pingInterval:    defaultPingInterval,
 	}
+
+	sender, err := email.NewEmailSender(buildEmailConfig(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("create email sender: %w", err)
+	}
+	s.emailSender = sender
 
 	s.http = &http.Server{
 		Addr:         cfg.ListenAddr,
@@ -92,6 +126,13 @@ func (s *Server) Start() error {
 				} else if n > 0 {
 					slog.Info("cleaned up expired auth requests", "count", n)
 				}
+
+				nc, err := s.store.CleanupExpiredChallenges()
+				if err != nil {
+					slog.Error("cleanup expired challenges", "err", err)
+				} else if nc > 0 {
+					slog.Info("cleaned up expired challenges", "count", nc)
+				}
 			}
 		}
 	}()
@@ -146,6 +187,11 @@ func (s *Server) Start() error {
 		}
 	}()
 
+	// Plan §9.3 (b): sample per-project applied_cursor lag every 30s. Shares
+	// the same shutdown ctx as the cleanup goroutines so Shutdown() tears it
+	// down with the rest of the periodic tasks.
+	s.startLagSampler(ctx)
+
 	return nil
 }
 
@@ -157,6 +203,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.rateLimiter.Stop()
 	err := s.http.Shutdown(ctx)
 	s.dbPool.CloseAll()
+	if s.projectLivePool != nil {
+		_ = s.projectLivePool.Close()
+	}
 	return err
 }
 
@@ -169,17 +218,52 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /metricz", s.handleMetrics)
 
 	// Auth (public)
-	mux.HandleFunc("POST /v1/auth/login/start", s.handleLoginStart)
-	mux.HandleFunc("POST /v1/auth/login/poll", s.handleLoginPoll)
-	mux.HandleFunc("GET /auth/verify", s.handleVerifyPage)
-	mux.HandleFunc("POST /auth/verify", s.handleVerifySubmit)
+	if s.config.LegacyDeviceAuth {
+		mux.HandleFunc("POST /v1/auth/login/start", s.handleLoginStart)
+		mux.HandleFunc("POST /v1/auth/login/poll", s.handleLoginPoll)
+		mux.HandleFunc("GET /auth/verify", s.handleVerifyPage)
+		mux.HandleFunc("POST /auth/verify", s.handleVerifySubmit)
+	} else {
+		mux.HandleFunc("POST /v1/auth/login/start", func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusGone, "endpoint_disabled", "this endpoint has been disabled; use /v1/auth/web/start or /v1/auth/device/start")
+		})
+		mux.HandleFunc("POST /v1/auth/login/poll", func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusGone, "endpoint_disabled", "this endpoint has been disabled; use /v1/auth/device/poll")
+		})
+		mux.HandleFunc("GET /auth/verify", func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		})
+		mux.HandleFunc("POST /auth/verify", func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		})
+	}
+	mux.HandleFunc("POST /v1/auth/web/start", s.handleWebStart)
+	mux.HandleFunc("POST /v1/auth/web/exchange", s.handleWebExchange)
+	mux.HandleFunc("POST /v1/auth/device/start", s.handleDeviceStart)
+	mux.HandleFunc("GET /auth/device/approve", s.handleDeviceApprove)
+	mux.HandleFunc("POST /v1/auth/device/poll", s.handleDevicePoll)
+
+	// Dev/test-only: read the last sent magic-link email. The handler itself is
+	// hard-gated (DevEmailInspect flag AND *email.MemorySender provider) and
+	// returns 404 otherwise, so registering it unconditionally is safe — prod
+	// uses the cloudflare provider and can never satisfy the gate. See
+	// handleDevLastEmail for the security rationale.
+	mux.HandleFunc("GET /internal/dev/last-email", s.handleDevLastEmail)
 
 	// Projects
-	mux.HandleFunc("POST /v1/projects", s.requireAuth(s.withRateLimit(s.handleCreateProject, s.config.RateLimitOther)))
-	mux.HandleFunc("GET /v1/projects", s.requireAuth(s.withRateLimit(s.handleListProjects, s.config.RateLimitOther)))
+	mux.HandleFunc("POST /v1/projects", s.requireAuth(s.requireProjectScope(s.withRateLimit(s.handleCreateProject, s.config.RateLimitOther))))
+	mux.HandleFunc("GET /v1/projects", s.requireAuth(s.requireProjectScope(s.withRateLimit(s.handleListProjects, s.config.RateLimitOther))))
 	mux.HandleFunc("GET /v1/projects/{id}", s.requireProjectAuth(serverdb.RoleReader, s.withRateLimit(s.handleGetProject, s.config.RateLimitOther)))
 	mux.HandleFunc("PATCH /v1/projects/{id}", s.requireProjectAuth(serverdb.RoleWriter, s.withRateLimit(s.handleUpdateProject, s.config.RateLimitOther)))
 	mux.HandleFunc("DELETE /v1/projects/{id}", s.requireProjectAuth(serverdb.RoleOwner, s.withRateLimit(s.handleDeleteProject, s.config.RateLimitOther)))
+
+	// Invitations
+	mux.HandleFunc("POST /v1/projects/{id}/invitations", s.requireProjectAuth(serverdb.RoleOwner, s.withRateLimit(s.handleCreateInvitation, s.config.RateLimitOther)))
+	mux.HandleFunc("GET /v1/projects/{id}/invitations", s.requireProjectAuth(serverdb.RoleOwner, s.withRateLimit(s.handleListProjectInvitations, s.config.RateLimitOther)))
+	mux.HandleFunc("DELETE /v1/projects/{id}/invitations/{invitationID}", s.requireProjectAuth(serverdb.RoleOwner, s.withRateLimit(s.handleDeleteInvitation, s.config.RateLimitOther)))
+	mux.HandleFunc("GET /v1/invitations", s.requireAuth(s.withRateLimit(s.handleListOwnInvitations, s.config.RateLimitOther)))
+	mux.HandleFunc("POST /v1/invitations/{invitationID}/accept", s.requireAuth(s.withRateLimit(s.handleAcceptInvitation, s.config.RateLimitOther)))
+	mux.HandleFunc("POST /v1/invitations/{invitationID}/decline", s.requireAuth(s.withRateLimit(s.handleDeclineInvitation, s.config.RateLimitOther)))
 
 	// Members
 	mux.HandleFunc("POST /v1/projects/{id}/members", s.requireProjectAuth(serverdb.RoleOwner, s.withRateLimit(s.handleAddMember, s.config.RateLimitOther)))
@@ -187,11 +271,18 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("PATCH /v1/projects/{id}/members/{userID}", s.requireProjectAuth(serverdb.RoleOwner, s.withRateLimit(s.handleUpdateMember, s.config.RateLimitOther)))
 	mux.HandleFunc("DELETE /v1/projects/{id}/members/{userID}", s.requireProjectAuth(serverdb.RoleOwner, s.withRateLimit(s.handleRemoveMember, s.config.RateLimitOther)))
 
+	// Realtime SSE — no rate limit wrapper; it's a long-lived stream.
+	mux.HandleFunc("GET /v1/projects/{id}/events", s.requireProjectAuth(serverdb.RoleReader, s.handleProjectEvents))
+
 	// Sync
 	mux.HandleFunc("POST /v1/projects/{id}/sync/push", s.requireProjectAuth(serverdb.RoleWriter, s.withRateLimit(s.handleSyncPush, s.config.RateLimitPush)))
 	mux.HandleFunc("GET /v1/projects/{id}/sync/pull", s.requireProjectAuth(serverdb.RoleReader, s.withRateLimit(s.handleSyncPull, s.config.RateLimitPull)))
 	mux.HandleFunc("GET /v1/projects/{id}/sync/status", s.requireProjectAuth(serverdb.RoleReader, s.withRateLimit(s.handleSyncStatus, s.config.RateLimitOther)))
 	mux.HandleFunc("GET /v1/projects/{id}/sync/snapshot", s.requireProjectAuth(serverdb.RoleReader, s.withRateLimit(s.handleSyncSnapshot, s.config.RateLimitOther)))
+
+	// Perch-shape REST routes (S2.3) — wraps td-serve handlers against per-project
+	// project.db. See internal/api/project_routes.go and plan §6 for details.
+	s.registerProjectRoutes(mux)
 
 	// Admin (CORS-enabled)
 	adminMux := http.NewServeMux()
@@ -201,6 +292,8 @@ func (s *Server) routes() http.Handler {
 	adminMux.HandleFunc("GET /v1/admin/users", s.requireAdmin(AdminScopeReadServer, s.handleAdminListUsers))
 	adminMux.HandleFunc("GET /v1/admin/users/{id}", s.requireAdmin(AdminScopeReadServer, s.handleAdminGetUser))
 	adminMux.HandleFunc("GET /v1/admin/users/{id}/keys", s.requireAdmin(AdminScopeReadServer, s.handleAdminUserKeys))
+	adminMux.HandleFunc("DELETE /v1/admin/users/{id}/keys/{keyID}", s.requireAdmin(AdminScopeWriteUsers, s.handleAdminRevokeUserKey))
+	adminMux.HandleFunc("POST /v1/admin/users/{id}/impersonation-token", s.requireAdmin(AdminScopeReadServer, s.handleAdminIssueImpersonationToken))
 	adminMux.HandleFunc("GET /v1/admin/auth/events", s.requireAdmin(AdminScopeReadServer, s.handleAdminAuthEvents))
 	adminMux.HandleFunc("GET /v1/admin/projects", s.requireAdmin(AdminScopeReadProjects, s.handleAdminListProjects))
 	adminMux.HandleFunc("GET /v1/admin/projects/{id}", s.requireAdmin(AdminScopeReadProjects, s.handleAdminGetProject))
@@ -216,7 +309,7 @@ func (s *Server) routes() http.Handler {
 	adminMux.HandleFunc("GET /v1/admin/projects/{id}/snapshot/query", s.requireAdmin(AdminScopeReadSnapshots, s.handleAdminSnapshotQuery))
 	mux.Handle("/v1/admin/", s.CORSMiddleware(adminMux))
 
-	return chain(mux, recoveryMiddleware, requestIDMiddleware, loggerMiddleware, metricsMiddleware(s.metrics), loggingMiddleware, maxBytesMiddleware(10<<20), authRateLimitMiddleware(s.rateLimiter, s.config.RateLimitAuth, s.store))
+	return chain(mux, recoveryMiddleware, requestIDMiddleware, loggerMiddleware, metricsMiddleware(s.metrics), loggingMiddleware, maxBytesMiddleware(10<<20), authRateLimitMiddleware(s.rateLimiter, s.config.RateLimitAuth, s.config.RateLimitOther, s.store))
 }
 
 // handleHealth returns a health check response, pinging the server DB.

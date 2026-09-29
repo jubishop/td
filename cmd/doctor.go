@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/marcus/td/internal/db"
-	"github.com/marcus/td/internal/features"
 	"github.com/marcus/td/internal/syncclient"
 	"github.com/marcus/td/internal/syncconfig"
 	"github.com/spf13/cobra"
@@ -74,8 +73,13 @@ func runDoctor() {
 	database, err := db.Open(baseDir)
 	dbOK := err == nil
 	if dbOK {
-		defer database.Close()
-		fmt.Printf("Local database ......... OK\n")
+		defer func() { _ = database.Close() }()
+		if err := database.QuickCheck(); err != nil {
+			dbOK = false
+			fmt.Printf("Local database ......... FAIL (%v)\n", err)
+		} else {
+			fmt.Printf("Local database ......... OK\n")
+		}
 	} else {
 		fmt.Printf("Local database ......... FAIL (%v)\n", err)
 	}
@@ -111,5 +115,9 @@ func runDoctor() {
 }
 
 func init() {
-	AddFeatureGatedCommand(features.SyncCLI.Name, doctorCmd)
+	// `td doctor` is a read-only diagnostic. It is registered UNGATED so a user
+	// debugging "why isn't this syncing" can always run it, even when the
+	// SyncCLI feature is off. Its mutating siblings (push/pull, init, auth,
+	// conflicts, tail) remain feature-gated. (td-78b482)
+	rootCmd.AddCommand(doctorCmd)
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/marcus/td/internal/models"
+	"github.com/marcus/td/internal/workdir"
 )
 
 // CreateWorkSession creates a new work session
@@ -18,11 +19,15 @@ func (db *DB) CreateWorkSession(ws *models.WorkSession) error {
 		}
 		ws.ID = id
 		ws.StartedAt = time.Now()
+		if err := db.populateWorkSessionWorktree(ws); err != nil {
+			return err
+		}
 
 		_, err = db.conn.Exec(`
-			INSERT INTO work_sessions (id, name, session_id, started_at, start_sha)
-			VALUES (?, ?, ?, ?, ?)
-		`, ws.ID, ws.Name, ws.SessionID, ws.StartedAt, ws.StartSHA)
+			INSERT INTO work_sessions
+				(id, name, session_id, worktree_id, worktree_root, repo_root, started_at, start_sha)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, ws.ID, ws.Name, ws.SessionID, ws.WorktreeID, ws.WorktreeRoot, ws.RepoRoot, ws.StartedAt, ws.StartSHA)
 		if err != nil {
 			return err
 		}
@@ -52,9 +57,10 @@ func (db *DB) GetWorkSession(id string) (*models.WorkSession, error) {
 	var endedAt sql.NullTime
 
 	err := db.conn.QueryRow(`
-		SELECT id, name, session_id, started_at, ended_at, start_sha, end_sha
+		SELECT id, name, session_id, worktree_id, worktree_root, repo_root, started_at, ended_at, start_sha, end_sha
 		FROM work_sessions WHERE id = ?
-	`, id).Scan(&ws.ID, &ws.Name, &ws.SessionID, &ws.StartedAt, &endedAt, &ws.StartSHA, &ws.EndSHA)
+	`, id).Scan(&ws.ID, &ws.Name, &ws.SessionID, &ws.WorktreeID, &ws.WorktreeRoot, &ws.RepoRoot,
+		&ws.StartedAt, &endedAt, &ws.StartSHA, &ws.EndSHA)
 
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("work session not found: %s", id)
@@ -103,7 +109,11 @@ func (db *DB) UpdateWorkSession(ws *models.WorkSession) error {
 
 // TagIssueToWorkSession links an issue to a work session
 func (db *DB) TagIssueToWorkSession(wsID, issueID, sessionID string) error {
-	return db.withWriteLock(func() error {
+	// Normalize before computing the deterministic WsiID and writing the
+	// work_session_issues.issue_id FK. Must match UntagIssueFromWorkSession so
+	// tag/untag resolve to the same row id.
+	issueID = NormalizeIssueID(issueID)
+	err := db.withWriteLock(func() error {
 		id := WsiID(wsID, issueID)
 		now := time.Now()
 		_, err := db.conn.Exec(`
@@ -130,11 +140,18 @@ func (db *DB) TagIssueToWorkSession(wsID, issueID, sessionID string) error {
 
 		return nil
 	})
+	if err == nil {
+		// WorkSessionTagsChanged invalidation. Best-effort.
+		db.supersedeApprovalIfLinked(issueID, sessionID)
+	}
+	return err
 }
 
 // UntagIssueFromWorkSession removes an issue from a work session
 func (db *DB) UntagIssueFromWorkSession(wsID, issueID, sessionID string) error {
-	return db.withWriteLock(func() error {
+	// Normalize to match TagIssueToWorkSession's deterministic WsiID.
+	issueID = NormalizeIssueID(issueID)
+	err := db.withWriteLock(func() error {
 		id := WsiID(wsID, issueID)
 		_, err := db.conn.Exec(`DELETE FROM work_session_issues WHERE id = ?`, id)
 		if err != nil {
@@ -157,6 +174,13 @@ func (db *DB) UntagIssueFromWorkSession(wsID, issueID, sessionID string) error {
 
 		return nil
 	})
+	if err == nil {
+		// WorkSessionTagsChanged invalidation. Best-effort. The DELETE
+		// is a no-op when the row doesn't exist, but supersede is also
+		// a no-op when there's no active approval, so this is safe.
+		db.supersedeApprovalIfLinked(issueID, sessionID)
+	}
+	return err
 }
 
 // GetWorkSessionIssues returns issues tagged to a work session
@@ -167,7 +191,7 @@ func (db *DB) GetWorkSessionIssues(wsID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ids []string
 	for rows.Next() {
@@ -185,7 +209,7 @@ func (db *DB) GetWorkSessionIssues(wsID string) ([]string, error) {
 
 // ListWorkSessions returns recent work sessions
 func (db *DB) ListWorkSessions(limit int) ([]models.WorkSession, error) {
-	query := `SELECT id, name, session_id, started_at, ended_at, start_sha, end_sha
+	query := `SELECT id, name, session_id, worktree_id, worktree_root, repo_root, started_at, ended_at, start_sha, end_sha
 	          FROM work_sessions ORDER BY started_at DESC`
 	args := []interface{}{}
 
@@ -198,14 +222,15 @@ func (db *DB) ListWorkSessions(limit int) ([]models.WorkSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var sessions []models.WorkSession
 	for rows.Next() {
 		var ws models.WorkSession
 		var endedAt sql.NullTime
 
-		if err := rows.Scan(&ws.ID, &ws.Name, &ws.SessionID, &ws.StartedAt, &endedAt, &ws.StartSHA, &ws.EndSHA); err != nil {
+		if err := rows.Scan(&ws.ID, &ws.Name, &ws.SessionID, &ws.WorktreeID, &ws.WorktreeRoot, &ws.RepoRoot,
+			&ws.StartedAt, &endedAt, &ws.StartSHA, &ws.EndSHA); err != nil {
 			return nil, err
 		}
 
@@ -220,4 +245,34 @@ func (db *DB) ListWorkSessions(limit int) ([]models.WorkSession, error) {
 		return nil, err
 	}
 	return sessions, nil
+}
+
+func (db *DB) populateWorkSessionWorktree(ws *models.WorkSession) error {
+	if ws.WorktreeID != "" || ws.WorktreeRoot != "" || ws.RepoRoot != "" {
+		return nil
+	}
+
+	if ws.SessionID != "" {
+		sess, err := db.GetSessionByID(ws.SessionID)
+		if err != nil {
+			return err
+		}
+		if sess != nil {
+			ws.WorktreeID = sess.WorktreeID
+			ws.WorktreeRoot = sess.WorktreeRoot
+			ws.RepoRoot = sess.RepoRoot
+		}
+	}
+	if ws.WorktreeID != "" || ws.WorktreeRoot != "" || ws.RepoRoot != "" {
+		return nil
+	}
+
+	wt, err := workdir.CurrentWorktree()
+	if err != nil {
+		return err
+	}
+	ws.WorktreeID = wt.WorktreeID
+	ws.WorktreeRoot = wt.WorktreeRoot
+	ws.RepoRoot = wt.RepoRoot
+	return nil
 }

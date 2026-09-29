@@ -31,7 +31,7 @@ var infoCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
@@ -48,14 +48,26 @@ var infoCmd = &cobra.Command{
 		// Get project name from directory
 		projectName := filepath.Base(baseDir)
 
-		// Review queue
-		reviewable, _ := database.ListIssues(reviewableByOptions(baseDir, sess.ID))
+		// Review queue: split into awaiting vs ready-to-close buckets.
+		allReviewable, _ := database.ListIssues(reviewableByOptions(baseDir, sess.ID))
+		reviewable := make([]models.Issue, 0, len(allReviewable))
+		readyToClose := make([]models.Issue, 0)
+		for _, issue := range allReviewable {
+			rev, _ := database.GetActiveApprovalReview(issue.ID)
+			if rev == nil {
+				reviewable = append(reviewable, issue)
+				continue
+			}
+			if closerAllowed(&issue, sess.ID, rev) {
+				readyToClose = append(readyToClose, issue)
+			}
+		}
 		inReview, _ := database.ListIssues(db.ListIssuesOptions{
 			Status: []models.Status{models.StatusInReview},
 		})
 
 		// JSON output
-		if jsonOutput, _ := cmd.Flags().GetBool("json"); jsonOutput {
+		if jsonMode(cmd) {
 			result := map[string]interface{}{
 				"project":         projectName,
 				"database":        ".todos/issues.db",
@@ -69,8 +81,9 @@ var infoCmd = &cobra.Command{
 					"closed":      stats["closed"],
 				},
 				"review_queue": map[string]interface{}{
-					"awaiting_review": len(inReview),
-					"you_can_review":  len(reviewable),
+					"awaiting_review":     len(inReview),
+					"you_can_review":      len(reviewable),
+					"you_can_close_after": len(readyToClose),
 				},
 				"by_type": map[string]interface{}{
 					"bug":     stats["type_bug"],
@@ -97,8 +110,9 @@ var infoCmd = &cobra.Command{
 		fmt.Println()
 
 		fmt.Println("Review Queue:")
-		fmt.Printf("  Awaiting review: %d\n", len(inReview))
-		fmt.Printf("  You can review:  %d\n", len(reviewable))
+		fmt.Printf("  Awaiting review:     %d\n", len(inReview))
+		fmt.Printf("  You can review:      %d\n", len(reviewable))
+		fmt.Printf("  You can close after: %d\n", len(readyToClose))
 		fmt.Println()
 
 		fmt.Println("By Type:")
@@ -117,28 +131,79 @@ var versionCmd = &cobra.Command{
 	Short:   "Show version and check for updates",
 	GroupID: "system",
 	Run: func(cmd *cobra.Command, args []string) {
+		isJSON := jsonMode(cmd)
 		short, _ := cmd.Flags().GetBool("short")
-		if short {
+
+		// --json always emits the full envelope: --short exists to make the
+		// human line greppable, and a caller that can parse JSON already has
+		// the version under a stable key.
+		if short && !isJSON {
 			fmt.Print(versionStr)
 			return
 		}
 
 		checkUpdates, _ := cmd.Flags().GetBool("check")
+		isDev := version.IsDevelopmentVersion(versionStr)
 
-		fmt.Printf("td version %s\n", versionStr)
+		// versionInfo is the --json envelope. update_available is always
+		// present so a caller never has to distinguish "no update" from "the
+		// key is missing"; latest_version and update_command stay empty when no
+		// check ran or the check failed, and checked reports which it was.
+		info := map[string]interface{}{
+			"version":          versionStr,
+			"development":      isDev,
+			"checked":          false,
+			"update_available": false,
+			"latest_version":   "",
+			"update_command":   "",
+		}
+
+		emit := func() {
+			if err := output.JSON(info); err != nil {
+				output.JSONError(output.ErrCodeDatabaseError, err.Error())
+			}
+		}
+
+		if !isJSON {
+			fmt.Printf("td version %s\n", versionStr)
+		}
 
 		// Skip check if dev version or --check=false
-		if !checkUpdates || version.IsDevelopmentVersion(versionStr) {
+		if !checkUpdates || isDev {
+			if isJSON {
+				emit()
+			}
 			return
+		}
+
+		announce := func(latest string) {
+			info["checked"] = true
+			info["update_available"] = latest != ""
+			if latest == "" {
+				if isJSON {
+					emit()
+				}
+				return
+			}
+			info["latest_version"] = latest
+			updateCmd := version.UpdateCommand(latest)
+			info["update_command"] = updateCmd
+			if isJSON {
+				emit()
+				return
+			}
+			fmt.Printf("\nUpdate available: %s → %s\n", versionStr, latest)
+			if updateCmd != "" {
+				fmt.Printf("Run: %s\n", updateCmd)
+			}
 		}
 
 		// Check cache first
 		if cached, err := version.LoadCache(); err == nil && version.IsCacheValid(cached, versionStr) {
 			if cached.HasUpdate {
-				fmt.Printf("\nUpdate available: %s → %s\n", versionStr, cached.LatestVersion)
-				if cmd := version.UpdateCommand(cached.LatestVersion); cmd != "" {
-					fmt.Printf("Run: %s\n", cmd)
-				}
+				announce(cached.LatestVersion)
+			} else {
+				announce("")
 			}
 			return
 		}
@@ -157,15 +222,18 @@ var versionCmd = &cobra.Command{
 		}
 
 		if result.Error != nil {
-			// Silently ignore network errors
+			// Network errors stay silent on the human path; --json still emits
+			// a parseable envelope with checked=false rather than nothing.
+			if isJSON {
+				emit()
+			}
 			return
 		}
 
 		if result.HasUpdate {
-			fmt.Printf("\nUpdate available: %s → %s\n", versionStr, result.LatestVersion)
-			if cmd := version.UpdateCommand(result.LatestVersion); cmd != "" {
-				fmt.Printf("Run: %s\n", cmd)
-			}
+			announce(result.LatestVersion)
+		} else {
+			announce("")
 		}
 	},
 }
@@ -176,25 +244,60 @@ var whoamiCmd = &cobra.Command{
 	GroupID: "session",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		baseDir := getBaseDir()
+		isJSON := jsonMode(cmd)
+
+		// In --json mode the top-level Execute path emits the JSON error
+		// envelope, so the human ERROR line must be suppressed here to keep
+		// stdout parseable.
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
 
 		database, err := db.Open(baseDir)
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sess, err := session.GetOrCreate(database)
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
 
 		// Get issues touched by this session
 		touchedIssues, _ := database.GetIssueSessionLog(sess.ID)
 
+		if isJSON {
+			touched := touchedIssues
+			if touched == nil {
+				touched = []string{}
+			}
+			// branch and agent are what correlate this session against a
+			// row of `td session list`; without them a JSON caller cannot
+			// find itself in that list at all.
+			payload := map[string]any{
+				"session":        sess.ID,
+				"branch":         sess.Branch,
+				"agent":          sess.AgentType,
+				"started":        sess.StartedAt.UTC().Format(time.RFC3339),
+				"issues_touched": touched,
+			}
+			if sess.Name != "" {
+				payload["name"] = sess.Name
+			}
+			if sess.PreviousSessionID != "" {
+				payload["previous_session"] = sess.PreviousSessionID
+			}
+			return output.EmitResult("whoami", payload)
+		}
+
 		fmt.Printf("SESSION: %s\n", sess.Display())
-		fmt.Printf("STARTED: %s\n", sess.StartedAt.Format("2006-01-02T15:04:05Z"))
+		// The literal Z in the layout claimed UTC while printing local time.
+		fmt.Printf("STARTED: %s\n", sess.StartedAt.UTC().Format(time.RFC3339))
 
 		if sess.PreviousSessionID != "" {
 			fmt.Printf("PREVIOUS SESSION: %s\n", sess.PreviousSessionID)
@@ -221,7 +324,7 @@ var sessionNameCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		newSession, _ := cmd.Flags().GetBool("new")
 
@@ -279,17 +382,58 @@ var sessionListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all sessions (branch + agent scoped)",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		isJSON := jsonMode(cmd)
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
+
 		database, err := db.Open(getBaseDir())
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		sessions, err := session.ListSessions(database)
 		if err != nil {
-			output.Error("failed to list sessions: %v", err)
+			emitErr("failed to list sessions: %v", err)
 			return err
+		}
+
+		// "current" means "the row this shell's next td command would use".
+		// Comparing branch + agent type + pid by hand got that wrong: the
+		// stored agent_type is the full fingerprint ("claude-code_94806"),
+		// never the bare type, so the comparison was false for the real
+		// current session and true for any row that happened to store a bare
+		// type. Asking the session layer for the current row instead applies
+		// the whole identity key (branch, fingerprint, context, worktree) and
+		// cannot drift from it. It deliberately does not create a session:
+		// listing is a read.
+		currentID := ""
+		if cur, err := session.Get(database); err == nil && cur != nil {
+			currentID = cur.ID
+		}
+
+		if isJSON {
+			// A bare array (empty when there are no sessions), matching the
+			// list-family JSON contract: no results is [] , never silence.
+			now := time.Now()
+			rows := make([]map[string]any, 0, len(sessions))
+			for _, sess := range sessions {
+				lastActive := sess.LastActive()
+				rows = append(rows, map[string]any{
+					"branch":        sess.Branch,
+					"agent":         sess.AgentType,
+					"session":       sess.ID,
+					"name":          sess.Name,
+					"last_activity": lastActive.UTC().Format(time.RFC3339),
+					"age_seconds":   int64(now.Sub(lastActive).Seconds()),
+					"current":       sess.ID == currentID,
+				})
+			}
+			return output.JSON(rows)
 		}
 
 		if len(sessions) == 0 {
@@ -297,22 +441,16 @@ var sessionListCmd = &cobra.Command{
 			return nil
 		}
 
-		currentBranch := session.GetCurrentBranch()
-		fp := session.GetAgentFingerprint()
-
 		fmt.Printf("%-16s %-14s %-12s %-18s %s\n", "BRANCH", "AGENT", "SESSION", "LAST ACTIVITY", "AGE")
 		fmt.Println(strings.Repeat("-", 80))
 
 		for _, sess := range sessions {
 			marker := " "
-			if sess.Branch == currentBranch && sess.AgentType == string(fp.Type) && sess.AgentPID == fp.PID {
+			if sess.ID == currentID {
 				marker = "*"
 			}
 
-			lastActive := sess.LastActivity
-			if lastActive.IsZero() {
-				lastActive = sess.StartedAt
-			}
+			lastActive := sess.LastActive()
 			age := time.Since(lastActive).Truncate(time.Minute)
 
 			agentInfo := sess.AgentType
@@ -337,62 +475,147 @@ var sessionCleanupCmd = &cobra.Command{
 	Use:   "cleanup",
 	Short: "Remove stale session files",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		isJSON := jsonMode(cmd)
+		emitErr := func(format string, args ...interface{}) {
+			if !isJSON {
+				output.Error(format, args...)
+			}
+		}
+
 		database, err := db.Open(getBaseDir())
 		if err != nil {
-			output.Error("%v", err)
+			emitErr("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		olderThan, _ := cmd.Flags().GetString("older-than")
 		force, _ := cmd.Flags().GetBool("force")
 
 		maxAge, err := session.ParseDuration(olderThan)
 		if err != nil {
-			output.Error("invalid duration: %v", err)
+			emitErr("invalid duration: %v", err)
 			return err
 		}
 
 		// Preview what would be deleted
 		sessions, err := session.ListSessions(database)
 		if err != nil {
-			output.Error("failed to list sessions: %v", err)
+			emitErr("failed to list sessions: %v", err)
+			return err
+		}
+
+		// A session row is what makes a leaked claim reclaimable: it carries
+		// the last-activity timestamp `td unstart --stale` measures and the id
+		// `td unstart --session` names. Deleting a holder's row by the same
+		// idleness predicate that makes its claim reclaimable strands the
+		// issue permanently — cleanup and reclamation would race, and on a
+		// cron cleanup always wins. So cleanup skips holders and says so.
+		held, err := database.SessionsHoldingClaims()
+		if err != nil {
+			emitErr("failed to check held claims: %v", err)
 			return err
 		}
 
 		now := time.Now()
 		var toDelete []session.Session
+		var holders []session.Session
 		for _, sess := range sessions {
-			lastActive := sess.LastActivity
-			if lastActive.IsZero() {
-				lastActive = sess.StartedAt
+			if now.Sub(sess.LastActive()) <= maxAge {
+				continue
 			}
-			if now.Sub(lastActive) > maxAge {
-				toDelete = append(toDelete, sess)
+			if held[sess.ID] > 0 {
+				holders = append(holders, sess)
+				continue
+			}
+			toDelete = append(toDelete, sess)
+		}
+
+		emitJSON := func(deleted int) error {
+			rows := make([]map[string]any, 0, len(toDelete))
+			for _, sess := range toDelete {
+				rows = append(rows, map[string]any{
+					"session":       sess.ID,
+					"branch":        sess.Branch,
+					"agent":         sess.AgentType,
+					"last_activity": sess.LastActive().UTC().Format(time.RFC3339),
+					"age_seconds":   int64(now.Sub(sess.LastActive()).Seconds()),
+				})
+			}
+			kept := make([]map[string]any, 0, len(holders))
+			for _, sess := range holders {
+				kept = append(kept, map[string]any{
+					"session":       sess.ID,
+					"branch":        sess.Branch,
+					"agent":         sess.AgentType,
+					"last_activity": sess.LastActive().UTC().Format(time.RFC3339),
+					"age_seconds":   int64(now.Sub(sess.LastActive()).Seconds()),
+					"claims":        held[sess.ID],
+					"reason":        "still holds unreleased claims; release them first (td unstart --session " + sess.ID + " --force)",
+				})
+			}
+			action := "would_cleanup_sessions"
+			if force {
+				action = "cleaned_up_sessions"
+			}
+			if len(holders) > 0 {
+				action += "_with_held_claims"
+			}
+			return output.EmitResult(action, map[string]any{
+				"older_than": olderThan,
+				"forced":     force,
+				"count":      deleted,
+				"sessions":   rows,
+				"held":       kept,
+				"held_count": len(kept),
+			})
+		}
+
+		warnHolders := func() {
+			for _, sess := range holders {
+				output.Warning("kept %s: still holds %d unreleased claim(s); release with `td unstart --session %s --force`",
+					sess.ID, held[sess.ID], sess.ID)
 			}
 		}
 
 		if len(toDelete) == 0 {
-			fmt.Printf("No sessions older than %s found.\n", olderThan)
+			if isJSON {
+				return emitJSON(0)
+			}
+			fmt.Printf("No deletable sessions older than %s found.\n", olderThan)
+			warnHolders()
 			return nil
 		}
 
 		if !force {
+			if isJSON {
+				return emitJSON(len(toDelete))
+			}
 			fmt.Printf("Will delete %d session(s) older than %s:\n", len(toDelete), olderThan)
 			for _, sess := range toDelete {
 				fmt.Printf("  - %s (branch: %s)\n", sess.ID, sess.Branch)
 			}
 			fmt.Println("\nRun with --force to delete.")
+			warnHolders()
 			return nil
 		}
 
-		deleted, err := session.CleanupStaleSessions(database, maxAge)
+		ids := make([]string, 0, len(toDelete))
+		for _, sess := range toDelete {
+			ids = append(ids, sess.ID)
+		}
+		deleted, err := database.DeleteSessionsByID(ids)
 		if err != nil {
-			output.Error("cleanup failed: %v", err)
+			emitErr("cleanup failed: %v", err)
 			return err
 		}
 
+		if isJSON {
+			return emitJSON(int(deleted))
+		}
+
 		fmt.Printf("Deleted %d stale session(s).\n", deleted)
+		warnHolders()
 		return nil
 	},
 }
@@ -409,7 +632,7 @@ var exportCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		format, _ := cmd.Flags().GetString("format")
 		outputPath, _ := cmd.Flags().GetString("output")
@@ -440,10 +663,10 @@ var exportCmd = &cobra.Command{
 
 				item := map[string]interface{}{
 					"issue":        issue,
-					"logs":         logs,
-					"handoffs":     handoffs,
-					"dependencies": deps,
-					"files":        files,
+					"logs":         jsonList(logs),
+					"handoffs":     jsonList(handoffs),
+					"dependencies": jsonList(deps),
+					"files":        jsonList(files),
 				}
 				exportData = append(exportData, item)
 			}
@@ -510,7 +733,7 @@ var importCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		filePath := args[0]
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -557,11 +780,11 @@ var importCmd = &cobra.Command{
 
 // exportedItem matches the JSON structure produced by the export command.
 type exportedItem struct {
-	Issue        models.Issue              `json:"issue"`
-	Logs         []models.Log              `json:"logs"`
-	Handoffs     []models.Handoff          `json:"handoffs"`
-	Dependencies []models.IssueDependency  `json:"dependencies"`
-	Files        []models.IssueFile        `json:"files"`
+	Issue        models.Issue             `json:"issue"`
+	Logs         []models.Log             `json:"logs"`
+	Handoffs     []models.Handoff         `json:"handoffs"`
+	Dependencies []models.IssueDependency `json:"dependencies"`
+	Files        []models.IssueFile       `json:"files"`
 }
 
 // UnmarshalJSON supports backward-compatible deserialization:
@@ -814,7 +1037,7 @@ func importMarkdown(database *db.DB, data string, dryRun, force bool, sessionID 
 		}
 		if matches := pointsRegex.FindStringSubmatch(line); matches != nil {
 			var pts int
-			fmt.Sscanf(matches[1], "%d", &pts)
+			_, _ = fmt.Sscanf(matches[1], "%d", &pts)
 			currentIssue.Points = pts
 			inDescription = false
 			continue
@@ -862,7 +1085,7 @@ var upgradeCmd = &cobra.Command{
 			output.Error("%v", err)
 			return err
 		}
-		defer database.Close()
+		defer func() { _ = database.Close() }()
 
 		currentVersion, _ := database.GetSchemaVersion()
 		fmt.Printf("Current schema version: %d\n", currentVersion)
@@ -900,8 +1123,6 @@ func init() {
 	rootCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(importCmd)
 	rootCmd.AddCommand(upgradeCmd)
-
-	infoCmd.Flags().Bool("json", false, "JSON output")
 
 	exportCmd.Flags().String("format", "json", "Export format: json or md")
 	exportCmd.Flags().StringP("output", "o", "", "Output file (default: stdout)")

@@ -1,7 +1,7 @@
 package serverdb
 
 // ServerSchemaVersion is the current server database schema version
-const ServerSchemaVersion = 3
+const ServerSchemaVersion = 6
 
 const serverSchema = `
 -- Users table
@@ -49,6 +49,23 @@ CREATE TABLE IF NOT EXISTS memberships (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+-- Invitations table
+CREATE TABLE IF NOT EXISTS invitations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner', 'writer', 'reader')),
+    invited_by TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'accepted', 'declined', 'expired')),
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL,
+    accepted_at DATETIME,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (invited_by) REFERENCES users(id) ON DELETE CASCADE
+);
+
 -- Sync cursors table
 CREATE TABLE IF NOT EXISTS sync_cursors (
     project_id TEXT NOT NULL,
@@ -69,6 +86,10 @@ CREATE TABLE IF NOT EXISTS schema_info (
 CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix);
 CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id);
+CREATE INDEX IF NOT EXISTS idx_invitations_project ON invitations(project_id);
+CREATE INDEX IF NOT EXISTS idx_invitations_email_status ON invitations(email, status);
+CREATE INDEX IF NOT EXISTS idx_invitations_cleanup ON invitations(status, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_invitations_token_hash ON invitations(token_hash);
 CREATE INDEX IF NOT EXISTS idx_projects_deleted ON projects(deleted_at);
 `
 
@@ -131,5 +152,65 @@ var Migrations = []Migration{
 
 		ALTER TABLE projects ADD COLUMN event_count INTEGER NOT NULL DEFAULT 0;
 		ALTER TABLE projects ADD COLUMN last_event_at DATETIME;`,
+	},
+	{
+		Version:     4,
+		Description: "Add auth_email_challenges table for email-verified auth",
+		SQL: `CREATE TABLE auth_email_challenges (
+			id TEXT PRIMARY KEY,
+			purpose TEXT NOT NULL CHECK (purpose IN ('web_login','device_login','email_verify','admin_login')),
+			email TEXT NOT NULL,
+			user_id TEXT,
+			selector TEXT UNIQUE NOT NULL,
+			token_hash TEXT NOT NULL,
+			otp_hash TEXT,
+			device_code_hash TEXT,
+			code_challenge TEXT,
+			code_challenge_method TEXT,
+			redirect_uri TEXT,
+			state_hash TEXT,
+			status TEXT NOT NULL DEFAULT 'pending'
+				CHECK (status IN ('pending','verified','consumed','expired','failed','suppressed')),
+			attempts INTEGER NOT NULL DEFAULT 0,
+			ip TEXT,
+			user_agent TEXT,
+			expires_at DATETIME NOT NULL,
+			verified_at DATETIME,
+			consumed_at DATETIME,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+		);
+		CREATE INDEX idx_auth_email_challenges_email_created ON auth_email_challenges(email, created_at);
+		CREATE INDEX idx_auth_email_challenges_device ON auth_email_challenges(device_code_hash);
+		CREATE INDEX idx_auth_email_challenges_cleanup ON auth_email_challenges(status, expires_at);`,
+	},
+	{
+		Version:     5,
+		Description: "Add project invitations table",
+		SQL: `CREATE TABLE IF NOT EXISTS invitations (
+			id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL,
+			email TEXT NOT NULL,
+			role TEXT NOT NULL CHECK(role IN ('owner', 'writer', 'reader')),
+			invited_by TEXT NOT NULL,
+			token_hash TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending'
+				CHECK(status IN ('pending', 'accepted', 'declined', 'expired')),
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			expires_at DATETIME NOT NULL,
+			accepted_at DATETIME,
+			FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+			FOREIGN KEY (invited_by) REFERENCES users(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_invitations_project ON invitations(project_id);
+		CREATE INDEX IF NOT EXISTS idx_invitations_email_status ON invitations(email, status);
+		CREATE INDEX IF NOT EXISTS idx_invitations_cleanup ON invitations(status, expires_at);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_invitations_token_hash ON invitations(token_hash);`,
+	},
+	{
+		Version:     6,
+		Description: "Add slug column to projects for stable canonical URL slugs",
+		SQL: `ALTER TABLE projects ADD COLUMN slug TEXT;
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slug ON projects(slug);`,
 	},
 }

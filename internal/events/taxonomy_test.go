@@ -69,6 +69,7 @@ func TestNormalizeEntityType(t *testing.T) {
 		{"issue_session_histories", EntityIssueSessionHistory, true},
 
 		// Invalid
+		{"session_state", "", false},
 		{"invalid", "", false},
 		{"unknown", "", false},
 		{"", "", false},
@@ -238,7 +239,7 @@ func TestIsValidEntityActionCombination(t *testing.T) {
 
 func TestAllEntityTypes(t *testing.T) {
 	types := AllEntityTypes()
-	expected := 14 // Number of entity types defined
+	expected := 15 // Number of entity types defined
 
 	if len(types) != expected {
 		t.Errorf("AllEntityTypes(): expected %d types, got %d", expected, len(types))
@@ -250,7 +251,7 @@ func TestAllEntityTypes(t *testing.T) {
 		EntitySessions, EntityBoards, EntityBoardIssuePositions,
 		EntityWorkSessions, EntityWorkSessionIssues, EntityIssueFiles,
 		EntityIssueDependencies, EntityGitSnapshots, EntityIssueSessionHistory,
-		EntityNotes,
+		EntityIssueReviews, EntityNotes,
 	}
 
 	for _, et := range requiredTypes {
