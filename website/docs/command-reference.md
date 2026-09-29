@@ -16,6 +16,7 @@ Complete reference for all `td` commands.
 | `td update <id> [flags]` | Update fields. Flags: `--title`, `--type`, `--priority`, `--description`, `--description-file`, `--acceptance`, `--acceptance-file`, `--labels` |
 | `td delete <id>` | Soft-delete issue |
 | `td restore <id>` | Restore soft-deleted issue |
+| `td browser [flags]` | Open the local browser workspace. Flags: `--port`, `--no-open`, `--interval` |
 
 ## Workflow Commands
 

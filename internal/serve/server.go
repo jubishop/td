@@ -21,6 +21,7 @@ type ServeConfig struct {
 	Token        string
 	CORSOrigin   string
 	PollInterval time.Duration
+	Browser      bool
 }
 
 // Server is the td serve HTTP server.
@@ -57,6 +58,9 @@ func NewServer(database *db.DB, baseDir, sessionID string, config ServeConfig) *
 	}
 
 	s.registerRoutes()
+	if config.Browser {
+		s.registerBrowserRoutes()
+	}
 	return s
 }
 
@@ -69,6 +73,9 @@ func (s *Server) Handler() http.Handler {
 	//   recovery -> logging -> CORS -> auth -> handler
 	h = s.authMiddleware(h)
 	h = s.corsMiddleware(h)
+	if s.config.Browser {
+		h = s.browserMiddleware(h)
+	}
 	h = s.loggingMiddleware(h)
 	h = s.recoveryMiddleware(h)
 

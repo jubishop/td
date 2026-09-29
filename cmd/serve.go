@@ -43,7 +43,19 @@ func init() {
 }
 
 func runServe(cmd *cobra.Command, args []string) error {
+	return runHTTPServer(cmd, false)
+}
+
+func runHTTPServer(cmd *cobra.Command, browser bool) error {
 	dir := getBaseDir()
+	port, _ := cmd.Flags().GetInt("port")
+	interval, _ := cmd.Flags().GetDuration("interval")
+	if port < 0 || port > 65535 {
+		return fmt.Errorf("port must be between 0 and 65535")
+	}
+	if interval <= 0 {
+		return fmt.Errorf("interval must be greater than zero")
+	}
 
 	// Open database
 	database, err := db.Open(dir)
@@ -62,16 +74,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Start session heartbeat
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 	serve.StartSessionHeartbeat(ctx, database, session.ID)
 
 	// Read flags
-	port, _ := cmd.Flags().GetInt("port")
 	addr, _ := cmd.Flags().GetString("addr")
+	if browser {
+		addr = "127.0.0.1"
+	}
 	token, _ := cmd.Flags().GetString("token")
 	cors, _ := cmd.Flags().GetString("cors")
-	interval, _ := cmd.Flags().GetDuration("interval")
 
 	config := serve.ServeConfig{
 		Port:         port,
@@ -79,6 +92,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		Token:        token,
 		CORSOrigin:   cors,
 		PollInterval: interval,
+		Browser:      browser,
 	}
 
 	// Create server
@@ -112,11 +126,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 		ln.Close()
 		return fmt.Errorf("write port file: %w", err)
 	}
+	defer func() {
+		if current, err := serve.ReadPortFile(dir); err == nil && current.InstanceID == instanceID {
+			_ = serve.DeletePortFile(dir)
+		}
+	}()
 
 	// Print startup banner to stderr
 	dbPath := filepath.Join(dir, ".todos", "issues.db")
 	portFilePath := filepath.Join(dir, ".todos", "serve-port")
-	fmt.Fprintf(os.Stderr, "td serve listening on http://%s:%d\n", addr, actualPort)
+	url := fmt.Sprintf("http://%s:%d", addr, actualPort)
+	fmt.Fprintf(os.Stderr, "td %s listening on %s\n", cmd.Name(), url)
 	fmt.Fprintf(os.Stderr, "  base dir:   %s\n", dir)
 	fmt.Fprintf(os.Stderr, "  database:   %s\n", dbPath)
 	fmt.Fprintf(os.Stderr, "  session:    %s (web)\n", session.ID)
@@ -140,12 +160,25 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 		close(errCh)
 	}()
+	if browser {
+		fmt.Fprintln(os.Stderr, "  Press Ctrl+C to stop.")
+		noOpen, _ := cmd.Flags().GetBool("no-open")
+		if !noOpen {
+			go func() {
+				if err := openBrowserURL(url); err != nil {
+					fmt.Fprintf(os.Stderr, "  Could not open browser: %v. Open %s manually.\n", err, url)
+				}
+			}()
+		}
+	}
 
 	// Wait for signal or server error
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	select {
+	case <-ctx.Done():
 	case sig := <-sigCh:
 		slog.Info("received signal, shutting down", "signal", sig)
 	case err := <-errCh:
@@ -153,6 +186,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("server error: %w", err)
 		}
 	}
+	srv.StopBackground()
 
 	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -163,9 +197,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Cleanup
-	_ = serve.DeletePortFile(dir)
 	cancel() // stop heartbeat
 
-	fmt.Fprintf(os.Stderr, "td serve stopped\n")
+	fmt.Fprintf(os.Stderr, "td %s stopped\n", cmd.Name())
 	return nil
 }

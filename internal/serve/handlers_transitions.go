@@ -2,6 +2,7 @@ package serve
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/models"
 	"github.com/marcus/td/internal/workflow"
 )
@@ -67,6 +69,10 @@ func (s *Server) handleTransition(w http.ResponseWriter, r *http.Request, spec t
 		return
 	}
 	canonicalIssueID := issue.ID
+	if !checkIssueRevision(w, r, issue) {
+		return
+	}
+	previous := *issue
 
 	// Validate current status against allowed "from" statuses using state machine
 	sm := workflow.DefaultMachine()
@@ -105,7 +111,11 @@ func (s *Server) handleTransition(w http.ResponseWriter, r *http.Request, spec t
 	}
 
 	// Persist
-	if err := s.db.UpdateIssueLogged(issue, s.sessionID, spec.actionType); err != nil {
+	if err := s.db.UpdateIssueLoggedIfUnchanged(issue, &previous, s.sessionID, spec.actionType); err != nil {
+		if errors.Is(err, db.ErrIssueChanged) {
+			WriteError(w, ErrConflict, "Task changed before this action could be applied. Refresh and review it again.", http.StatusConflict)
+			return
+		}
 		slog.Error("transition issue", "err", err, "id", issueID, "to", spec.toStatus)
 		WriteError(w, ErrInternal, "failed to update issue", http.StatusInternalServerError)
 		return
@@ -149,6 +159,7 @@ func (s *Server) handleTransition(w http.ResponseWriter, r *http.Request, spec t
 	}
 
 	dto := IssueToDTO(updated)
+	s.NotifyChange()
 	WriteSuccess(w, map[string]interface{}{
 		"issue":    dto,
 		"cascades": cascades,

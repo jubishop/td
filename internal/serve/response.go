@@ -111,6 +111,7 @@ func WriteValidation(w http.ResponseWriter, fields []FieldError) {
 // Nullable fields use *string so they serialize as JSON null when nil.
 // Collections serialize as [] when empty, never null.
 type IssueDTO struct {
+	Revision           string   `json:"revision"`
 	ID                 string   `json:"id"`
 	Title              string   `json:"title"`
 	Description        string   `json:"description"`
@@ -140,6 +141,7 @@ type IssueDTO struct {
 // handling for the API layer.
 func IssueToDTO(issue *models.Issue) IssueDTO {
 	dto := IssueDTO{
+		Revision:    issueRevision(issue),
 		ID:          issue.ID,
 		Title:       issue.Title,
 		Description: issue.Description,

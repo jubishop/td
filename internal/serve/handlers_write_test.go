@@ -150,6 +150,10 @@ func TestCreateIssue_AllFields(t *testing.T) {
 	if issue["due_date"] != "2026-05-01" {
 		t.Errorf("due_date = %v, want 2026-05-01", issue["due_date"])
 	}
+	persisted, err := srv.db.GetIssue(issue["id"].(string))
+	if err != nil || persisted.Sprint != "sprint-1" {
+		t.Fatalf("sprint was not persisted: %+v, %v", persisted, err)
+	}
 }
 
 func TestCreateIssue_StoryNormalizedToFeature(t *testing.T) {

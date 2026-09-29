@@ -2,6 +2,7 @@ package serve
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -153,6 +154,11 @@ func (s *Server) handleUpdateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !checkIssueRevision(w, r, issue) {
+		return
+	}
+	previous := *issue
+
 	// Apply only non-nil fields
 	if body.Title != nil {
 		issue.Title = *body.Title
@@ -190,6 +196,20 @@ func (s *Server) handleUpdateIssue(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
+			seen := map[string]bool{issue.ID: true}
+			for ancestorID := normalizedParent; ancestorID != ""; {
+				if seen[ancestorID] {
+					WriteError(w, ErrValidation, "parent task would create a cycle", http.StatusBadRequest)
+					return
+				}
+				seen[ancestorID] = true
+				ancestor, err := s.db.GetIssue(ancestorID)
+				if err != nil {
+					WriteError(w, ErrValidation, "could not resolve parent task", http.StatusBadRequest)
+					return
+				}
+				ancestorID = ancestor.ParentID
+			}
 			issue.ParentID = normalizedParent
 		} else {
 			issue.ParentID = ""
@@ -217,7 +237,11 @@ func (s *Server) handleUpdateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update atomically with action log
-	if err := s.db.UpdateIssueLogged(issue, s.sessionID, models.ActionUpdate); err != nil {
+	if err := s.db.UpdateIssueLoggedIfUnchanged(issue, &previous, s.sessionID, models.ActionUpdate); err != nil {
+		if errors.Is(err, db.ErrIssueChanged) {
+			WriteError(w, ErrConflict, "Task changed while saving. Compare the saved version with your draft.", http.StatusConflict)
+			return
+		}
 		slog.Error("update issue", "err", err, "id", issueID)
 		WriteError(w, ErrInternal, "failed to update issue", http.StatusInternalServerError)
 		return
@@ -254,7 +278,14 @@ func (s *Server) handleDeleteIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Soft delete with action log
-	if err := s.db.DeleteIssueLogged(issue.ID, s.sessionID); err != nil {
+	if !checkIssueRevision(w, r, issue) {
+		return
+	}
+	if err := s.db.DeleteIssueLoggedIfUnchanged(issue.ID, s.sessionID, issue); err != nil {
+		if errors.Is(err, db.ErrIssueChanged) {
+			WriteError(w, ErrConflict, "Task changed before deletion. Refresh and review it again.", http.StatusConflict)
+			return
+		}
 		slog.Error("delete issue", "err", err, "id", issue.ID)
 		WriteError(w, ErrInternal, "failed to delete issue", http.StatusInternalServerError)
 		return

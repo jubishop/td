@@ -118,7 +118,16 @@ curl "http://localhost:54321/v1/issues?status=open&type=bug&sort=priority&limit=
 
 ### `GET /v1/issues/{id}`
 
-Get a single issue with its logs, comments, handoff, and dependencies.
+Get a single issue with its logs, comments, handoff, dependencies, and direct
+child issues.
+
+Issue objects include an opaque `revision` string. Clients can send that value
+in an `If-Match` header when editing, deleting, or applying a workflow action.
+A stale revision returns `409 conflict` without applying the change. Fetch the
+current task and compare it with the user's draft before resubmitting. Existing
+clients can continue to omit the header.
+
+The detail response also includes `children`, an array of direct child issues.
 
 ```bash
 curl http://localhost:54321/v1/issues/td-abc123
@@ -132,6 +141,7 @@ curl http://localhost:54321/v1/issues/td-abc123
     "logs": [],
     "comments": [],
     "latest_handoff": null,
+    "children": [],
     "dependencies": [
       {
         "dep_id": "dep_a1b2c3d4",
