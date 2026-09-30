@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/marcus/td/internal/models"
 )
@@ -181,5 +183,98 @@ func TestClientProjectMetadata(t *testing.T) {
 		if w.Code != http.StatusNotFound {
 			t.Fatalf("API server exposes UI route %s: %d", path, w.Code)
 		}
+	}
+}
+
+func TestClientConditionalCORSPreflight(t *testing.T) {
+	srv := newTestServer(ServeConfig{CORSOrigin: "http://localhost:3000"})
+	r := httptest.NewRequest(http.MethodOptions, "/v1/issues/td-test", nil)
+	r.Header.Set("Origin", "http://localhost:3000")
+	r.Header.Set("Access-Control-Request-Method", http.MethodPatch)
+	r.Header.Set("Access-Control-Request-Headers", "content-type,if-match")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight: %d", w.Code)
+	}
+	for _, header := range strings.Split(w.Header().Get("Access-Control-Allow-Headers"), ",") {
+		if strings.EqualFold(strings.TrimSpace(header), "If-Match") {
+			return
+		}
+	}
+	t.Fatal("CORS preflight does not allow conditional writes")
+}
+
+func TestClientChildRevisionMatchesDetail(t *testing.T) {
+	srv := newTestServerWithDB(t)
+	parent := &models.Issue{Title: "Parent of a reviewed child"}
+	if err := srv.db.CreateIssue(parent); err != nil {
+		t.Fatal(err)
+	}
+	child := &models.Issue{Title: "Child with review metadata", ParentID: parent.ID}
+	if err := srv.db.CreateIssue(child); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	child.Status = models.StatusClosed
+	child.ReviewRequestedBySession = "ses_agent"
+	child.ReviewerSession = "ses_reviewer"
+	child.ClosedBySession = "ses_closer"
+	child.ReviewedAt = &now
+	child.ClosedAt = &now
+	if err := srv.db.UpdateIssue(child); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp, env := doJSON(t, ts, "GET", "/v1/issues/"+parent.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("parent detail: %d %+v", resp.StatusCode, env.Error)
+	}
+	children := env.Data.(map[string]interface{})["children"].([]interface{})
+	if len(children) != 1 {
+		t.Fatalf("children: %+v", children)
+	}
+	fromParent := children[0].(map[string]interface{})
+	_, detail := doJSON(t, ts, "GET", "/v1/issues/"+child.ID, nil)
+	fromDetail := detail.Data.(map[string]interface{})["issue"].(map[string]interface{})
+	if fromParent["revision"] != fromDetail["revision"] {
+		t.Errorf("unchanged child revision differs between parent and detail")
+	}
+	if status := requestRevision(t, ts, "PATCH", "/v1/issues/"+child.ID, fromParent["revision"].(string), map[string]string{"description": "Updated using child revision"}); status != http.StatusOK {
+		t.Fatalf("fresh child write: %d", status)
+	}
+}
+
+func TestClientRecordReviewRevisionGuard(t *testing.T) {
+	t.Setenv("TD_FEATURE_REVIEW_POLICY_MODE", "trusted")
+	for _, decision := range []string{"approved", "changes_requested"} {
+		t.Run(decision, func(t *testing.T) {
+			srv := newTestServerWithDB(t)
+			id := seedInReviewIssue(t, srv.db, "ses_agent")
+			original, _ := srv.db.GetIssue(id)
+			staleRevision := issueRevision(original)
+			original.Title = "Agent changed the review evidence"
+			if err := srv.db.UpdateIssueLogged(original, "ses_agent", models.ActionUpdate); err != nil {
+				t.Fatal(err)
+			}
+			ts := httptest.NewServer(srv.Handler())
+			defer ts.Close()
+			body := map[string]string{"decision": decision, "summary": "Reviewed the task evidence"}
+			if status := requestRevision(t, ts, "POST", "/v1/issues/"+id+"/reviews", staleRevision, body); status != http.StatusConflict {
+				t.Fatalf("stale record-only review: %d", status)
+			}
+			reviews, err := srv.db.ListIssueReviews(id)
+			if err != nil || len(reviews) != 0 {
+				t.Fatalf("stale request recorded reviews: %+v, %v", reviews, err)
+			}
+			current, _ := srv.db.GetIssue(id)
+			if current.Title != original.Title || current.Status != models.StatusInReview {
+				t.Fatalf("stale request changed task: %+v", current)
+			}
+			if status := requestRevision(t, ts, "POST", "/v1/issues/"+id+"/reviews", issueRevision(current), body); status != http.StatusCreated {
+				t.Fatalf("fresh record-only review: %d", status)
+			}
+		})
 	}
 }
