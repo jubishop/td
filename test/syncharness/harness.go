@@ -407,7 +407,7 @@ func (h *Harness) Mutate(clientID, actionType, entityType, entityID string, data
 	}
 
 	seq := h.actionSeq.Add(1)
-	alID := fmt.Sprintf("al-%08d", seq)
+	alID := harnessActionID(seq)
 
 	// Determine the action type to log. For tables without deleted_at, map "delete"
 	// to the specific action type that sync engine treats as hard delete.
@@ -958,10 +958,9 @@ func (h *Harness) UndoLastAction(clientID string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Find the last non-undone action (excluding backfill-generated entries)
-	// Harness uses IDs like "al-00000001" (8 decimal digits)
-	// Backfill uses IDs like "al-a1b2c3d4" (8 hex chars, may contain letters)
-	// We filter by checking that the ID matches the harness pattern.
+	// Find the last non-undone action (excluding backfill-generated entries).
+	// Backfill rows are also action_log rows for this session, so filter on the
+	// harness ID prefix, which no backfill ID can match (see harnessActionID).
 	var (
 		actionID    string
 		actionType  string
@@ -974,7 +973,7 @@ func (h *Harness) UndoLastAction(clientID string) error {
 		SELECT id, action_type, entity_type, entity_id, previous_data, new_data
 		FROM action_log
 		WHERE session_id = ? AND undone = 0
-		  AND id GLOB 'al-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'
+		  AND id GLOB '`+harnessActionIDPrefix+`*'
 		ORDER BY rowid DESC
 		LIMIT 1
 	`, c.SessionID).Scan(&actionID, &actionType, &entityType, &entityID, &prevDataStr, &newDataStr)
@@ -993,7 +992,7 @@ func (h *Harness) UndoLastAction(clientID string) error {
 
 	// Insert compensating event based on action type
 	seq := h.actionSeq.Add(1)
-	alID := fmt.Sprintf("al-%08d", seq)
+	alID := harnessActionID(seq)
 
 	var compensatingAction string
 	var compensatingNewData, compensatingPrevData []byte
@@ -1081,6 +1080,18 @@ func (h *Harness) UndoLastAction(clientID string) error {
 	}
 
 	return tx.Commit()
+}
+
+// harnessActionIDPrefix marks action_log rows written by the harness. Sync
+// backfill writes "al-" plus 8 random hex characters, and hex never contains
+// 'h', so a harness ID can never be mistaken for a backfill ID (a bare
+// all-digits pattern matched ~2.3% of backfill IDs, making undo pick a
+// backfill row at random).
+const harnessActionIDPrefix = "al-h"
+
+// harnessActionID returns the action_log ID for the seq-th harness action.
+func harnessActionID(seq int64) string {
+	return fmt.Sprintf("%s%07d", harnessActionIDPrefix, seq)
 }
 
 // mapHarnessActionType converts action types to their sync-equivalent categories.

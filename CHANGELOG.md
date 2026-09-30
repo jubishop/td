@@ -4,6 +4,10 @@ All notable changes to td are documented in this file.
 
 ## [Unreleased]
 
+### Developer
+
+- **A sync-harness undo test no longer fails ~2% of the time.** `UndoLastAction` in `test/syncharness` told harness action-log rows apart from sync-backfill rows by matching `al-` plus eight decimal digits. Backfill IDs are eight random hex characters, so about 2.3% of them are all digits and matched too; undo then picked the backfill `create` row instead of the delete it meant to reverse, and `TestUndoRestore_ReDeletePropagates` intermittently failed (it also failed on v0.65.0, and blocked the v0.65.1 release gate once). Harness IDs now carry an `h` marker that hex can never contain.
+
 ## [v0.65.1] - 2026-09-29
 
 ### Developer
