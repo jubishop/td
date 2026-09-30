@@ -39,3 +39,6 @@ api.test
 # Nightshift plan artifacts (keep out of version control)
 .nightshift-plan
 .todos/
+
+# graphify knowledge graph cache (rebuilt by clara-home bin/graphify-refresh)
+graphify-out/
