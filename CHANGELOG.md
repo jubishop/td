@@ -4,6 +4,24 @@ All notable changes to td are documented in this file.
 
 ## [Unreleased]
 
+## [v0.66.0] - 2026-09-29
+
+### HTTP API
+
+- **Clients can detect conflicting edits before overwriting them.** Every issue in API responses now carries a `revision`. Send it back in an `If-Match` header on edit, delete, workflow transitions, or review decisions, and td returns `409 conflict` if the issue changed since the client loaded it — for example, because an agent edited the same task — leaving the newer version intact. The header is optional; existing clients are unaffected. The check runs under td's write lock, so it covers the approve-and-close transaction too. CORS now allows `If-Match`. Thanks to @jubishop (#212).
+- **`POST /v1/boards/{id}/move` places a task before another task,** or at the end, including on boards with no explicit positions yet. It uses the same task list as `GET /v1/boards/{id}` (closed tasks only with `include_closed`), and gives explicit positions only to the moved task and the unpositioned tasks above it, so tasks below the drop point keep following the board's query and new tasks still sort by it (#212).
+- **`GET /v1/project` describes the project a client is talking to:** name, path, session, title length limits, and a `capabilities` list (`issue_revisions`, `board_move`) so a client can detect what the server supports (#212).
+- **Issue details include direct children, and parent cycles are rejected.** `GET /v1/issues/{id}` returns a `children` array, and `PATCH` refuses a `parent_id` that would make a task its own ancestor (#212).
+
+### Bug Fixes
+
+- **Creating an issue keeps its sprint.** `CreateIssueLogged` dropped the `sprint` field on insert (#212).
+- **`td serve` shuts down cleanly.** It now honors command cancellation, closes live event streams during shutdown, and removes the port file only if it still belongs to this server instance, so a replacement server's port file is not deleted (#212).
+
+### CLI
+
+- **`td info --json` reports `base_dir`,** the resolved project root, so clients can follow worktrees and `.td-root` through td rather than re-implementing the lookup (#212).
+
 ### Developer
 
 - **A sync-harness undo test no longer fails ~2% of the time.** `UndoLastAction` in `test/syncharness` told harness action-log rows apart from sync-backfill rows by matching `al-` plus eight decimal digits. Backfill IDs are eight random hex characters, so about 2.3% of them are all digits and matched too; undo then picked the backfill `create` row instead of the delete it meant to reverse, and `TestUndoRestore_ReDeletePropagates` intermittently failed (it also failed on v0.65.0, and blocked the v0.65.1 release gate once). Harness IDs now carry an `h` marker that hex can never contain.
