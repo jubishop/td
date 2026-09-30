@@ -32,7 +32,6 @@ A minimalist CLI for tracking tasks across AI coding sessions. When your context
 - [Analytics & Stats](#analytics--stats)
 - [Full Command Reference](#full-command-reference)
 - [Live Monitor](#live-monitor)
-- [Browser Workspace](#browser-workspace)
 - [Architecture](#architecture)
 - [Development](#development)
 - [Release](#release)
@@ -161,22 +160,6 @@ For AI agents in Claude Code, Codex, Cursor, or other compatible environments:
 Or use the skill directly from the repo: See `./td-task-management/SKILL.md` for full documentation.
 
 Migration status for legacy in-repo guides is tracked in `docs/guides/README.md`.
-
-## Browser Workspace
-
-Run `td browser` inside an initialized project to manage tasks and review agent
-work in your browser. It includes Board, List, Reviews, and Activity views,
-Markdown editing, saved boards, and live updates. Conflicting edits preserve
-the saved task and let you compare it with your draft before saving again.
-
-```bash
-td browser                 # Start locally and open your browser
-td browser --no-open       # Print the URL without opening a tab
-td browser --port 8080     # Use a specific port
-```
-
-The interface is bundled in the td binary. The server listens on `127.0.0.1`
-and runs until you press Ctrl+C. See the [browser guide](website/docs/browser.md).
 
 ## Architecture
 

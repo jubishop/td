@@ -14,7 +14,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func TestBrowserLifecycle(t *testing.T) {
+func TestServeLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	database, err := db.Initialize(dir)
 	if err != nil {
@@ -26,13 +26,15 @@ func TestBrowserLifecycle(t *testing.T) {
 	t.Cleanup(func() { baseDirOverride = previousOverride })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cmd := &cobra.Command{Use: "browser"}
+	cmd := &cobra.Command{Use: "serve"}
 	cmd.SetContext(ctx)
 	cmd.Flags().Int("port", 0, "")
-	cmd.Flags().Bool("no-open", true, "")
+	cmd.Flags().String("addr", "127.0.0.1", "")
+	cmd.Flags().String("token", "", "")
+	cmd.Flags().String("cors", "", "")
 	cmd.Flags().Duration("interval", 50*time.Millisecond, "")
 	done := make(chan error, 1)
-	go func() { done <- runHTTPServer(cmd, true) }()
+	go func() { done <- runServe(cmd, nil) }()
 	var info *serve.PortInfo
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -43,17 +45,17 @@ func TestBrowserLifecycle(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if err != nil {
-		t.Fatalf("browser did not start: %v", err)
+		t.Fatalf("server did not start: %v", err)
 	}
 	client := &http.Client{Timeout: time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", info.Port))
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/v1/project", info.Port))
 	if err != nil {
 		t.Fatal(err)
 	}
 	page, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != 200 || !strings.Contains(string(page), "/assets/app.js") {
-		t.Fatalf("browser page: %d %s", resp.StatusCode, page)
+	if resp.StatusCode != 200 || !strings.Contains(string(page), "issue_revisions") {
+		t.Fatalf("server page: %d %s", resp.StatusCode, page)
 	}
 	stream, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/v1/events", info.Port))
 	if err != nil {
@@ -67,12 +69,12 @@ func TestBrowserLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("browser did not stop with an SSE client connected")
+		t.Fatal("server did not stop with an SSE client connected")
 	}
 	if _, err := serve.ReadPortFile(dir); err == nil {
-		t.Fatal("browser left its port file behind")
+		t.Fatal("server left its port file behind")
 	}
-	if _, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", info.Port)); err == nil {
-		t.Fatal("browser listener still running")
+	if _, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/v1/project", info.Port)); err == nil {
+		t.Fatal("server listener still running")
 	}
 }

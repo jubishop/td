@@ -6,115 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/marcus/td/internal/models"
 )
-
-func newBrowserTestServer(t *testing.T) *Server {
-	t.Helper()
-	srv := newTestServerWithDB(t)
-	srv.config.Browser = true
-	srv.registerBrowserRoutes()
-	return srv
-}
-
-func TestBrowserEmbeddedAssets(t *testing.T) {
-	srv := newBrowserTestServer(t)
-	for _, path := range []string{"/", "/assets/style.css", "/assets/app.js", "/assets/api.js", "/assets/details.js", "/assets/workspace.js", "/assets/ui.js"} {
-		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+path, nil)
-		response := httptest.NewRecorder()
-		srv.Handler().ServeHTTP(response, req)
-		if response.Code != http.StatusOK || response.Body.Len() == 0 {
-			t.Fatalf("%s: status %d, %s", path, response.Code, response.Body.String())
-		}
-		if response.Header().Get("Content-Security-Policy") == "" {
-			t.Fatalf("missing CSP for %s", path)
-		}
-	}
-	response := httptest.NewRecorder()
-	newTestServer(ServeConfig{}).Handler().ServeHTTP(response, httptest.NewRequest("GET", "/", nil))
-	if response.Code != http.StatusNotFound {
-		t.Fatalf("API-only server serves browser: %d", response.Code)
-	}
-}
-
-func TestBrowserOriginBoundary(t *testing.T) {
-	srv := newBrowserTestServer(t)
-	for _, tc := range []struct {
-		host, origin, site string
-		want               int
-	}{
-		{"127.0.0.1:8080", "http://127.0.0.1:8080", "same-origin", 200},
-		{"localhost:8080", "", "none", 200},
-		{"[::1]:8080", "http://[::1]:8080", "same-origin", 200},
-		{"127.0.0.1:8080", "https://example.com", "cross-site", 403},
-		{"127.0.0.1:8080", "http://127.0.0.1:9090", "same-site", 403},
-		{"127.0.0.1:8080", "null", "", 403},
-		{"attacker.example:8080", "", "", 403},
-		{"127.0.0.1:8080", "", "cross-site", 403},
-	} {
-		t.Run(tc.host+tc.origin+tc.site, func(t *testing.T) {
-			r := httptest.NewRequest("GET", "http://"+tc.host+"/v1/browser", nil)
-			r.Header.Set("Origin", tc.origin)
-			r.Header.Set("Sec-Fetch-Site", tc.site)
-			w := httptest.NewRecorder()
-			srv.Handler().ServeHTTP(w, r)
-			if w.Code != tc.want {
-				t.Fatalf("got %d: %s", w.Code, w.Body.String())
-			}
-		})
-	}
-}
-
-func TestBrowserMarkdownSanitization(t *testing.T) {
-	srv := newBrowserTestServer(t)
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-	_, env := doJSON(t, ts, "POST", "/v1/markdown", map[string]string{"text": "# Heading\n\n- [x] Done\n\n[bad](javascript:alert(1))\n\n<script>alert(1)</script><img src=x onerror=alert(2)>\n\n```go\nvar ok = true\n```"})
-	html := env.Data.(map[string]interface{})["html"].(string)
-	for _, forbidden := range []string{"<script", "onerror", "javascript:"} {
-		if strings.Contains(html, forbidden) {
-			t.Fatalf("unsafe HTML: %s", html)
-		}
-	}
-	for _, expected := range []string{"<h1>Heading</h1>", "<pre>", "<code", `<input`, `disabled`, `checked`} {
-		if !strings.Contains(html, expected) {
-			t.Fatalf("missing Markdown output %s: %s", expected, html)
-		}
-	}
-}
-
-func TestBrowserMarkdownRejectsEncodedDangerousURLs(t *testing.T) {
-	srv := newBrowserTestServer(t)
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-	for _, source := range []string{
-		`[click](&#106;avascript:alert(1))`,
-		`<javascript:alert(document.domain)>`,
-		`![alt](&#106;avascript:alert(1))`,
-	} {
-		t.Run(source, func(t *testing.T) {
-			var rendered bytes.Buffer
-			if err := browserMarkdown.Convert([]byte(source), &rendered); err != nil {
-				t.Fatal(err)
-			}
-			for _, attribute := range []string{`href="javascript:`, `src="javascript:`} {
-				if strings.Contains(rendered.String(), attribute) {
-					t.Errorf("renderer emitted an unsafe URL before sanitization: %s", rendered.String())
-				}
-			}
-			_, env := doJSON(t, ts, "POST", "/v1/markdown", map[string]string{"text": source})
-			html := env.Data.(map[string]interface{})["html"].(string)
-			for _, attribute := range []string{`href="javascript:`, `src="javascript:`} {
-				if strings.Contains(html, attribute) {
-					t.Errorf("endpoint emitted an unsafe URL: %s", html)
-				}
-			}
-		})
-	}
-}
 
 func requestRevision(t *testing.T, ts *httptest.Server, method, path, revision string, body interface{}) int {
 	t.Helper()
@@ -131,8 +26,8 @@ func requestRevision(t *testing.T, ts *httptest.Server, method, path, revision s
 	return resp.StatusCode
 }
 
-func TestBrowserStaleWritesPreserveAgentChange(t *testing.T) {
-	srv := newBrowserTestServer(t)
+func TestClientStaleWritesPreserveAgentChange(t *testing.T) {
+	srv := newTestServerWithDB(t)
 	issue := &models.Issue{Title: "Original task", Status: models.StatusInReview}
 	if err := srv.db.CreateIssue(issue); err != nil {
 		t.Fatal(err)
@@ -170,9 +65,9 @@ func TestBrowserStaleWritesPreserveAgentChange(t *testing.T) {
 	}
 }
 
-func TestBrowserRecordedApprovalRevisionGuard(t *testing.T) {
+func TestClientRecordedApprovalRevisionGuard(t *testing.T) {
 	t.Setenv("TD_FEATURE_REVIEW_POLICY_MODE", "trusted")
-	srv := newBrowserTestServer(t)
+	srv := newTestServerWithDB(t)
 	id := seedInReviewIssue(t, srv.db, "ses_agent")
 	original, _ := srv.db.GetIssue(id)
 	ts := httptest.NewServer(srv.Handler())
@@ -201,9 +96,9 @@ func TestBrowserRecordedApprovalRevisionGuard(t *testing.T) {
 	}
 }
 
-func TestBrowserMoveUnpositionedTasks(t *testing.T) {
-	srv := newBrowserTestServer(t)
-	board, err := srv.db.CreateBoard("Browser ordering", "")
+func TestClientMoveUnpositionedTasks(t *testing.T) {
+	srv := newTestServerWithDB(t)
+	board, err := srv.db.CreateBoard("Client ordering", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,13 +136,13 @@ func TestBrowserMoveUnpositionedTasks(t *testing.T) {
 	}
 }
 
-func TestBrowserParentCycleRejected(t *testing.T) {
-	srv := newBrowserTestServer(t)
-	parent := &models.Issue{Title: "Parent task for browser test"}
+func TestClientParentCycleRejected(t *testing.T) {
+	srv := newTestServerWithDB(t)
+	parent := &models.Issue{Title: "Parent task for client test"}
 	if err := srv.db.CreateIssue(parent); err != nil {
 		t.Fatal(err)
 	}
-	child := &models.Issue{Title: "Child task for browser test", ParentID: parent.ID}
+	child := &models.Issue{Title: "Child task for client test", ParentID: parent.ID}
 	if err := srv.db.CreateIssue(child); err != nil {
 		t.Fatal(err)
 	}
@@ -257,6 +152,34 @@ func TestBrowserParentCycleRejected(t *testing.T) {
 		resp, _ := doJSON(t, ts, "PATCH", "/v1/issues/"+parent.ID, map[string]string{"parent_id": parentID})
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("cycle accepted: %d", resp.StatusCode)
+		}
+	}
+}
+
+func TestClientProjectMetadata(t *testing.T) {
+	srv := newTestServerWithDB(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp, env := doJSON(t, ts, "GET", "/v1/project", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metadata: %+v", env)
+	}
+	data := env.Data.(map[string]interface{})
+	if data["path"] != srv.baseDir || data["session_id"] != srv.sessionID {
+		t.Fatalf("identity: %+v", data)
+	}
+	if data["title_min_length"].(float64) <= 0 || data["title_max_length"].(float64) < data["title_min_length"].(float64) {
+		t.Fatalf("title limits: %+v", data)
+	}
+	caps := data["capabilities"].([]interface{})
+	if len(caps) != 2 || caps[0] != "issue_revisions" || caps[1] != "board_move" {
+		t.Fatalf("capabilities: %+v", caps)
+	}
+	for _, path := range []string{"/", "/assets/app.js", "/v1/browser", "/v1/markdown"} {
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("API server exposes UI route %s: %d", path, w.Code)
 		}
 	}
 }

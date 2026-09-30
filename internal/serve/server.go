@@ -21,7 +21,6 @@ type ServeConfig struct {
 	Token        string
 	CORSOrigin   string
 	PollInterval time.Duration
-	Browser      bool
 }
 
 // Server is the td serve HTTP server.
@@ -60,9 +59,6 @@ func NewServer(database *db.DB, baseDir, sessionID string, config ServeConfig) *
 	}
 
 	s.registerRoutes()
-	if config.Browser {
-		s.registerBrowserRoutes()
-	}
 	return s
 }
 
@@ -75,9 +71,6 @@ func (s *Server) Handler() http.Handler {
 	//   recovery -> logging -> CORS -> auth -> handler
 	h = s.authMiddleware(h)
 	h = s.corsMiddleware(h)
-	if s.config.Browser {
-		h = s.browserMiddleware(h)
-	}
 	h = s.loggingMiddleware(h)
 	h = s.recoveryMiddleware(h)
 
@@ -160,6 +153,8 @@ func (s *Server) registerRoutes() {
 	// Health (read)
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 
+	s.mux.HandleFunc("GET /v1/project", s.handleProject)
+
 	// Monitor (read)
 	s.mux.HandleFunc("GET /v1/monitor", s.handleMonitor)
 
@@ -199,6 +194,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PATCH /v1/boards/{id}", s.handleUpdateBoard)
 	s.mux.HandleFunc("DELETE /v1/boards/{id}", s.handleDeleteBoard)
 	s.mux.HandleFunc("POST /v1/boards/{id}/issues", s.handleSetBoardPosition)
+	s.mux.HandleFunc("POST /v1/boards/{id}/move", s.handleMoveBoardIssue)
 	s.mux.HandleFunc("DELETE /v1/boards/{id}/issues/{issue_id}", s.handleRemoveBoardPosition)
 
 	// Sessions (read)

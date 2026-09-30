@@ -31,6 +31,34 @@ The `change_token` is a monotonically increasing value derived from the action l
 
 ---
 
+## Project metadata
+
+### `GET /v1/project`
+
+Local `td serve` project identity, title limits, and optional API capabilities.
+This endpoint follows the server's bearer-token authentication. It is not a
+browser-specific endpoint and does not serve HTML or assets.
+
+```json
+{
+  "ok": true,
+  "data": {
+    "name": "my-project",
+    "path": "/path/to/my-project",
+    "session_id": "ses_a1b2c3",
+    "title_min_length": 3,
+    "title_max_length": 200,
+    "capabilities": ["issue_revisions", "board_move"]
+  }
+}
+```
+
+Clients should check capabilities before relying on optional behavior.
+`issue_revisions` means issue reads return a revision and conditional issue
+writes reject stale snapshots. `board_move` enables moves anchored to issue IDs.
+
+---
+
 ## Monitor
 
 ### `GET /v1/monitor`
@@ -464,6 +492,21 @@ curl -X POST http://localhost:54321/v1/boards/brd_abc/issues \
   -H "Content-Type: application/json" \
   -d '{"issue_id": "td-abc123", "position": 0}'
 ```
+
+### `POST /v1/boards/{id}/move`
+
+Move a board issue before another issue. Omit `before_id` or send an empty
+string to move it to the end. This also works when tasks have no explicit
+board positions yet. The changes are recorded in the action log.
+
+```json
+{ "issue_id": "td-abc123", "before_id": "td-def456" }
+```
+
+Returns `{ "ok": true, "data": { "positioned": true } }`. Returns `409`
+if the issue or destination is absent from the loaded board. Refresh the board
+before retrying. A status transition is a separate API call; a failed move
+does not undo an earlier status transition.
 
 ### `DELETE /v1/boards/{id}/issues/{issue_id}`
 
