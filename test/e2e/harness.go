@@ -5,9 +5,11 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -54,10 +56,11 @@ type Harness struct {
 	sessionIDs map[string]string // actor -> TD_SESSION_ID
 
 	serverCmd          *exec.Cmd
-	serverLog          string   // path to server log file
-	serverPort         int      // port the server listens on
-	serverData         string   // path to server-data directory
-	serverEnvOverrides []string // extra env vars for server (set before Setup)
+	serverDone         chan struct{} // closed after the child has been reaped
+	serverLog          string        // path to server log file
+	serverPort         int           // port the server listens on
+	serverData         string        // path to server-data directory
+	serverEnvOverrides []string      // extra env vars for server (set before Setup)
 	config             Config
 	t                  *testing.T // nil when used standalone
 }
@@ -150,21 +153,8 @@ func Setup(t *testing.T, cfg Config) *Harness {
 		t.Fatalf("build td-sync: %v\n%s", err, out)
 	}
 
-	// Pick random port
-	port, err := randomPort()
-	if err != nil {
-		t.Fatalf("random port: %v", err)
-	}
-	h.ServerURL = fmt.Sprintf("http://localhost:%d", port)
-	h.serverPort = port
 	h.serverData = serverData
-
-	// Start server
 	h.serverLog = filepath.Join(workDir, "server.log")
-	logFile, err := os.Create(h.serverLog)
-	if err != nil {
-		t.Fatalf("create server log: %v", err)
-	}
 
 	// Provision actor users BEFORE starting the server. The device PKCE login
 	// flow is non-enumerating: it only emails (and creates a challenge for)
@@ -180,41 +170,10 @@ func Setup(t *testing.T, cfg Config) *Harness {
 		}
 	}
 
-	h.serverCmd = exec.Command(h.SyncBin)
-	h.serverCmd.Env = append(os.Environ(),
-		fmt.Sprintf("SYNC_LISTEN_ADDR=:%d", port),
-		fmt.Sprintf("SYNC_SERVER_DB_PATH=%s/server.db", serverData),
-		fmt.Sprintf("SYNC_PROJECT_DATA_DIR=%s/projects", serverData),
-		"SYNC_ALLOW_SIGNUP=true",
-		fmt.Sprintf("SYNC_BASE_URL=%s", h.ServerURL),
-		// Device PKCE login flow: in-memory email provider + dev inspection so the
-		// harness can read the magic link via GET /internal/dev/last-email.
-		"SYNC_EMAIL_PROVIDER=memory",
-		"SYNC_DEV_EMAIL_INSPECT=1",
-		fmt.Sprintf("SYNC_EMAIL_BASE_URL=%s", h.ServerURL),
-		"SYNC_LOG_FORMAT=text",
-		"SYNC_LOG_LEVEL=info",
-		"SYNC_RATE_LIMIT_AUTH=1000",
-		"SYNC_RATE_LIMIT_PUSH=10000",
-		"SYNC_RATE_LIMIT_PULL=10000",
-		"SYNC_RATE_LIMIT_OTHER=10000",
-	)
-	h.serverCmd.Env = append(h.serverCmd.Env, h.serverEnvOverrides...)
-	h.serverCmd.Stdout = logFile
-	h.serverCmd.Stderr = logFile
-
-	if err := h.serverCmd.Start(); err != nil {
-		_ = logFile.Close()
+	if err := h.startServerWithRetry(randomPort); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
-	_ = logFile.Close()
-
-	// Wait for server health
-	if err := h.waitForHealth(30 * time.Second); err != nil {
-		serverLog, _ := os.ReadFile(h.serverLog)
-		t.Fatalf("server not healthy: %v\nServer log:\n%s", err, serverLog)
-	}
-	t.Logf("server ready on port %d", port)
+	t.Logf("server ready on port %d", h.serverPort)
 
 	// Init + auth + link
 	for _, actor := range actors {
@@ -266,9 +225,8 @@ func Setup(t *testing.T, cfg Config) *Harness {
 
 // Teardown kills the server and cleans up temp dirs.
 func (h *Harness) Teardown() {
-	if h.serverCmd != nil && h.serverCmd.Process != nil {
-		_ = h.serverCmd.Process.Kill()
-		_ = h.serverCmd.Wait()
+	if h.serverCmd != nil {
+		_ = h.StopServer()
 	}
 	if h.WorkDir != "" {
 		_ = os.RemoveAll(h.WorkDir)
@@ -382,26 +340,66 @@ func (h *Harness) StopServer() error {
 	if h.serverCmd == nil || h.serverCmd.Process == nil {
 		return fmt.Errorf("server not running")
 	}
-	if err := h.serverCmd.Process.Kill(); err != nil {
+	if err := h.serverCmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return fmt.Errorf("kill server: %w", err)
 	}
-	// Wait for process to fully exit (ignore error since Kill causes non-zero exit)
-	_ = h.serverCmd.Wait()
+	<-h.serverDone
 	h.serverCmd = nil
+	h.serverDone = nil
+	return nil
+}
+
+const serverStartAttempts = 5
+
+var errServerAddressInUse = errors.New("server address already in use")
+
+// Only initial startup may change the URL, before actors persist it in config.
+func (h *Harness) startServerWithRetry(pickPort func() (int, error)) error {
+	for attempt := 1; attempt <= serverStartAttempts; attempt++ {
+		port, err := pickPort()
+		if err != nil {
+			return fmt.Errorf("random port: %w", err)
+		}
+		h.serverPort = port
+		h.ServerURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+		if err := h.StartServer(); err != nil {
+			if !errors.Is(err, errServerAddressInUse) || attempt == serverStartAttempts {
+				return fmt.Errorf("server startup attempt %d/%d: %w", attempt, serverStartAttempts, err)
+			}
+			continue
+		}
+		return nil
+	}
 	return nil
 }
 
 // StartServer starts a new server process using the same data directory and port.
 // Blocks until the server passes a health check.
 func (h *Harness) StartServer() error {
-	logFile, err := os.OpenFile(h.serverLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	return h.startServer(30 * time.Second)
+}
+
+func (h *Harness) startServer(timeout time.Duration) error {
+	if h.serverCmd != nil {
+		return fmt.Errorf("server already running; stop it before starting again")
+	}
+	logFile, err := os.OpenFile(h.serverLog, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return fmt.Errorf("open server log: %w", err)
 	}
+	defer func() { _ = logFile.Close() }()
+	logStart, err := logFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek server log: %w", err)
+	}
+	attemptLog := func() string {
+		data, _ := io.ReadAll(io.NewSectionReader(logFile, logStart, 1<<63-1-logStart))
+		return string(data)
+	}
 
-	h.serverCmd = exec.Command(h.SyncBin)
-	h.serverCmd.Env = append(os.Environ(),
-		fmt.Sprintf("SYNC_LISTEN_ADDR=:%d", h.serverPort),
+	cmd := exec.Command(h.SyncBin)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("SYNC_LISTEN_ADDR=127.0.0.1:%d", h.serverPort),
 		fmt.Sprintf("SYNC_SERVER_DB_PATH=%s/server.db", h.serverData),
 		fmt.Sprintf("SYNC_PROJECT_DATA_DIR=%s/projects", h.serverData),
 		"SYNC_ALLOW_SIGNUP=true",
@@ -416,18 +414,38 @@ func (h *Harness) StartServer() error {
 		"SYNC_RATE_LIMIT_PULL=10000",
 		"SYNC_RATE_LIMIT_OTHER=10000",
 	)
-	h.serverCmd.Env = append(h.serverCmd.Env, h.serverEnvOverrides...)
-	h.serverCmd.Stdout = logFile
-	h.serverCmd.Stderr = logFile
+	cmd.Env = append(cmd.Env, h.serverEnvOverrides...)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 
-	if err := h.serverCmd.Start(); err != nil {
-		_ = logFile.Close()
+	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start server: %w", err)
 	}
-	_ = logFile.Close()
+	h.serverCmd = cmd
+	done := make(chan struct{})
+	h.serverDone = done
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
 
-	if err := h.waitForHealth(30 * time.Second); err != nil {
-		return fmt.Errorf("server not healthy after restart: %w", err)
+	if err := h.waitForHealth(timeout, attemptLog); err != nil {
+		exited := false
+		select {
+		case <-done:
+			exited = true
+		default:
+		}
+		if stopErr := h.StopServer(); stopErr != nil {
+			return fmt.Errorf("server not healthy: %w; cleanup: %v", err, stopErr)
+		}
+		logs := attemptLog()
+		// Match only this child's bind failure, never a stale log or a timeout.
+		bindError := fmt.Sprintf("listen: listen tcp 127.0.0.1:%d: bind: address already in use", h.serverPort)
+		if exited && strings.Contains(logs, bindError) {
+			return fmt.Errorf("%w: %v\nServer log:\n%s", errServerAddressInUse, err, logs)
+		}
+		return fmt.Errorf("server not healthy: %w\nServer log:\n%s", err, logs)
 	}
 	return nil
 }
@@ -468,27 +486,51 @@ func runCmd(dir string, name string, args ...string) (string, error) {
 	return string(out), err
 }
 
-func (h *Harness) waitForHealth(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+func (h *Harness) waitForHealth(timeout time.Duration, attemptLog func() string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	healthURL := h.ServerURL + "/healthz"
 	client := &http.Client{Timeout: 2 * time.Second}
+	defer client.CloseIdleConnections()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
 
-	for time.Now().Before(deadline) {
-		// Check if server process died
-		if h.serverCmd.ProcessState != nil {
-			return fmt.Errorf("server process exited")
+	for {
+		select {
+		case <-h.serverDone:
+			return fmt.Errorf("server process exited: %s", h.serverCmd.ProcessState)
+		default:
 		}
 
-		resp, err := client.Get(healthURL)
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == 200 {
-				return nil
+		// The port may belong to another HTTP server. Require this child's
+		// post-bind startup message before accepting any health response.
+		logs := attemptLog()
+		if strings.Contains(logs, `msg="server started"`) || strings.Contains(logs, `"msg":"server started"`) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+			if err != nil {
+				return err
+			}
+			resp, err := client.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					select {
+					case <-h.serverDone:
+						return fmt.Errorf("server process exited: %s", h.serverCmd.ProcessState)
+					default:
+						return nil
+					}
+				}
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-h.serverDone:
+			return fmt.Errorf("server process exited: %s", h.serverCmd.ProcessState)
+		case <-ctx.Done():
+			return fmt.Errorf("health check timed out after %v", timeout)
+		case <-ticker.C:
+		}
 	}
-	return fmt.Errorf("health check timed out after %v", timeout)
 }
 
 // authenticate performs the device PKCE login flow for an actor, mirroring what
