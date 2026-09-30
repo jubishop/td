@@ -2,6 +2,7 @@ package serve
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -369,7 +370,7 @@ type transitionSpec struct {
 	beforeCommit func(ctx HandlerContext, issue *models.Issue) error
 	// persist overrides the default issue writer for lifecycle operations that
 	// must include related rows and events in the same database transaction.
-	persist func(ctx HandlerContext, issue *models.Issue) error
+	persist func(ctx HandlerContext, issue, previous *models.Issue) error
 	// postCommit runs after UpdateIssueLogged succeeds but before cascades.
 	// Used to write issue_reviews rows for approve so audit output records
 	// the reviewer independently of the closer.
@@ -398,6 +399,10 @@ func handleTransition(ctx HandlerContext, w http.ResponseWriter, r *http.Request
 		return
 	}
 	canonicalIssueID := issue.ID
+	if !checkIssueRevision(w, r, issue) {
+		return
+	}
+	previous := *issue
 
 	// Validate current status against allowed "from" statuses using state machine
 	sm := workflow.DefaultMachine()
@@ -457,11 +462,15 @@ func handleTransition(ctx HandlerContext, w http.ResponseWriter, r *http.Request
 	// Persist
 	var persistErr error
 	if spec.persist != nil {
-		persistErr = spec.persist(ctx, issue)
+		persistErr = spec.persist(ctx, issue, &previous)
 	} else {
-		persistErr = ctx.DB.UpdateIssueLogged(issue, ctx.SessionID, spec.actionType)
+		persistErr = ctx.DB.UpdateIssueLoggedIfUnchanged(issue, &previous, ctx.SessionID, spec.actionType)
 	}
 	if persistErr != nil {
+		if errors.Is(persistErr, db.ErrIssueChanged) {
+			WriteError(w, ErrConflict, "Task changed before this action could be applied. Refresh and review it again.", http.StatusConflict)
+			return
+		}
 		slog.Error("transition issue", "err", persistErr, "id", issueID, "to", spec.toStatus)
 		WriteIssueWriteError(w, persistErr, issueID, "failed to update issue")
 		return
@@ -514,6 +523,7 @@ func handleTransition(ctx HandlerContext, w http.ResponseWriter, r *http.Request
 	}
 
 	dto := IssueToDTO(updated)
+	notifyChange(ctx)
 	// Keep available_transitions fresh on the mutation response so clients that
 	// replace their in-memory issue with this payload (instead of re-fetching)
 	// still render the authoritative action set for the new status.
@@ -669,6 +679,9 @@ func HandleApprove(ctx HandlerContext, w http.ResponseWriter, r *http.Request) {
 	issueID := r.PathValue("id")
 	if issueID != "" && ctx.DB != nil {
 		if issue, err := ctx.DB.GetIssue(issueID); err == nil && issue != nil {
+			if !checkIssueRevision(w, r, issue) {
+				return
+			}
 			if handledCloseAfterReview(ctx, w, r, issue, reviewedBy) {
 				return
 			}
@@ -722,8 +735,8 @@ func HandleApprove(ctx HandlerContext, w http.ResponseWriter, r *http.Request) {
 			issue.ReviewedAt = &now
 			issue.ClosedAt = &now
 		},
-		persist: func(c HandlerContext, issue *models.Issue) error {
-			_, err := c.DB.CreateIssueReviewAndUpdateIssueLogged(db.NewReview{
+		persist: func(c HandlerContext, issue, previous *models.Issue) error {
+			_, err := c.DB.CreateIssueReviewAndUpdateIssueLoggedIfUnchanged(db.NewReview{
 				IssueID:            issue.ID,
 				ReviewerSession:    c.SessionID,
 				Decision:           reviewpolicy.DecisionApproved,
@@ -731,7 +744,7 @@ func HandleApprove(ctx HandlerContext, w http.ResponseWriter, r *http.Request) {
 				RequestedBySession: issue.ReviewRequestedBySession,
 				SelfReview:         decisionSelfReview,
 				ReviewedBy:         decisionAttributedTo,
-			}, issue, models.StatusInReview, c.SessionID, models.ActionApprove)
+			}, issue, previous, models.StatusInReview, c.SessionID, models.ActionApprove)
 			return err
 		},
 		postCommit: func(c HandlerContext, issue *models.Issue) {
@@ -840,12 +853,17 @@ func handledCloseAfterReview(ctx HandlerContext, w http.ResponseWriter, r *http.
 		return true
 	}
 
+	previous := *issue
 	now := time.Now()
 	issue.Status = models.StatusClosed
 	issue.ClosedBySession = ctx.SessionID
 	issue.ClosedAt = &now
 
-	if err := ctx.DB.UpdateIssueLoggedWithReviewMeta(issue, models.StatusInReview, ctx.SessionID, models.ActionCloseAfterReview, "", ""); err != nil {
+	if err := ctx.DB.UpdateIssueLoggedWithReviewMetaIfUnchanged(issue, &previous, models.StatusInReview, ctx.SessionID, models.ActionCloseAfterReview, "", ""); err != nil {
+		if errors.Is(err, db.ErrIssueChanged) {
+			WriteError(w, ErrConflict, "Task changed before this action could be applied. Refresh and review it again.", http.StatusConflict)
+			return true
+		}
 		slog.Error("close-after-review update", "err", err, "id", issue.ID)
 		WriteError(w, ErrInternal, "failed to close issue", http.StatusInternalServerError)
 		return true
@@ -888,6 +906,7 @@ func handledCloseAfterReview(ctx HandlerContext, w http.ResponseWriter, r *http.
 	if summary := activeReviewSummary(ctx, issue.ID); summary != nil {
 		payload["active_review"] = summary
 	}
+	notifyChange(ctx)
 	WriteSuccess(w, payload, http.StatusOK)
 	return true
 }

@@ -2,6 +2,7 @@ package serve
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -188,6 +189,11 @@ func HandleUpdateIssue(ctx HandlerContext, w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if !checkIssueRevision(w, r, issue) {
+		return
+	}
+	previous := *issue
+
 	// Apply only non-nil fields
 	if body.Title != nil {
 		issue.Title = *body.Title
@@ -225,6 +231,20 @@ func HandleUpdateIssue(ctx HandlerContext, w http.ResponseWriter, r *http.Reques
 				}
 				return
 			}
+			seen := map[string]bool{issue.ID: true}
+			for ancestorID := normalizedParent; ancestorID != ""; {
+				if seen[ancestorID] {
+					WriteError(w, ErrValidation, "parent task would create a cycle", http.StatusBadRequest)
+					return
+				}
+				seen[ancestorID] = true
+				ancestor, err := ctx.DB.GetIssue(ancestorID)
+				if err != nil {
+					WriteError(w, ErrValidation, "could not resolve parent task", http.StatusBadRequest)
+					return
+				}
+				ancestorID = ancestor.ParentID
+			}
 			issue.ParentID = normalizedParent
 		} else {
 			issue.ParentID = ""
@@ -252,7 +272,11 @@ func HandleUpdateIssue(ctx HandlerContext, w http.ResponseWriter, r *http.Reques
 	}
 
 	// Update atomically with action log
-	if err := ctx.DB.UpdateIssueLogged(issue, ctx.SessionID, models.ActionUpdate); err != nil {
+	if err := ctx.DB.UpdateIssueLoggedIfUnchanged(issue, &previous, ctx.SessionID, models.ActionUpdate); err != nil {
+		if errors.Is(err, db.ErrIssueChanged) {
+			WriteError(w, ErrConflict, "Task changed while saving. Compare the saved version with your draft.", http.StatusConflict)
+			return
+		}
 		slog.Error("update issue", "err", err, "id", issueID)
 		WriteIssueWriteError(w, err, issueID, "failed to update issue")
 		return
@@ -298,7 +322,14 @@ func HandleDeleteIssue(ctx HandlerContext, w http.ResponseWriter, r *http.Reques
 	}
 
 	// Soft delete with action log
-	if err := ctx.DB.DeleteIssueLogged(issue.ID, ctx.SessionID); err != nil {
+	if !checkIssueRevision(w, r, issue) {
+		return
+	}
+	if err := ctx.DB.DeleteIssueLoggedIfUnchanged(issue.ID, ctx.SessionID, issue); err != nil {
+		if errors.Is(err, db.ErrIssueChanged) {
+			WriteError(w, ErrConflict, "Task changed before deletion. Refresh and review it again.", http.StatusConflict)
+			return
+		}
 		slog.Error("delete issue", "err", err, "id", issue.ID)
 		WriteError(w, ErrInternal, "failed to delete issue", http.StatusInternalServerError)
 		return

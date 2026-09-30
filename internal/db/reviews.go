@@ -103,12 +103,24 @@ func (db *DB) CreateIssueReviewAndUpdateIssueLogged(
 	rv NewReview, issue *models.Issue, expectedStatus models.Status,
 	sessionID string, actionType models.ActionType,
 ) (string, error) {
+	return db.CreateIssueReviewAndUpdateIssueLoggedIfUnchanged(rv, issue, nil, expectedStatus, sessionID, actionType)
+}
+
+// CreateIssueReviewAndUpdateIssueLoggedIfUnchanged also checks an optional task
+// snapshot before writing the review or changing the issue.
+func (db *DB) CreateIssueReviewAndUpdateIssueLoggedIfUnchanged(
+	rv NewReview, issue, expected *models.Issue, expectedStatus models.Status,
+	sessionID string, actionType models.ActionType,
+) (string, error) {
 	var reviewID string
 	err := db.withWriteLock(func() error {
 		return db.withReviewSyncTxLocked(func(tx *sql.Tx) error {
 			prev, err := db.scanIssueRowFrom(tx, issue.ID)
 			if err != nil {
 				return err
+			}
+			if expected != nil && (prev.DeletedAt != nil || marshalIssue(prev) != marshalIssue(expected)) {
+				return ErrIssueChanged
 			}
 			if prev.Status != expectedStatus {
 				return &StaleIssueStatusError{IssueID: issue.ID, Expected: expectedStatus, Actual: prev.Status}

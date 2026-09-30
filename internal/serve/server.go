@@ -153,6 +153,8 @@ func (s *Server) registerRoutes() {
 	// Health (read)
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 
+	s.mux.HandleFunc("GET /v1/project", s.handleProject)
+
 	// Monitor (read)
 	s.mux.HandleFunc("GET /v1/monitor", s.handleMonitor)
 
@@ -192,6 +194,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PATCH /v1/boards/{id}", s.handleUpdateBoard)
 	s.mux.HandleFunc("DELETE /v1/boards/{id}", s.handleDeleteBoard)
 	s.mux.HandleFunc("POST /v1/boards/{id}/issues", s.handleSetBoardPosition)
+	s.mux.HandleFunc("POST /v1/boards/{id}/move", s.handleMoveBoardIssue)
 	s.mux.HandleFunc("DELETE /v1/boards/{id}/issues/{issue_id}", s.handleRemoveBoardPosition)
 
 	// Sessions (read)
@@ -302,7 +305,7 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,If-Match")
 		w.Header().Set("Access-Control-Max-Age", "3600")
 
 		if r.Method == http.MethodOptions {

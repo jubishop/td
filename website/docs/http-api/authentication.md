@@ -55,7 +55,7 @@ When configured, the server sets these headers on matching requests:
 |--------|-------|
 | `Access-Control-Allow-Origin` | The requesting origin |
 | `Access-Control-Allow-Methods` | `GET,POST,PATCH,PUT,DELETE,OPTIONS` |
-| `Access-Control-Allow-Headers` | `Content-Type,Authorization` |
+| `Access-Control-Allow-Headers` | `Content-Type,Authorization,If-Match` |
 | `Access-Control-Max-Age` | `3600` |
 
 Preflight `OPTIONS` requests return `204 No Content` with the CORS headers.

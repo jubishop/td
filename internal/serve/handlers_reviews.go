@@ -2,6 +2,7 @@ package serve
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -173,6 +174,10 @@ func HandleRecordReview(ctx HandlerContext, w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
+	if !checkIssueRevision(w, r, issue) {
+		return
+	}
+	previous := *issue
 	// Minor issues bypass review entirely — they're meant to self-review and
 	// close in one step. A record-only review row on a minor issue is
 	// semantically meaningless and would mislead consumers of issue_reviews.
@@ -232,12 +237,16 @@ func HandleRecordReview(ctx HandlerContext, w http.ResponseWriter, r *http.Reque
 		issue.ReviewedAt = &now
 	}
 
-	reviewID, err := ctx.DB.CreateIssueReviewAndUpdateIssueLogged(db.NewReview{
+	reviewID, err := ctx.DB.CreateIssueReviewAndUpdateIssueLoggedIfUnchanged(db.NewReview{
 		IssueID: issue.ID, ReviewerSession: ctx.SessionID, Decision: body.Decision,
 		Summary: body.Summary, RequestedBySession: issue.ReviewRequestedBySession,
 		SelfReview: decision.SelfReview, ReviewedBy: decision.AttributedTo,
-	}, issue, models.StatusInReview, ctx.SessionID, actionType)
+	}, issue, &previous, models.StatusInReview, ctx.SessionID, actionType)
 	if err != nil {
+		if errors.Is(err, db.ErrIssueChanged) {
+			WriteError(w, ErrConflict, "Task changed before this review could be recorded. Refresh and review it again.", http.StatusConflict)
+			return
+		}
 		slog.Error("update issue for review", "err", err, "id", issue.ID)
 		WriteError(w, ErrInternal, "failed to record review", http.StatusInternalServerError)
 		return

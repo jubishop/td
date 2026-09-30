@@ -70,6 +70,7 @@ var infoCmd = &cobra.Command{
 		if jsonMode(cmd) {
 			result := map[string]interface{}{
 				"project":         projectName,
+				"base_dir":        baseDir,
 				"database":        ".todos/issues.db",
 				"current_session": sess.ID,
 				"issues": map[string]interface{}{

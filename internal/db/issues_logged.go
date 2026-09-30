@@ -245,9 +245,9 @@ func (db *DB) CreateIssueLogged(issue *models.Issue, sessionID string) error {
 			}
 
 			_, err = db.conn.Exec(`
-				INSERT INTO issues (id, title, description, status, type, priority, points, labels, parent_id, acceptance, created_at, updated_at, minor, created_branch, creator_session, defer_until, due_date, defer_count)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			`, issue.ID, issue.Title, issue.Description, issue.Status, issue.Type, issue.Priority, issue.Points, labels, issue.ParentID, issue.Acceptance, issue.CreatedAt, issue.UpdatedAt, issue.Minor, issue.CreatedBranch, issue.CreatorSession, deferUntil, dueDate, issue.DeferCount)
+				INSERT INTO issues (id, title, description, status, type, priority, points, labels, parent_id, acceptance, sprint, created_at, updated_at, minor, created_branch, creator_session, defer_until, due_date, defer_count)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`, issue.ID, issue.Title, issue.Description, issue.Status, issue.Type, issue.Priority, issue.Points, labels, issue.ParentID, issue.Acceptance, issue.Sprint, issue.CreatedAt, issue.UpdatedAt, issue.Minor, issue.CreatedBranch, issue.CreatorSession, deferUntil, dueDate, issue.DeferCount)
 
 			if err == nil {
 				break
@@ -483,11 +483,23 @@ func (db *DB) UpdateIssueLoggedWithReviewMeta(
 	actionType models.ActionType,
 	createdReviewID, priorActiveReviewID string,
 ) error {
+	return db.UpdateIssueLoggedWithReviewMetaIfUnchanged(issue, nil, expectedStatus, sessionID, actionType, createdReviewID, priorActiveReviewID)
+}
+
+// UpdateIssueLoggedWithReviewMetaIfUnchanged also checks an optional task
+// snapshot before changing the issue or its review metadata.
+func (db *DB) UpdateIssueLoggedWithReviewMetaIfUnchanged(
+	issue, expected *models.Issue, expectedStatus models.Status, sessionID string,
+	actionType models.ActionType, createdReviewID, priorActiveReviewID string,
+) error {
 	return db.withWriteLock(func() error {
 		return db.withReviewSyncTxLocked(func(tx *sql.Tx) error {
 			prev, err := db.scanIssueRowFrom(tx, issue.ID)
 			if err != nil {
 				return err
+			}
+			if expected != nil && (prev.DeletedAt != nil || marshalIssue(prev) != marshalIssue(expected)) {
+				return ErrIssueChanged
 			}
 			if prev.Status != expectedStatus {
 				return &StaleIssueStatusError{
@@ -605,11 +617,19 @@ func (db *DB) UpdateIssueLoggedIfStatus(issue *models.Issue, expectedStatus mode
 
 // DeleteIssueLogged soft-deletes an issue and logs the action atomically within a single withWriteLock call.
 func (db *DB) DeleteIssueLogged(issueID, sessionID string) error {
+	return db.DeleteIssueLoggedIfUnchanged(issueID, sessionID, nil)
+}
+
+// DeleteIssueLoggedIfUnchanged preserves a newer task when a browser has a stale snapshot.
+func (db *DB) DeleteIssueLoggedIfUnchanged(issueID, sessionID string, expected *models.Issue) error {
 	return db.withWriteLock(func() error {
 		// Read current state for PreviousData
 		prev, err := db.scanIssueRow(issueID)
 		if err != nil {
 			return err
+		}
+		if expected != nil && (prev.DeletedAt != nil || marshalIssue(prev) != marshalIssue(expected)) {
+			return ErrIssueChanged
 		}
 		previousData := marshalIssue(prev)
 

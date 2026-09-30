@@ -283,6 +283,15 @@ func HandleGetIssue(ctx HandlerContext, w http.ResponseWriter, r *http.Request) 
 
 	// Fetch latest handoff
 	handoff, _ := ctx.DB.GetLatestHandoff(issue.ID)
+	children, err := ctx.DB.ListIssues(db.ListIssuesOptions{ParentID: issue.ID})
+	if err != nil {
+		WriteError(w, ErrInternal, "failed to load child tasks", http.StatusInternalServerError)
+		return
+	}
+	childDTOs := make([]IssueDTO, 0, len(children))
+	for _, child := range children {
+		childDTOs = append(childDTOs, IssueToDTO(&child))
+	}
 
 	// Fetch dependencies (outgoing: what this issue depends on)
 	depIDs, _ := ctx.DB.GetDependencies(issue.ID)
@@ -344,6 +353,7 @@ func HandleGetIssue(ctx HandlerContext, w http.ResponseWriter, r *http.Request) 
 		"logs":           logsToDTOsNonNil(logs),
 		"comments":       commentsToDTOsNonNil(comments),
 		"latest_handoff": handoffDTO,
+		"children":       childDTOs,
 		"dependencies":   dependencies,
 		"blocked_by":     blockedBy,
 	}, http.StatusOK)

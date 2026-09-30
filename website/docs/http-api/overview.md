@@ -60,10 +60,17 @@ Each `td serve` process writes a JSON port file at `.todos/serve-port` for progr
 
 ### Consumer Discovery Flow
 
-1. Read `.todos/serve-port` and parse the JSON.
-2. Call `GET /health` on the recorded port.
-3. Reuse the process when healthy.
-4. Start `td serve` when the file is missing, the PID is dead, or `/health` fails.
+1. Run `td -w /path/to/project info --json` and read `base_dir`. This resolves
+   worktrees, `.td-root`, and directory associations using td itself.
+2. Read `<base_dir>/.todos/serve-port` and parse the JSON.
+3. Call `GET /health` on the recorded port.
+4. Reuse the process when healthy.
+5. Start `td serve` when the file is missing, the PID is dead, or `/health` fails.
+
+Use authenticated `GET /v1/project` to verify the project path and required
+API capabilities before sending writes. Health alone does not establish
+identity or compatibility. When a client starts a server, it owns its lifecycle;
+clients that reuse a server must leave it running when they exit.
 
 :::tip
 Run one `td serve` process per td project. Do not coordinate multiple projects inside one server instance.

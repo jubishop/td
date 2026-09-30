@@ -62,7 +62,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Start session heartbeat
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 	serve.StartSessionHeartbeat(ctx, database, session.ID)
 
@@ -113,6 +113,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("write port file: %w", err)
 	}
 
+	defer func() {
+		if current, err := serve.ReadPortFile(dir); err == nil && current.InstanceID == instanceID {
+			_ = serve.DeletePortFile(dir)
+		}
+	}()
+
 	// Print startup banner to stderr
 	dbPath := filepath.Join(dir, ".todos", "issues.db")
 	portFilePath := filepath.Join(dir, ".todos", "serve-port")
@@ -144,8 +150,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Wait for signal or server error
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	select {
+	case <-ctx.Done():
 	case sig := <-sigCh:
 		slog.Info("received signal, shutting down", "signal", sig)
 	case err := <-errCh:
@@ -153,6 +161,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("server error: %w", err)
 		}
 	}
+
+	srv.StopBackground()
 
 	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -163,7 +173,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Cleanup
-	_ = serve.DeletePortFile(dir)
 	cancel() // stop heartbeat
 
 	fmt.Fprintf(os.Stderr, "td serve stopped\n")

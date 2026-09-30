@@ -31,6 +31,34 @@ The `change_token` is a monotonically increasing value derived from the action l
 
 ---
 
+## Project metadata
+
+### `GET /v1/project`
+
+Local `td serve` project identity, title limits, and optional API capabilities.
+This endpoint follows the server's bearer-token authentication. It is not a
+browser-specific endpoint and does not serve HTML or assets.
+
+```json
+{
+  "ok": true,
+  "data": {
+    "name": "my-project",
+    "path": "/path/to/my-project",
+    "session_id": "ses_a1b2c3",
+    "title_min_length": 3,
+    "title_max_length": 200,
+    "capabilities": ["issue_revisions", "board_move"]
+  }
+}
+```
+
+Clients should check capabilities before relying on optional behavior.
+`issue_revisions` means issue reads return a revision and conditional issue
+writes reject stale snapshots. `board_move` enables moves anchored to issue IDs.
+
+---
+
 ## Monitor
 
 ### `GET /v1/monitor`
@@ -118,7 +146,16 @@ curl "http://localhost:54321/v1/issues?status=open&type=bug&sort=priority&limit=
 
 ### `GET /v1/issues/{id}`
 
-Get a single issue with its logs, comments, handoff, and dependencies.
+Get a single issue with its logs, comments, handoff, dependencies, and direct
+child issues.
+
+Issue objects include an opaque `revision` string. Clients can send that value
+in an `If-Match` header when editing, deleting, or applying a workflow action.
+A stale revision returns `409 conflict` without applying the change. Fetch the
+current task and compare it with the user's draft before resubmitting. Existing
+clients can continue to omit the header.
+
+The detail response also includes `children`, an array of direct child issues.
 
 ```bash
 curl http://localhost:54321/v1/issues/td-abc123
@@ -132,6 +169,7 @@ curl http://localhost:54321/v1/issues/td-abc123
     "logs": [],
     "comments": [],
     "latest_handoff": null,
+    "children": [],
     "dependencies": [
       {
         "dep_id": "dep_a1b2c3d4",
@@ -454,6 +492,21 @@ curl -X POST http://localhost:54321/v1/boards/brd_abc/issues \
   -H "Content-Type: application/json" \
   -d '{"issue_id": "td-abc123", "position": 0}'
 ```
+
+### `POST /v1/boards/{id}/move`
+
+Move a board issue before another issue. Omit `before_id` or send an empty
+string to move it to the end. This also works when tasks have no explicit
+board positions yet. The changes are recorded in the action log.
+
+```json
+{ "issue_id": "td-abc123", "before_id": "td-def456" }
+```
+
+Returns `{ "ok": true, "data": { "positioned": true } }`. Returns `409`
+if the issue or destination is absent from the loaded board. Refresh the board
+before retrying. A status transition is a separate API call; a failed move
+does not undo an earlier status transition.
 
 ### `DELETE /v1/boards/{id}/issues/{issue_id}`
 
