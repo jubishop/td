@@ -500,13 +500,18 @@ string to move it to the end. This also works when tasks have no explicit
 board positions yet. The changes are recorded in the action log.
 
 ```json
-{ "issue_id": "td-abc123", "before_id": "td-def456" }
+{ "issue_id": "td-abc123", "before_id": "td-def456", "include_closed": false }
 ```
 
+The move uses the same task list as `GET /v1/boards/{id}`: closed tasks are
+left out unless `include_closed` is `true`. Send the same value your board view
+used. Only the moved task and any unpositioned tasks above it get explicit
+positions; tasks below the drop point keep following the board query, so new
+tasks still sort by it.
+
 Returns `{ "ok": true, "data": { "positioned": true } }`. Returns `409`
-if the issue or destination is absent from the loaded board. Refresh the board
-before retrying. A status transition is a separate API call; a failed move
-does not undo an earlier status transition.
+if the issue or the task it should be placed before is no longer on the board.
+Refresh the board before retrying.
 
 ### `DELETE /v1/boards/{id}/issues/{issue_id}`
 

@@ -3,6 +3,7 @@ package serve
 import (
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -476,61 +477,15 @@ func HandleGetBoard(ctx HandlerContext, w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	q := r.URL.Query()
-	includeClosed := q.Get("include_closed") == "true"
-
-	// Build status filter
-	var statusFilter []models.Status
-	if includeClosed {
-		statusFilter = nil // no filter = all statuses
-	} else {
-		statusFilter = []models.Status{
-			models.StatusOpen,
-			models.StatusInProgress,
-			models.StatusBlocked,
-			models.StatusInReview,
-		}
+	candidates, err := boardCandidates(ctx, board, r.URL.Query().Get("include_closed") == "true")
+	if err != nil {
+		WriteError(w, ErrInternal, "board query error: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
-
-	// Resolve board issues
-	var boardIssues []models.BoardIssueView
-	if board.Query != "" {
-		// Execute TDQ query with neutral @me behavior
-		// Pass empty session ID to neutralize @me clauses
-		queryResults, err := query.Execute(ctx.DB, board.Query, "", query.ExecuteOptions{})
-		if err != nil {
-			WriteError(w, ErrInternal, "board query error: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Filter by status
-		var filtered []models.Issue
-		if len(statusFilter) > 0 {
-			statusSet := make(map[models.Status]bool)
-			for _, st := range statusFilter {
-				statusSet[st] = true
-			}
-			for _, issue := range queryResults {
-				if statusSet[issue.Status] {
-					filtered = append(filtered, issue)
-				}
-			}
-		} else {
-			filtered = queryResults
-		}
-
-		boardIssues, err = ctx.DB.ApplyBoardPositions(board.ID, filtered)
-		if err != nil {
-			WriteError(w, ErrInternal, "failed to apply board positions: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-	} else {
-		// Empty query - use GetBoardIssues
-		boardIssues, err = ctx.DB.GetBoardIssues(board.ID, ctx.SessionID, statusFilter)
-		if err != nil {
-			WriteError(w, ErrInternal, "failed to get board issues: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
+	boardIssues, err := ctx.DB.ApplyBoardPositions(board.ID, candidates)
+	if err != nil {
+		WriteError(w, ErrInternal, "failed to apply board positions: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	// Compute unresolved-blocker summaries for all cards in O(1) extra queries.
@@ -935,4 +890,37 @@ func hasWithValue(raw, want string) bool {
 		}
 	}
 	return false
+}
+
+// boardOpenStatuses are the statuses a board shows unless closed tasks are included.
+var boardOpenStatuses = map[models.Status]bool{
+	models.StatusOpen:       true,
+	models.StatusInProgress: true,
+	models.StatusBlocked:    true,
+	models.StatusInReview:   true,
+}
+
+// boardCandidates returns a board's tasks in query order, before explicit
+// positions are applied. Board reads and moves share it so a move sees the
+// same list the client displayed. IDs in keep are included even when their
+// status is filtered out.
+func boardCandidates(ctx HandlerContext, board *models.Board, includeClosed bool, keep ...string) ([]models.Issue, error) {
+	var issues []models.Issue
+	var err error
+	if board.Query == "" {
+		issues, err = ctx.DB.ListIssues(db.ListIssuesOptions{SortBy: "priority"})
+	} else {
+		// Pass an empty session ID to neutralize @me clauses.
+		issues, err = query.Execute(ctx.DB, board.Query, "", query.ExecuteOptions{})
+	}
+	if err != nil || includeClosed {
+		return issues, err
+	}
+	filtered := issues[:0]
+	for _, issue := range issues {
+		if boardOpenStatuses[issue.Status] || slices.Contains(keep, issue.ID) {
+			filtered = append(filtered, issue)
+		}
+	}
+	return filtered, nil
 }

@@ -278,3 +278,62 @@ func TestClientRecordReviewRevisionGuard(t *testing.T) {
 		})
 	}
 }
+
+func TestClientMoveIgnoresHiddenClosedTasks(t *testing.T) {
+	srv := newTestServerWithDB(t)
+	board, err := srv.db.CreateBoard("Client closed tasks", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var issues []models.Issue
+	for i, status := range []models.Status{models.StatusClosed, models.StatusOpen, models.StatusClosed, models.StatusOpen, models.StatusOpen} {
+		issue := models.Issue{Title: "Closed filter task " + string(rune('A'+i)), Status: status}
+		if err := srv.db.CreateIssue(&issue); err != nil {
+			t.Fatal(err)
+		}
+		issues = append(issues, issue)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	countPositions := func() int {
+		views, err := srv.db.GetBoardIssues(board.ID, "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, v := range views {
+			if v.HasPosition {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Default view hides closed tasks: moving to the end positions only open ones.
+	resp, env := doJSON(t, ts, "POST", "/v1/boards/"+board.ID+"/move", map[string]string{"issue_id": issues[1].ID})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("move: %+v", env.Error)
+	}
+	if got := countPositions(); got != 3 {
+		t.Fatalf("positioned %d tasks, want the 3 open ones", got)
+	}
+
+	// A closed anchor still resolves, and include_closed matches a view showing closed tasks.
+	resp, env = doJSON(t, ts, "POST", "/v1/boards/"+board.ID+"/move", map[string]interface{}{"issue_id": issues[4].ID, "before_id": issues[2].ID, "include_closed": true})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("move before closed task: %+v", env.Error)
+	}
+	views, err := srv.db.GetBoardIssues(board.ID, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range views {
+		if v.Issue.ID == issues[4].ID {
+			if views[i+1].Issue.ID != issues[2].ID {
+				t.Fatalf("moved task is followed by %s, want %s", views[i+1].Issue.ID, issues[2].ID)
+			}
+			return
+		}
+	}
+	t.Fatal("moved task missing from board")
+}
