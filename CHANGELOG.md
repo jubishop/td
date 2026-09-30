@@ -4,6 +4,12 @@ All notable changes to td are documented in this file.
 
 ## [Unreleased]
 
+## [v0.65.1] - 2026-09-29
+
+### Developer
+
+- **The sync end-to-end harness no longer races on its server port.** It released its randomly selected port before `td-sync` bound it, so another process could take the port and cause a flaky startup failure, or let an unrelated HTTP server's health response make startup look successful. Startup now requires the child's post-bind `server started` message plus a passing health check, and retries up to five times only on that child's confirmed address-in-use failure, reaping each failed child first. Restarts keep the existing address and data. Thanks to @jubishop (#211).
+
 ## [v0.65.0] - 2026-08-27
 
 ### Bug Fixes
