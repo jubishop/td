@@ -893,11 +893,11 @@ func hasWithValue(raw, want string) bool {
 }
 
 // boardOpenStatuses are the statuses a board shows unless closed tasks are included.
-var boardOpenStatuses = map[models.Status]bool{
-	models.StatusOpen:       true,
-	models.StatusInProgress: true,
-	models.StatusBlocked:    true,
-	models.StatusInReview:   true,
+var boardOpenStatuses = []models.Status{
+	models.StatusOpen,
+	models.StatusInProgress,
+	models.StatusBlocked,
+	models.StatusInReview,
 }
 
 // boardCandidates returns a board's tasks in query order, before explicit
@@ -905,20 +905,35 @@ var boardOpenStatuses = map[models.Status]bool{
 // same list the client displayed. IDs in keep are included even when their
 // status is filtered out.
 func boardCandidates(ctx HandlerContext, board *models.Board, includeClosed bool, keep ...string) ([]models.Issue, error) {
-	var issues []models.Issue
-	var err error
-	if board.Query == "" {
-		issues, err = ctx.DB.ListIssues(db.ListIssuesOptions{SortBy: "priority"})
-	} else {
-		// Pass an empty session ID to neutralize @me clauses.
-		issues, err = query.Execute(ctx.DB, board.Query, "", query.ExecuteOptions{})
+	var statuses []models.Status
+	if !includeClosed {
+		statuses = boardOpenStatuses
 	}
+	if board.Query == "" {
+		// Same listing as db.GetBoardIssues, so the API, CLI, and monitor
+		// order equal-priority tasks the same way.
+		issues, err := ctx.DB.ListIssues(db.ListIssuesOptions{Status: statuses, SortBy: "priority"})
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range keep {
+			if id == "" || slices.ContainsFunc(issues, func(i models.Issue) bool { return i.ID == id }) {
+				continue
+			}
+			if issue, err := ctx.DB.GetIssue(id); err == nil && issue.DeletedAt == nil {
+				issues = append(issues, *issue)
+			}
+		}
+		return issues, nil
+	}
+	// Pass an empty session ID to neutralize @me clauses.
+	issues, err := query.Execute(ctx.DB, board.Query, "", query.ExecuteOptions{})
 	if err != nil || includeClosed {
 		return issues, err
 	}
 	filtered := issues[:0]
 	for _, issue := range issues {
-		if boardOpenStatuses[issue.Status] || slices.Contains(keep, issue.ID) {
+		if slices.Contains(statuses, issue.Status) || slices.Contains(keep, issue.ID) {
 			filtered = append(filtered, issue)
 		}
 	}
