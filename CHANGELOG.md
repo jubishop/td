@@ -9,10 +9,17 @@ All notable changes to td are documented in this file.
 ### Sync Server
 
 - **Self-hosted `td-sync` servers can complete logins without email.** `td auth login` only finishes when the user clicks an emailed link, and only the Cloudflare provider delivers mail, so a server without email could never complete a login. `td-sync admin approve-login --email <email>` lets the operator approve the waiting login from the server's shell. It shows the pending login's selector, times, client IP, and user agent and asks `[y/N]`; `--yes` skips the prompt for scripts, and `--selector` picks one when several are pending. The client still presents its PKCE verifier and receives the normal 365-day sync key. Approval re-checks eligibility in one `BEGIN IMMEDIATE` transaction, is safe while the server is running, records a `device_verified` auth event with `{"approved_by":"operator_cli"}`, and does not mark the email verified. No HTTP route or config flag is added. Thanks to @jubishop (#213).
+- **`td-sync admin create-user` works while the server is running.** `CreateUser` counted users and then inserted inside a deferred transaction, so a write from the running server in between made it fail immediately with `database is locked`. It now takes the write lock up front with `BEGIN IMMEDIATE` and waits under the busy timeout. Thanks to @jubishop (#215).
+
+### Sync Client
+
+- **`td sync init` no longer crashes when authenticated only by `TD_AUTH_KEY`.** With the env key set and no `auth.json`, it dereferenced a nil login. It now reports the email as unknown when no saved login matches the key in use. Thanks to @jubishop (#216).
+- **The sync client sends a `td/<version> (<os>/<arch>)` User-Agent** on every request, including login and the event stream, instead of Go's default. Server logs and `approve-login` listings can now identify td clients. Thanks to @jubishop (#217).
 
 ### Documentation
 
 - **The sync server ops guide has a "Self-hosting without email" walkthrough,** and no longer claims that the `log` email provider prints the login link or that `td auth login` creates accounts when `SYNC_ALLOW_SIGNUP=true` (#213).
+- **The ops guide says which URL builds emailed login links:** `SYNC_EMAIL_BASE_URL`, which has no default and does not fall back to `SYNC_BASE_URL`. `SYNC_BASE_URL` only feeds the legacy device flow (#214).
 
 ### Developer
 
