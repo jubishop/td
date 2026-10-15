@@ -48,11 +48,11 @@ var syncInitCmd = &cobra.Command{
 			return fmt.Errorf("not authenticated")
 		}
 
-		creds, err := syncconfig.LoadAuth()
+		email, err := syncInitEmail()
 		if err != nil {
 			return fmt.Errorf("load auth: %w", err)
 		}
-		fmt.Printf("Authenticated as: %s\n", creds.Email)
+		fmt.Printf("Authenticated as: %s\n", email)
 		fmt.Println()
 
 		// Step 3: Project
@@ -146,13 +146,27 @@ var syncInitCmd = &cobra.Command{
 		fmt.Println()
 		fmt.Println("=== Setup Complete ===")
 		fmt.Printf("Server:  %s\n", currentURL)
-		fmt.Printf("Email:   %s\n", creds.Email)
+		fmt.Printf("Email:   %s\n", email)
 		fmt.Printf("Project: %s\n", projectID)
 		fmt.Println()
 		output.Success("Ready to sync! Run 'td sync' to start.")
 
 		return nil
 	},
+}
+
+// syncInitEmail returns the saved login email for the API key in use. Other
+// sync commands accept TD_AUTH_KEY alone, so auth.json may be missing or belong
+// to a different key; the email is then unknown.
+func syncInitEmail() (string, error) {
+	creds, err := syncconfig.LoadAuth()
+	if err != nil {
+		return "", err
+	}
+	if creds == nil || creds.APIKey != syncconfig.GetAPIKey() {
+		return "unknown (using TD_AUTH_KEY)", nil
+	}
+	return creds.Email, nil
 }
 
 // promptLine prints a prompt and reads a line. Returns defaultVal if input is blank.
