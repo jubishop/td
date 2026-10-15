@@ -39,7 +39,6 @@ go build -o td-sync ./cmd/td-sync
 
 # Run with custom config
 SYNC_LISTEN_ADDR=:9090 \
-SYNC_BASE_URL=http://localhost:9090 \
 SYNC_SERVER_DB_PATH=./mydata/server.db \
 SYNC_PROJECT_DATA_DIR=./mydata/projects \
 SYNC_LOG_FORMAT=text \
@@ -47,7 +46,7 @@ SYNC_LOG_LEVEL=debug \
 ./td-sync
 ```
 
-> **If you change `SYNC_LISTEN_ADDR`, also set `SYNC_BASE_URL`** to the same address. `SYNC_BASE_URL` is used in the device auth verification URLs sent to users. If it doesn't match the actual port, auth verification will fail with connection errors.
+> **If you change `SYNC_LISTEN_ADDR`, point clients at the new address** with `TD_SYNC_URL` (see the [client guide](sync-client-guide.md)). With an email provider, also set `SYNC_EMAIL_BASE_URL` to it: the emailed approval links start with that URL. `SYNC_BASE_URL` matters only for the legacy device flow.
 
 ### Verify it's running
 
@@ -106,7 +105,7 @@ All config is via environment variables.
 | `SYNC_PROJECT_DATA_DIR` | `./data/projects` | Directory for per-project event DBs |
 | `SYNC_SHUTDOWN_TIMEOUT` | `30s` | Graceful shutdown timeout |
 | `SYNC_ALLOW_SIGNUP` | `true` | Let the td-watch web sign-in (`/v1/auth/web/start`) create accounts for unknown emails; invited emails can sign up either way. With `SYNC_LEGACY_DEVICE_AUTH` on, it also governs the legacy device flow: `true` lets `/auth/verify` create accounts, and `false` makes `/v1/auth/login/start` reject unknown emails. `td auth login` never creates accounts; create them with `td-sync admin create-user`. |
-| `SYNC_BASE_URL` | `http://localhost:8080` | Public URL for device auth verification links. **Must match your actual listen address** — if running on `:9090`, set this to `http://localhost:9090`. Verification links in auth emails will be broken if this is wrong. |
+| `SYNC_BASE_URL` | `http://localhost:8080` | Public URL returned as `verification_uri` by the legacy `/v1/auth/login/start` flow, which runs only with `SYNC_LEGACY_DEVICE_AUTH` on. Emailed login links do not use it; they use `SYNC_EMAIL_BASE_URL`. |
 | `SYNC_LOG_FORMAT` | `json` | Log format: `json` or `text` |
 | `SYNC_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
@@ -132,7 +131,7 @@ The server sends transactional emails for authentication (magic-link login). The
 | `CLOUDFLARE_EMAIL_FROM` | Sender address — `login@opentangle.com` in production |
 | `CLOUDFLARE_EMAIL_FROM_NAME` | Display name — `td-watch` in production |
 | `CLOUDFLARE_EMAIL_REPLY_TO` | Reply-To address — `haplab@vorwaller.net` in production |
-| `SYNC_EMAIL_BASE_URL` | Base URL of the sync server, used to generate verification links in emails |
+| `SYNC_EMAIL_BASE_URL` | Public URL of the sync server. The approval link in `td auth login` emails is `<SYNC_EMAIL_BASE_URL>/auth/device/approve?token=...`. It has no default and does not fall back to `SYNC_BASE_URL`. |
 | `SYNC_AUTH_WEB_CALLBACK_URL` | URL of the td-watch login completion page (e.g. `https://watch.haplab.com/home/login/complete`) |
 
 ### Production sender identity
