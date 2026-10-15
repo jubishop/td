@@ -32,7 +32,7 @@ const (
 	AuthEventEmailSent        = "email_sent"        // email dispatched to provider without error
 	AuthEventEmailSuppressed  = "email_suppressed"  // challenge created for unknown/disabled user, generic response sent
 	AuthEventWebExchanged     = "web_exchanged"     // web/exchange succeeded, key issued
-	AuthEventDeviceVerified   = "device_verified"   // emailed link consumed, device request marked verified
+	AuthEventDeviceVerified   = "device_verified"   // emailed link consumed or operator approved via CLI, device request marked verified
 	AuthEventLoginFailed      = "login_failed"      // any terminal failure: wrong token, wrong state, wrong verifier, expired
 )
 

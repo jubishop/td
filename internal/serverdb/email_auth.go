@@ -1,6 +1,7 @@
 package serverdb
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -367,6 +368,128 @@ func (db *ServerDB) VerifyAndMarkDeviceChallengeVerified(selector, plaintextSecr
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
+
+	c.Status = ChallengeStatusVerified
+	c.VerifiedAt = &now
+	return c, nil
+}
+
+// OperatorApprovalMetadata is the metadata recorded on the device_verified auth
+// event when an operator approves a login with `td-sync admin approve-login`.
+const OperatorApprovalMetadata = `{"approved_by":"operator_cli"}`
+
+// operatorApprovableWhere matches the device logins an operator may approve
+// for a user: pending, unexpired device_login challenges. Its arguments are
+// userID, ChallengeStatusPending, and the current time.
+const operatorApprovableWhere = `user_id = ? AND purpose = 'device_login' AND status = ? AND expires_at > ?`
+
+// PendingDeviceChallenges returns the device logins for userID that an
+// operator may approve with ApproveDeviceChallengeAsOperator: pending,
+// unexpired device_login challenges, newest first. It changes nothing, so the
+// operator can review them before choosing one.
+func (db *ServerDB) PendingDeviceChallenges(userID string) ([]*EmailChallenge, error) {
+	rows, err := db.conn.Query(
+		`SELECT`+challengeSelectCols+`
+		 FROM auth_email_challenges
+		 WHERE `+operatorApprovableWhere+`
+		 ORDER BY created_at DESC, selector`,
+		userID, ChallengeStatusPending, time.Now().UTC(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("select pending device challenges: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var pending []*EmailChallenge
+	for rows.Next() {
+		c, err := scanEmailChallenge(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan device challenge: %w", err)
+		}
+		pending = append(pending, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate device challenges: %w", err)
+	}
+	return pending, nil
+}
+
+// ApproveDeviceChallengeAsOperator marks the device login with the given
+// selector as verified without the emailed token. It lets the operator of a
+// self-hosted server that sends no email approve a waiting `td auth login`
+// after choosing it from PendingDeviceChallenges. Running it requires write
+// access to server.db, which already allows minting API keys, so it grants
+// nothing new. The CLI that started the login must still present its PKCE
+// verifier to /v1/auth/device/poll to receive a key.
+//
+// The selector is required. Inside the transaction the challenge must still be
+// a pending, unexpired device_login belonging to userID; otherwise it returns
+// ErrChallengeNotFound and changes nothing. web_login and other purposes are
+// never touched.
+//
+// Unlike the emailed link, this does not set users.email_verified_at, because
+// the operator did not prove ownership of the address. The device_verified
+// auth event is written in the same transaction with OperatorApprovalMetadata.
+//
+// The transaction starts with BEGIN IMMEDIATE so the write lock is taken up
+// front under the busy timeout. That keeps the re-check and the update
+// atomic, and makes it safe to run while a td-sync server holds the same file.
+func (db *ServerDB) ApproveDeviceChallengeAsOperator(userID, selector string) (*EmailChallenge, error) {
+	if selector == "" {
+		return nil, errors.New("approve device challenge: selector is required")
+	}
+
+	ctx := context.Background()
+	conn, err := db.conn.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
+	now := time.Now().UTC()
+	row := conn.QueryRowContext(ctx,
+		`SELECT`+challengeSelectCols+`
+		 FROM auth_email_challenges
+		 WHERE `+operatorApprovableWhere+` AND selector = ?`,
+		userID, ChallengeStatusPending, now, selector,
+	)
+	c, err := scanEmailChallenge(row)
+	if err == sql.ErrNoRows {
+		return nil, ErrChallengeNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select device challenge: %w", err)
+	}
+
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE auth_email_challenges SET status = ?, verified_at = ?
+		 WHERE selector = ? AND status = ?`,
+		ChallengeStatusVerified, now, c.Selector, ChallengeStatusPending,
+	); err != nil {
+		return nil, fmt.Errorf("update device challenge status: %w", err)
+	}
+
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO auth_events (auth_request_id, email, event_type, metadata) VALUES (?, ?, ?, ?)`,
+		c.Selector, c.Email, AuthEventDeviceVerified, OperatorApprovalMetadata,
+	); err != nil {
+		return nil, fmt.Errorf("insert auth event: %w", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	committed = true
 
 	c.Status = ChallengeStatusVerified
 	c.VerifiedAt = &now
