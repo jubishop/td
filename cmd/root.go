@@ -15,6 +15,7 @@ import (
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/session"
 	"github.com/marcus/td/internal/suggest"
+	"github.com/marcus/td/internal/syncclient"
 	"github.com/marcus/td/internal/workdir"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -33,6 +34,7 @@ var (
 func SetVersion(v string) {
 	versionStr = v
 	rootCmd.Version = v
+	syncclient.SetVersion(v)
 }
 
 var rootCmd = &cobra.Command{
