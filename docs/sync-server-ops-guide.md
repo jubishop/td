@@ -163,13 +163,13 @@ SYNC_EMAIL_PROVIDER=memory SYNC_DEV_EMAIL_INSPECT=1 ./td-sync
 
 A private server, such as one on a home network, can run without an email provider. Leave `SYNC_EMAIL_PROVIDER` unset (the `log` provider) and approve each login from the server's shell instead of an emailed link. Pass `--db` to the admin commands, or set `SYNC_SERVER_DB_PATH`, when the database is not at `./data/server.db`.
 
-1. Create your account while the server is stopped. `td auth login` never creates accounts.
+1. Create your account. `td auth login` never creates accounts.
 
    ```bash
    td-sync admin create-user --email you@example.com
    ```
 
-2. Start the server. On the client, run `td auth login` and enter the same email; it waits for approval.
+2. Start the server if it is not running. On the client, run `td auth login` and enter the same email; it waits for approval.
 
 3. On the server, review the waiting login and approve it:
 
@@ -198,7 +198,7 @@ A private server, such as one on a home network, can run without an email provid
 
 `approve-login` needs write access to `server.db`, which `create-key` and `grant` already require, so it gives nothing to anyone without a shell on the server. The client must still present the PKCE verifier from the login it started. The approval is recorded as a `device_verified` auth event with `{"approved_by":"operator_cli"}` and does not mark the email address verified.
 
-`approve-login` is safe to run while the server is up. If a very busy server holds the database lock past the 5-second busy timeout, the command exits with `database is locked` and changes nothing; run it again. `create-user` is less tolerant of concurrent writes, so run it while the server is stopped.
+`create-user` and `approve-login` are safe to run while the server is up. If a very busy server holds the database lock past the 5-second busy timeout, the command exits with `database is locked` and changes nothing; run it again.
 
 ## Docker Deployment
 

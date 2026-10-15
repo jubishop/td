@@ -217,18 +217,109 @@ func TestAdminApproveLogin_SinglePendingNeedsConfirmation(t *testing.T) {
 	}
 }
 
+// serverWriter keeps writing to server.db from this process, as a running
+// td-sync server would, while a test runs admin commands as separate
+// processes. A real server writes server.db once or twice per request; this
+// writer commits hundreds of times a second but, like any real server, leaves
+// the lock free between writes. A writer that never releases the lock can
+// starve any second process past the busy timeout.
+type serverWriter struct {
+	writes   atomic.Int64
+	writeErr atomic.Value
+	stopCh   chan struct{}
+	once     sync.Once
+	wg       sync.WaitGroup
+}
+
+func startServerWriter(t *testing.T, store *serverdb.ServerDB) *serverWriter {
+	t.Helper()
+	w := &serverWriter{stopCh: make(chan struct{})}
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		for {
+			select {
+			case <-w.stopCh:
+				return
+			default:
+			}
+			if err := store.InsertAuthEvent("load", "load@example.com", serverdb.AuthEventStarted, "{}"); err != nil {
+				w.writeErr.Store(err.Error())
+				return
+			}
+			w.writes.Add(1)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	t.Cleanup(w.stop)
+	return w
+}
+
+func (w *serverWriter) stop() {
+	w.once.Do(func() { close(w.stopCh) })
+	w.wg.Wait()
+}
+
+// runWhileWriting runs an admin command as a separate process while w writes,
+// and fails the test if the writer made no progress during it.
+func (w *serverWriter) runWhileWriting(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	before, began := w.writes.Load(), time.Now()
+	stdout, stderr, code = runAdminProcess(t, args...)
+	t.Logf("server committed %d writes during the %v %s process", w.writes.Load()-before, time.Since(began).Round(time.Millisecond), args[0])
+	if w.writes.Load() == before {
+		t.Fatalf("server writer made no progress while %s ran", args[0])
+	}
+	return stdout, stderr, code
+}
+
+// stopAndCheck stops the writer and fails the test if any of its writes failed.
+func (w *serverWriter) stopAndCheck(t *testing.T) {
+	t.Helper()
+	w.stop()
+	if v := w.writeErr.Load(); v != nil {
+		t.Fatalf("server write failed during the admin command: %v", v)
+	}
+}
+
+// TestAdminCreateUser_WhileServerWrites runs create-user as separate processes
+// while this process keeps writing to the database. A single run hits the
+// window between its read and its write only some of the time, so it creates
+// several users, then reruns one to check that it stays idempotent.
+func TestAdminCreateUser_WhileServerWrites(t *testing.T) {
+	store, dbPath := openServerStore(t)
+	w := startServerWriter(t, store)
+
+	const users = 8
+	for i := range users {
+		email := fmt.Sprintf("live%d@example.com", i)
+		stdout, stderr, code := w.runWhileWriting(t, "create-user", "--email", email, "--db", dbPath)
+		if code != 0 || !strings.Contains(stdout, "created user "+email) {
+			t.Fatalf("create-user %s while server writes: code=%d stdout=%q stderr=%q", email, code, stdout, stderr)
+		}
+	}
+	stdout, stderr, code := w.runWhileWriting(t, "create-user", "--email", "live0@example.com", "--db", dbPath)
+	if code != 0 || !strings.Contains(stdout, "user already exists: live0@example.com") {
+		t.Fatalf("repeat create-user while server writes: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	w.stopAndCheck(t)
+	for i := range users {
+		u, err := store.GetUserByEmail(fmt.Sprintf("live%d@example.com", i))
+		if err != nil || u == nil {
+			t.Fatalf("server handle cannot see user %d: %v", i, err)
+		}
+		if u.IsAdmin != (i == 0) {
+			t.Fatalf("user %d: is_admin=%v, want only the first user to be admin", i, u.IsAdmin)
+		}
+	}
+}
+
 // TestAdminApproveLogin_WhileServerWrites runs approve-login as a separate
-// process while this process holds the database open and keeps writing to it,
-// as a running td-sync server would. A real server writes server.db once or
-// twice per request; this writer commits hundreds of times a second but, like
-// any real server, leaves the lock free between writes. A writer that never
-// releases the lock can starve any second process past the busy timeout.
+// process while this process keeps writing to the database.
 func TestAdminApproveLogin_WhileServerWrites(t *testing.T) {
 	store, dbPath := openServerStore(t)
 
-	// create-user runs before the load starts: its transaction reads before it
-	// writes, so a concurrent writer can make it fail with SQLITE_BUSY. The
-	// docs tell operators to run it while the server is stopped.
 	stdout, stderr, code := runAdminProcess(t, "create-user", "--email", "live@example.com", "--db", dbPath)
 	if code != 0 || !strings.Contains(stdout, "created user live@example.com") {
 		t.Fatalf("create-user: code=%d stdout=%q stderr=%q", code, stdout, stderr)
@@ -239,48 +330,13 @@ func TestAdminApproveLogin_WhileServerWrites(t *testing.T) {
 	}
 	selector := startDeviceLogin(t, store, u, 3)
 
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	var writes atomic.Int64
-	var writeErr atomic.Value
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			if err := store.InsertAuthEvent("load", "load@example.com", serverdb.AuthEventStarted, "{}"); err != nil {
-				writeErr.Store(err.Error())
-				return
-			}
-			writes.Add(1)
-			time.Sleep(time.Millisecond)
-		}
-	}()
-	var once sync.Once
-	stopWriter := func() {
-		once.Do(func() { close(stop) })
-		wg.Wait()
-	}
-	t.Cleanup(stopWriter)
-
-	before, began := writes.Load(), time.Now()
-	stdout, stderr, code = runAdminProcess(t, "approve-login", "--email", "live@example.com", "--yes", "--db", dbPath)
-	t.Logf("server committed %d writes during the %v approve-login process", writes.Load()-before, time.Since(began).Round(time.Millisecond))
+	w := startServerWriter(t, store)
+	stdout, stderr, code = w.runWhileWriting(t, "approve-login", "--email", "live@example.com", "--yes", "--db", dbPath)
 	if code != 0 || !strings.Contains(stdout, "selector:   "+selector) {
 		t.Fatalf("approve-login while server writes: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if writes.Load() == before {
-		t.Fatal("server writer made no progress while approve-login ran")
-	}
 
-	stopWriter()
-	if v := writeErr.Load(); v != nil {
-		t.Fatalf("server write failed while approve-login ran: %v", v)
-	}
+	w.stopAndCheck(t)
 	if got := challengeStatus(t, store, selector); got != serverdb.ChallengeStatusVerified {
 		t.Fatalf("server handle sees status %s, want verified", got)
 	}
