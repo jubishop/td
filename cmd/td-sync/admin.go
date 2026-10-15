@@ -44,7 +44,7 @@ func printAdminUsage() {
 	fmt.Fprintln(os.Stderr, `Usage: td-sync admin <command> [flags]
 
 Commands:
-  create-user   Create a user (idempotent; stop the server first)
+  create-user   Create a user (idempotent)
   approve-login Approve a pending td auth login without email
   grant         Grant admin privileges to a user
   revoke        Revoke admin privileges from a user
@@ -68,8 +68,8 @@ func openDB(dbPath string) *serverdb.ServerDB {
 // runAdminCreateUser provisions a user by email, for self-hosted servers and
 // dev/test setup (e.g. the e2e harness), where the non-enumerating device-login
 // flow requires the user to already exist. It is idempotent: if the user already
-// exists it prints the existing ID and exits 0. Run it while the server is NOT
-// holding the DB open (the e2e harness provisions users before server start).
+// exists it prints the existing ID and exits 0. Safe to run while the server
+// is up.
 func runAdminCreateUser(args []string) {
 	fs := flag.NewFlagSet("admin create-user", flag.ExitOnError)
 	email := fs.String("email", "", "user email address")

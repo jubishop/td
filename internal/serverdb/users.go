@@ -1,6 +1,7 @@
 package serverdb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -19,6 +20,13 @@ type User struct {
 
 // CreateUser inserts a new user with the given email (lowercased).
 // The first user created is automatically made an admin.
+//
+// The count and the insert share one transaction so two concurrent creations
+// cannot both become admin. It starts with BEGIN IMMEDIATE so the write lock
+// is taken up front under the busy timeout, which makes `td-sync admin
+// create-user` safe to run while a td-sync server holds the same file. A
+// deferred transaction that reads first gets SQLITE_BUSY at once, without
+// waiting, if another connection writes in between.
 func (db *ServerDB) CreateUser(email string) (*User, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" {
@@ -30,23 +38,32 @@ func (db *ServerDB) CreateUser(email string) (*User, error) {
 		return nil, fmt.Errorf("generate user id: %w", err)
 	}
 
-	// Use a transaction to atomically check count and insert
-	// to prevent TOCTOU race where two concurrent requests both become admin
-	tx, err := db.conn.Begin()
+	ctx := context.Background()
+	conn, err := db.conn.Conn(ctx)
 	if err != nil {
+		return nil, fmt.Errorf("get connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
 
 	// First user becomes admin
 	var count int
-	if err := tx.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&count); err != nil {
 		return nil, fmt.Errorf("count users: %w", err)
 	}
 	isAdmin := count == 0
 
 	now := time.Now().UTC()
-	_, err = tx.Exec(
+	_, err = conn.ExecContext(ctx,
 		`INSERT INTO users (id, email, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
 		id, email, isAdmin, now, now,
 	)
@@ -54,9 +71,10 @@ func (db *ServerDB) CreateUser(email string) (*User, error) {
 		return nil, fmt.Errorf("insert user: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
+	committed = true
 
 	return &User{ID: id, Email: email, IsAdmin: isAdmin, CreatedAt: now, UpdatedAt: now}, nil
 }
