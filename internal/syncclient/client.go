@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -59,20 +60,47 @@ func IsHTTPStatus(err error, codes ...int) bool {
 
 // Client is an HTTP client for the td-sync server.
 type Client struct {
-	BaseURL  string
-	APIKey   string
-	DeviceID string
-	HTTP     *http.Client
+	BaseURL   string
+	APIKey    string
+	DeviceID  string
+	UserAgent string
+	HTTP      *http.Client
+}
+
+// userAgent identifies td to the sync server. SetVersion fills in the version.
+var userAgent = buildUserAgent("dev")
+
+// SetVersion sets the td version that clients created afterwards send in
+// their User-Agent. Call it once at startup.
+func SetVersion(version string) {
+	userAgent = buildUserAgent(version)
+}
+
+func buildUserAgent(version string) string {
+	return fmt.Sprintf("td/%s (%s/%s)", version, runtime.GOOS, runtime.GOARCH)
 }
 
 // New creates a new sync client.
 func New(baseURL, apiKey, deviceID string) *Client {
 	return &Client{
-		BaseURL:  baseURL,
-		APIKey:   apiKey,
-		DeviceID: deviceID,
-		HTTP:     &http.Client{Timeout: 30 * time.Second},
+		BaseURL:   baseURL,
+		APIKey:    apiKey,
+		DeviceID:  deviceID,
+		UserAgent: userAgent,
+		HTTP:      &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// newRequest builds a request to the sync server with the client's User-Agent.
+func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if c.UserAgent != "" {
+		req.Header.Set("User-Agent", c.UserAgent)
+	}
+	return req, nil
 }
 
 // --- Auth types (mirrors internal/api/auth.go, independently defined) ---
@@ -376,7 +404,7 @@ type SnapshotResponse struct {
 // GetSnapshot downloads a snapshot database for bootstrap.
 func (c *Client) GetSnapshot(projectID string) (*SnapshotResponse, error) {
 	path := fmt.Sprintf("/v1/projects/%s/sync/snapshot", projectID)
-	req, err := http.NewRequest("GET", c.BaseURL+path, nil)
+	req, err := c.newRequest(context.Background(), http.MethodGet, path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -439,7 +467,7 @@ func (c *Client) SyncStatusContext(ctx context.Context, projectID string) (*Sync
 func (c *Client) Events(ctx context.Context, projectID, lastEventID string, idleTimeout time.Duration, onOpen func(), onEvent func(ProjectEvent)) error {
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, c.BaseURL+fmt.Sprintf("/v1/projects/%s/events", projectID), nil)
+	req, err := c.newRequest(streamCtx, http.MethodGet, fmt.Sprintf("/v1/projects/%s/events", projectID), nil)
 	if err != nil {
 		return fmt.Errorf("create event request: %w", err)
 	}
@@ -604,7 +632,7 @@ func (c *Client) doRequestContext(ctx context.Context, method, path string, body
 		bodyReader = bytes.NewReader(data)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, bodyReader)
+	req, err := c.newRequest(ctx, method, path, bodyReader)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
