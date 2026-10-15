@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/marcus/td/internal/api"
 	"github.com/marcus/td/internal/serverdb"
@@ -19,6 +23,8 @@ func runAdmin(args []string) {
 	switch args[0] {
 	case "create-user":
 		runAdminCreateUser(args[1:])
+	case "approve-login":
+		runAdminApproveLogin(args[1:])
 	case "grant":
 		runAdminGrant(args[1:])
 	case "revoke":
@@ -38,11 +44,12 @@ func printAdminUsage() {
 	fmt.Fprintln(os.Stderr, `Usage: td-sync admin <command> [flags]
 
 Commands:
-  create-user Create a user (dev/test provisioning; idempotent)
-  grant       Grant admin privileges to a user
-  revoke      Revoke admin privileges from a user
-  create-key  Create an API key for an admin user
-  revoke-key  Revoke an API key by key ID`)
+  create-user   Create a user (idempotent; stop the server first)
+  approve-login Approve a pending td auth login without email
+  grant         Grant admin privileges to a user
+  revoke        Revoke admin privileges from a user
+  create-key    Create an API key for an admin user
+  revoke-key    Revoke an API key by key ID`)
 }
 
 func openDB(dbPath string) *serverdb.ServerDB {
@@ -58,9 +65,9 @@ func openDB(dbPath string) *serverdb.ServerDB {
 	return store
 }
 
-// runAdminCreateUser provisions a user by email. It is intended for dev/test
-// setup (e.g. the e2e harness) where the non-enumerating device-login flow
-// requires the user to already exist. It is idempotent: if the user already
+// runAdminCreateUser provisions a user by email, for self-hosted servers and
+// dev/test setup (e.g. the e2e harness), where the non-enumerating device-login
+// flow requires the user to already exist. It is idempotent: if the user already
 // exists it prints the existing ID and exits 0. Run it while the server is NOT
 // holding the DB open (the e2e harness provisions users before server start).
 func runAdminCreateUser(args []string) {
@@ -95,6 +102,125 @@ func runAdminCreateUser(args []string) {
 	}
 
 	fmt.Printf("created user %s (%s)\n", user.Email, user.ID)
+}
+
+// runAdminApproveLogin approves a pending `td auth login` for an existing user
+// without the emailed link, for self-hosted servers that send no email. The
+// operator must choose the login explicitly: by --selector, or by confirming
+// the only pending one after seeing its details. Nothing is approved
+// implicitly, because per-email rate limiting can silently drop the operator's
+// own request and leave someone else's as the only one pending.
+// The waiting CLI still has to present its PKCE verifier on its next poll
+// before a key is issued. Safe to run while the server is up.
+func runAdminApproveLogin(args []string) {
+	fs := flag.NewFlagSet("admin approve-login", flag.ExitOnError)
+	email := fs.String("email", "", "email of the user whose pending login to approve")
+	selector := fs.String("selector", "", "approve this pending login without prompting")
+	yes := fs.Bool("yes", false, "approve the only pending login without prompting (for scripts)")
+	dbPath := fs.String("db", "", "path to server.db (default: from SYNC_SERVER_DB_PATH or ./data/server.db)")
+	_ = fs.Parse(args)
+
+	if *email == "" {
+		fmt.Fprintln(os.Stderr, "error: --email is required")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	store := openDB(*dbPath)
+	defer func() { _ = store.Close() }()
+
+	user, err := store.GetUserByEmail(*email)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if user == nil {
+		fmt.Fprintf(os.Stderr, "error: user not found: %s\n", *email)
+		fmt.Fprintf(os.Stderr, "create the account first: td-sync admin create-user --email %s\n", *email)
+		os.Exit(1)
+	}
+
+	chosen := *selector
+	shown := false
+	if chosen == "" {
+		pending, err := store.PendingDeviceChallenges(user.ID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		switch len(pending) {
+		case 0:
+			exitNoPendingLogin("", user.Email)
+		case 1:
+		default:
+			fmt.Fprintf(os.Stderr, "error: %d pending logins for %s; re-run with --selector to choose one:\n", len(pending), user.Email)
+			for _, p := range pending {
+				fmt.Fprintln(os.Stderr)
+				printPendingLogin(os.Stderr, p)
+			}
+			os.Exit(1)
+		}
+
+		p := pending[0]
+		if !*yes {
+			fmt.Printf("pending login for %s:\n", user.Email)
+			printPendingLogin(os.Stdout, p)
+			shown = true
+			fmt.Print("Approve this login? [y/N] ")
+			reader := bufio.NewReader(os.Stdin)
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				fmt.Println()
+			}
+			line = strings.TrimSpace(strings.ToLower(line))
+			if line != "y" && line != "yes" {
+				fmt.Fprintln(os.Stderr, "login not approved")
+				os.Exit(1)
+			}
+		}
+		chosen = p.Selector
+	}
+
+	c, err := store.ApproveDeviceChallengeAsOperator(user.ID, chosen)
+	if errors.Is(err, serverdb.ErrChallengeNotFound) {
+		exitNoPendingLogin(chosen, user.Email)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("approved login for %s\n", user.Email)
+	if !shown {
+		printPendingLogin(os.Stdout, c)
+	}
+	fmt.Println("The waiting `td auth login` completes on its next poll.")
+}
+
+func exitNoPendingLogin(selector, email string) {
+	if selector != "" {
+		fmt.Fprintf(os.Stderr, "error: no pending login %s for %s\n", selector, email)
+	} else {
+		fmt.Fprintf(os.Stderr, "error: no pending login for %s\n", email)
+	}
+	fmt.Fprintln(os.Stderr, "run `td auth login` on the client first; pending logins expire after 15 minutes")
+	os.Exit(1)
+}
+
+// printPendingLogin prints what the server recorded about a device login, so
+// the operator can tell which client started it.
+func printPendingLogin(w io.Writer, c *serverdb.EmailChallenge) {
+	value := func(s *string) string {
+		if s == nil || *s == "" {
+			return "-"
+		}
+		return *s
+	}
+	_, _ = fmt.Fprintf(w, "  selector:   %s\n", c.Selector)
+	_, _ = fmt.Fprintf(w, "  created:    %s\n", c.CreatedAt.UTC().Format(time.RFC3339))
+	_, _ = fmt.Fprintf(w, "  expires:    %s\n", c.ExpiresAt.UTC().Format(time.RFC3339))
+	_, _ = fmt.Fprintf(w, "  ip:         %s\n", value(c.IP))
+	_, _ = fmt.Fprintf(w, "  user agent: %s\n", value(c.UserAgent))
 }
 
 func runAdminGrant(args []string) {

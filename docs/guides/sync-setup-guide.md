@@ -74,6 +74,8 @@ td auth login
 
 Enter your email. The server emails you a one-time approval link — click it to approve the login from this device. No code is shown in the terminal; the login completes only after you click the emailed link. The CLI then saves your credentials to `~/.config/td/auth.json`.
 
+The email must already belong to an account on the server; `td auth login` never creates one. On a self-hosted server without email, the operator creates your account and approves the login from the server instead. See [Self-hosting without email](../sync-server-ops-guide.md#self-hosting-without-email).
+
 Check auth status anytime:
 ```bash
 td auth status

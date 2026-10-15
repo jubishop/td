@@ -201,12 +201,18 @@ This starts the email-approval device flow (PKCE):
 6. An API key (valid ~365 days) is saved to `~/.config/td/auth.json` (file
    permissions: 0600)
 
-The login cannot be completed without clicking the emailed link, and a
-different process that observed the request but lacks your local verifier cannot
-complete it either. If you do not approve within ~15 minutes the request
-expires; just run `td auth login` again.
+The login cannot be completed without clicking the emailed link (or, on a
+self-hosted server without email, the operator's approval), and a different
+process that observed the request but lacks your local verifier cannot complete
+it either. If you do not approve within ~15 minutes the request expires; just
+run `td auth login` again.
 
-If the server has `SYNC_ALLOW_SIGNUP=true`, new users are created automatically on first login.
+`td auth login` never creates an account. The email must already belong to an
+account on the server; for an unknown email the login never completes. On a
+self-hosted server the operator creates accounts with
+`td-sync admin create-user`, and, if the server sends no email, approves your
+login with `td-sync admin approve-login` instead of you clicking a link. See
+[Self-hosting without email](sync-server-ops-guide.md#self-hosting-without-email).
 
 **Check auth status:**
 

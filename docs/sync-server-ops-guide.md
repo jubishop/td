@@ -59,12 +59,15 @@ curl http://localhost:8080/healthz
 ### Test the full auth + sync flow locally
 
 ```bash
-# 1. Start server
+# 1. Create your account, then start the server
+./td-sync admin create-user --email you@example.com
 ./td-sync &
 
 # 2. Login from td CLI (uses localhost:8080 by default)
 td auth login
-# Enter email, then open the verification URL in browser and enter the code
+# Enter your email. No email provider is configured, so approve the
+# waiting login from a second terminal and answer y at the prompt:
+./td-sync admin approve-login --email you@example.com
 
 # 3. Create a remote project
 td sync-project create "my-project"
@@ -102,7 +105,7 @@ All config is via environment variables.
 | `SYNC_SERVER_DB_PATH` | `./data/server.db` | Server metadata DB path |
 | `SYNC_PROJECT_DATA_DIR` | `./data/projects` | Directory for per-project event DBs |
 | `SYNC_SHUTDOWN_TIMEOUT` | `30s` | Graceful shutdown timeout |
-| `SYNC_ALLOW_SIGNUP` | `true` | Allow new user registration via device auth |
+| `SYNC_ALLOW_SIGNUP` | `true` | Let the td-watch web sign-in (`/v1/auth/web/start`) create accounts for unknown emails; invited emails can sign up either way. With `SYNC_LEGACY_DEVICE_AUTH` on, it also governs the legacy device flow: `true` lets `/auth/verify` create accounts, and `false` makes `/v1/auth/login/start` reject unknown emails. `td auth login` never creates accounts; create them with `td-sync admin create-user`. |
 | `SYNC_BASE_URL` | `http://localhost:8080` | Public URL for device auth verification links. **Must match your actual listen address** — if running on `:9090`, set this to `http://localhost:9090`. Verification links in auth emails will be broken if this is wrong. |
 | `SYNC_LOG_FORMAT` | `json` | Log format: `json` or `text` |
 | `SYNC_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
@@ -116,8 +119,8 @@ The server sends transactional emails for authentication (magic-link login). The
 | Provider | When to use |
 |---|---|
 | `cloudflare` | Production and staging — sends real email via Cloudflare Email Workers |
-| `memory` | Local development — stores sent emails in memory (logged to stdout, never delivered) |
-| `log` | Default when no provider is set — logs email content at `INFO` level, never delivers |
+| `memory` | Local development and tests — keeps sent emails in memory and never delivers them. With `SYNC_DEV_EMAIL_INSPECT=1`, `GET /internal/dev/last-email` returns the latest one, login link included, to anyone who can reach the server, so use it only where no one else can reach the server. |
+| `log` | Default when no provider is set — logs each login email's recipient and purpose at `INFO` level, never the link, and delivers nothing. Approve logins with `td-sync admin approve-login`; see [Self-hosting without email](#self-hosting-without-email). |
 
 ### Required environment variables (Cloudflare provider)
 
@@ -151,11 +154,52 @@ This lets you catch misconfiguration before auth emails are needed rather than a
 
 ### Dev setup
 
-Use `SYNC_EMAIL_PROVIDER=memory`. The server captures sent emails in memory and prints them at startup/send time. No Cloudflare account or credentials are required.
+Use `SYNC_EMAIL_PROVIDER=memory`. The server keeps sent emails in memory instead of delivering them; add `SYNC_DEV_EMAIL_INSPECT=1` to read the latest one from `GET /internal/dev/last-email`, which is how the e2e harness completes logins. No Cloudflare account or credentials are required.
 
 ```bash
-SYNC_EMAIL_PROVIDER=memory ./td-sync
+SYNC_EMAIL_PROVIDER=memory SYNC_DEV_EMAIL_INSPECT=1 ./td-sync
 ```
+
+### Self-hosting without email
+
+A private server, such as one on a home network, can run without an email provider. Leave `SYNC_EMAIL_PROVIDER` unset (the `log` provider) and approve each login from the server's shell instead of an emailed link. Pass `--db` to the admin commands, or set `SYNC_SERVER_DB_PATH`, when the database is not at `./data/server.db`.
+
+1. Create your account while the server is stopped. `td auth login` never creates accounts.
+
+   ```bash
+   td-sync admin create-user --email you@example.com
+   ```
+
+2. Start the server. On the client, run `td auth login` and enter the same email; it waits for approval.
+
+3. On the server, review the waiting login and approve it:
+
+   ```bash
+   td-sync admin approve-login --email you@example.com
+   ```
+
+   ```
+   pending login for you@example.com:
+     selector:   9fa4737eefb88723467b86736ad68480
+     created:    2026-10-15T20:20:18Z
+     expires:    2026-10-15T20:35:18Z
+     ip:         192.168.1.20
+     user agent: Go-http-client/1.1
+   Approve this login? [y/N] y
+   approved login for you@example.com
+   ```
+
+   Approve only if the IP is your client's. The user agent does not tell clients apart, because every td client sends Go's default `Go-http-client/1.1`. The client then finishes on its next poll and saves a normal 365-day sync key. Pending logins expire after 15 minutes.
+
+   If the login you expect is not listed, or one you don't recognize is, answer `n`. The server accepts one login start per email per minute and silently drops the rest while the client keeps waiting, so a request from someone else can take the place of yours. Wait a minute and run `td auth login` again.
+
+   If more than one login is pending, the command lists each one's selector, creation and expiry times, client IP, and user agent, approves nothing, and asks you to choose one with `--selector`. `--yes` approves the only pending login without the prompt; use it only in scripts.
+
+4. Turn signup off: set `SYNC_ALLOW_SIGNUP=false` and restart the server. Otherwise anyone who can reach it can create accounts through the web sign-in endpoint, although they still cannot log in without your approval. This does not affect `create-user` or `approve-login`.
+
+`approve-login` needs write access to `server.db`, which `create-key` and `grant` already require, so it gives nothing to anyone without a shell on the server. The client must still present the PKCE verifier from the login it started. The approval is recorded as a `device_verified` auth event with `{"approved_by":"operator_cli"}` and does not mark the email address verified.
+
+`approve-login` is safe to run while the server is up. If a very busy server holds the database lock past the 5-second busy timeout, the command exits with `database is locked` and changes nothing; run it again. `create-user` is less tolerant of concurrent writes, so run it while the server is stopped.
 
 ## Docker Deployment
 
